@@ -349,29 +349,60 @@ function createEntityHandler(
       return (await unwrap<any[]>(db.from(table).upsert(values).select())) ?? [];
     },
     async updateMany(query, ops) {
-      const normalized: UpdateOps = isUpdateOps(ops as Record<string, unknown>)
+      const n: UpdateOps = isUpdateOps(ops as Record<string, unknown>)
         ? (ops as UpdateOps)
         : { $set: ops as Record<string, unknown> };
-      const setOnly =
-        !normalized.$inc &&
-        !normalized.$mul &&
-        !normalized.$push &&
-        !normalized.$pull &&
-        !normalized.$unset;
-      if (setOnly) {
-        // One atomic PATCH across all matching rows.
-        const rows =
-          (await unwrap<any[]>(
-            applyFilter(db.from(table).update(normalized.$set ?? {}), query).select("id"),
-          )) ?? [];
+      // $set + $unset are absolute assignments → one atomic PATCH.
+      const setPart: Record<string, unknown> = { ...(n.$set ?? {}) };
+      if (n.$unset) for (const k of Object.keys(n.$unset)) setPart[k] = null;
+      const hasNumeric = !!(n.$inc || n.$mul);
+      const hasArray = !!(n.$push || n.$pull);
+
+      // Array operators can't be expressed atomically over PostgREST →
+      // read-modify-write everything. Documented as non-atomic.
+      if (hasArray) {
+        const rows = (await unwrap<any[]>(applyFilter(db.from(table).select("*"), query))) ?? [];
+        for (const row of rows) applyUpdateOps(row, n);
+        if (rows.length) await unwrap(db.from(table).upsert(rows).select("id"));
         return { success: true, updated: rows.length, has_more: false };
       }
-      // Read-modify-write for arithmetic/array operators. NOT atomic under
-      // concurrent writers (a Postgres RPC would be — tracked as a follow-up).
-      const rows = (await unwrap<any[]>(applyFilter(db.from(table).select("*"), query))) ?? [];
-      for (const row of rows) applyUpdateOps(row, normalized);
-      if (rows.length) await unwrap(db.from(table).upsert(rows).select("id"));
-      return { success: true, updated: rows.length, has_more: false };
+
+      // No arithmetic → a single atomic PATCH covers $set/$unset.
+      if (!hasNumeric) {
+        const rows =
+          (await unwrap<any[]>(applyFilter(db.from(table).update(setPart), query).select("id"))) ?? [];
+        return { success: true, updated: rows.length, has_more: false };
+      }
+
+      // Arithmetic ($inc/$mul) → ATOMIC via the per-schema `bool_apply_numeric`
+      // function (the increment happens in SQL: `col = col + n`). Select the
+      // target ids first (reusing the filter), apply any $set/$unset as a PATCH,
+      // then call the function. Falls back to read-modify-write when the
+      // function isn't provisioned on this schema (PGRST202), so it stays
+      // correct on older schemas — just non-atomic there.
+      const targets = (await unwrap<any[]>(applyFilter(db.from(table).select("id"), query))) ?? [];
+      const ids = targets.map((r) => String(r.id));
+      if (Object.keys(setPart).length && ids.length) {
+        await unwrap(db.from(table).update(setPart).in("id", ids).select("id"));
+      }
+      if (ids.length) {
+        const { error } = await db.rpc("bool_apply_numeric", {
+          p_table: table,
+          p_ids: ids,
+          p_inc: n.$inc ?? null,
+          p_mul: n.$mul ?? null,
+        });
+        if (error) {
+          if ((error as { code?: string }).code === "PGRST202") {
+            const rows = (await unwrap<any[]>(db.from(table).select("*").in("id", ids))) ?? [];
+            for (const row of rows) applyUpdateOps(row, { $inc: n.$inc, $mul: n.$mul });
+            if (rows.length) await unwrap(db.from(table).upsert(rows).select("id"));
+          } else {
+            throw error;
+          }
+        }
+      }
+      return { success: true, updated: ids.length, has_more: false };
     },
     async delete(id) {
       await unwrap(db.from(table).delete().eq("id", id));

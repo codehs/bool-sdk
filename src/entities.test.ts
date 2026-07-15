@@ -198,22 +198,43 @@ describe("entities: write paths → PostgREST", () => {
     expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ done: true });
   });
 
-  test("updateMany() with $inc reads then writes (read-modify-write)", async () => {
-    let phase = 0;
-    respond = (_url, init) => {
-      // First call: the SELECT of matching rows. Second: the upsert.
-      if (init?.method === "GET" || (!init?.method && phase === 0)) {
-        phase = 1;
-        return Response.json([{ id: "a", views: 5 }]);
+  test("updateMany() with $inc selects ids then calls the atomic RPC", async () => {
+    respond = (url) =>
+      url.includes("/rpc/bool_apply_numeric")
+        ? new Response(null, { status: 204 })
+        : Response.json([{ id: "a" }, { id: "b" }]); // the id SELECT
+    const bool = createBoolClient(CONFIG);
+    const res = await bool.entities.posts.updateMany({ topic: "x" }, { $inc: { views: 1 } });
+    // 1) select matching ids
+    expect(new URL(calls[0]!.url).pathname).toEndWith("/rest/v1/posts");
+    expect(reqQuery(calls[0]!).get("select")).toBe("id");
+    // 2) POST the RPC with the ids + operators — the increment happens in SQL
+    const rpc = calls.find((c) => c.url.includes("/rpc/bool_apply_numeric"))!;
+    expect(rpc.init?.method).toBe("POST");
+    expect(JSON.parse(String(rpc.init?.body))).toEqual({
+      p_table: "posts",
+      p_ids: ["a", "b"],
+      p_inc: { views: 1 },
+      p_mul: null,
+    });
+    expect(res.updated).toBe(2);
+  });
+
+  test("updateMany() $inc falls back to read-modify-write when the RPC is missing (PGRST202)", async () => {
+    respond = (url) => {
+      if (url.includes("/rpc/bool_apply_numeric")) {
+        return Response.json({ code: "PGRST202", message: "function not found" }, { status: 404 });
       }
-      return Response.json([{ id: "a", views: 6 }]);
+      // the id SELECT, then the read of full rows, then the upsert
+      return Response.json([{ id: "a", views: 5 }]);
     };
     const bool = createBoolClient(CONFIG);
     const res = await bool.entities.posts.updateMany({ id: "a" }, { $inc: { views: 1 } });
-    // A read (GET) followed by a write (POST upsert).
-    expect(calls[0]!.init?.method ?? "GET").toBe("GET");
-    expect(calls[1]!.init?.method).toBe("POST");
-    expect(JSON.parse(String(calls[1]!.init?.body))).toEqual([{ id: "a", views: 6 }]);
+    // After the RPC 404s, it reads the rows and upserts the incremented value.
+    const upsert = calls.find(
+      (c) => c.init?.method === "POST" && !c.url.includes("/rpc/"),
+    )!;
+    expect(JSON.parse(String(upsert.init?.body))).toEqual([{ id: "a", views: 6 }]);
     expect(res.updated).toBe(1);
   });
 
