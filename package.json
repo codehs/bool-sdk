@@ -1,5 +1,5 @@
 {
-  "name": "@bool/sdk",
+  "name": "bool-sdk",
   "version": "0.1.0",
   "description": "Client SDK for apps built on Bool — gateway data access, end-user auth, and the React auth layer.",
   "type": "module",

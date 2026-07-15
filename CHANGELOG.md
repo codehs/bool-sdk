@@ -9,5 +9,5 @@ out of per-app scaffold files into a published package:
   gateway data plane (REST + Storage), realtime doorbell helper
   (`subscribeToChanges`), and the end-user auth surface (`client.auth`)
   against the gateway users plane.
-- `@bool/sdk/react` — `BoolAuthProvider`, `useBoolAuth`, `AuthGate`,
+- `bool-sdk/react` — `BoolAuthProvider`, `useBoolAuth`, `AuthGate`,
   `useSignInForm`.

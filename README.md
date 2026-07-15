@@ -1,4 +1,4 @@
-# @bool/sdk
+# bool-sdk
 
 The client SDK for apps built on [Bool](https://bool.com). Every Bool app
 ("Bool") gets this pre-wired — it's how the app reaches its data, files, and
@@ -25,7 +25,7 @@ tested, and upgradable independently of any one app.
   `onAuthStateChange`, password reset) but talks to the Bool gateway's users
   plane, so each app has its own isolated accounts and the client never
   handles a credential.
-- **React auth layer** (`@bool/sdk/react`): `<BoolAuthProvider>`,
+- **React auth layer** (`bool-sdk/react`): `<BoolAuthProvider>`,
   `useBoolAuth()`, `<AuthGate>`, and the headless `useSignInForm()` state
   machine that login forms bind to.
 
@@ -33,7 +33,7 @@ tested, and upgradable independently of any one app.
 
 ```ts
 // Bool apps ship this in src/lib/supabase.ts:
-import { createBoolClient } from "@bool/sdk";
+import { createBoolClient } from "bool-sdk";
 
 export const bool = createBoolClient({
   supabaseUrl: import.meta.env.VITE_SUPABASE_URL!,
@@ -51,7 +51,7 @@ export const auth = bool.auth;   // this app's own end-user accounts
 
 ```tsx
 // React auth (the default client is the one created above):
-import { BoolAuthProvider, AuthGate, useBoolAuth, useSignInForm } from "@bool/sdk/react";
+import { BoolAuthProvider, AuthGate, useBoolAuth, useSignInForm } from "bool-sdk/react";
 
 <BoolAuthProvider>
   <AuthGate fallback={<SignInForm />}>

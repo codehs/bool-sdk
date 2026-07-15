@@ -109,7 +109,7 @@ export type BoolClient = {
   subscribeToChanges(listener: (payload: BoolChangePayload) => void): () => void;
 };
 
-// The last-created client, used by the React layer (@bool/sdk/react) so app
+// The last-created client, used by the React layer (bool-sdk/react) so app
 // components don't have to thread the client through props. Last-created wins
 // so a hot-reloaded `src/lib/supabase.ts` re-registers its fresh client.
 let defaultClient: BoolClient | null = null;
