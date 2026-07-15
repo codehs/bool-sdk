@@ -31,6 +31,20 @@ Known gaps vs. Base44 (documented, follow-ups): `updateMany` with
 writers — a Postgres RPC would make it atomic); `$size` (filter by array
 length) isn't expressible over PostgREST and is omitted.
 
+**`EntitiesModule` is now an augmentable `interface`** (was a `type` alias), so
+generated apps can type each entity via `declare module "bool-sdk"`:
+
+```ts
+declare module "bool-sdk" {
+  interface EntitiesModule { board_games: EntityHandler<BoardGames> }
+}
+```
+
+That makes `bool.entities.board_games` typed (field names, enum values, types)
+while the string index signature keeps un-declared tables usable as
+`EntityHandler<any>`. Bool's `define_entity` tool writes one such `.d.ts` per
+model. No runtime change.
+
 ## 0.1.1
 
 Publishing now goes through npm OIDC trusted publishing (no long-lived token).

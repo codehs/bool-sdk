@@ -121,8 +121,27 @@ export interface EntityHandler<T = any> {
   subscribe(cb: (change: BoolChangePayload) => void): () => void;
 }
 
-/** Dynamic map: `entities.<anyTableName>` yields a handler for that table. */
-export type EntitiesModule = { [table: string]: EntityHandler };
+/**
+ * Dynamic map: `entities.<anyTableName>` yields a handler for that table.
+ *
+ * Declared as an `interface` (not a `type` alias) so a generated app can
+ * AUGMENT it with typed per-entity members via `declare module "bool-sdk"`.
+ * Bool's `define_entity` tool writes one `bool/entities/<name>.d.ts` per model
+ * that does exactly that, e.g.:
+ *
+ *   declare module "bool-sdk" {
+ *     interface EntitiesModule { board_games: EntityHandler<BoardGames> }
+ *   }
+ *
+ * so `bool.entities.board_games.create({...})` is typed and typos are caught at
+ * build time (`tsc -b`). The string index signature keeps every table — including
+ * ones not yet declared — usable as `EntityHandler<any>` by default, so the
+ * un-augmented SDK still works. A named member must be assignable to the index
+ * signature, which `EntityHandler<Row>` (→ `EntityHandler<any>`) always is.
+ */
+export interface EntitiesModule {
+  [table: string]: EntityHandler;
+}
 
 const DEFAULT_SORT = "-created_at";
 const DEFAULT_LIMIT = 50;
