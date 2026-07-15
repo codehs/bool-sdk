@@ -11,12 +11,22 @@ tested, and upgradable independently of any one app.
 
 ## What it does
 
+- **Entities data API.** `client.entities.<table>` is the recommended way to
+  read/write data — `list`, `filter`, `get`, `create`, `update`, `delete`,
+  `subscribe`. It hides Supabase/SQL entirely; methods return rows directly and
+  throw on error:
+  ```ts
+  const todos = await bool.entities.todos.list("-created_at");
+  const one   = await bool.entities.todos.create({ title: "hi" });
+  await bool.entities.todos.update(one.id, { done: true });
+  await bool.entities.todos.filter({ status: "active", count: { gte: 10 } });
+  ```
 - **Data + Storage through the Bool gateway.** `client.db` is a standard
-  [supabase-js](https://supabase.com/docs/reference/javascript) client whose
-  REST and Storage traffic is routed to the Bool gateway (`/_bool/v1/db`). The
-  gateway injects the real credential server-side and pins the app's private
-  Postgres schema — the anon key in the bundle has no data grants and can't
-  read anything directly.
+  [supabase-js](https://supabase.com/docs/reference/javascript) client (what
+  `entities` is built on) whose REST and Storage traffic is routed to the Bool
+  gateway (`/_bool/v1/db`). The gateway injects the real credential server-side
+  and pins the app's private Postgres schema — the anon key in the bundle has
+  no data grants and can't read anything directly.
 - **Realtime "doorbell".** Postgres changes broadcast a row-data-free
   `{table, op}` ping on the app's public channel; `subscribeToChanges` wraps
   the subscription. Refetch on each ping — the ping never carries row data.

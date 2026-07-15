@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0
+
+Adds the **entities data layer** — a Base44-style CRUD API over the gateway so
+apps read/write data without touching Supabase, SQL, or credentials directly:
+
+```ts
+const todos = await bool.entities.todos.list("-created_at");
+const one   = await bool.entities.todos.create({ title: "hi" });
+await bool.entities.todos.update(one.id, { done: true });
+await bool.entities.todos.filter({ status: "active", count: { gte: 10 } });
+```
+
+`bool.entities.<table>` exposes `list`, `filter`, `get`, `create`, `update`,
+`delete`, and `subscribe`. Methods return row data directly and throw on error.
+Additive and backward-compatible — `bool.db` / `supabase` still work.
+
 ## 0.1.1
 
 Publishing now goes through npm OIDC trusted publishing (no long-lived token).

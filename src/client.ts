@@ -17,6 +17,7 @@
 // Keep this in sync with the gateway data route (/_bool/v1/db) and users route
 // (/_bool/v1/users) in the Bool platform repo.
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { createEntitiesModule, type EntitiesModule } from "./entities.js";
 
 /** Matches the server's append-only gateway path version. */
 const GATEWAY_API = "v1";
@@ -99,6 +100,9 @@ export type BoolClient = {
    * Use it exactly like a normal supabase-js client: `.from(...)`, `.storage`,
    * `.channel(...)`. Do NOT use `db.auth` — end-user auth is `client.auth`. */
   db: BoolDb;
+  /** The data API: `entities.<table>.list/filter/get/create/update/delete`.
+   * The recommended way to read/write app data — hides Supabase entirely. */
+  entities: EntitiesModule;
   /** End-user auth for this app (gateway users plane). */
   auth: BoolAuth;
   /** This app's private Postgres schema name. */
@@ -423,26 +427,31 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     },
   };
 
+  // Realtime "doorbell": the app schema's grants are revoked, so Supabase
+  // `postgres_changes` never fires. Instead the server broadcasts a
+  // row-data-free ping on the PUBLIC channel "bool:" + schema whenever any
+  // row changes. Subscribe with the anon key (no token needed) and REFETCH
+  // on each ping.
+  const subscribeToChanges = (
+    listener: (payload: BoolChangePayload) => void,
+  ): (() => void) => {
+    const channel = db
+      .channel("bool:" + schema)
+      .on("broadcast", { event: "*" }, (msg) =>
+        listener((msg as { payload?: BoolChangePayload }).payload ?? {}),
+      )
+      .subscribe();
+    return () => {
+      void db.removeChannel(channel);
+    };
+  };
+
   const client: BoolClient = {
     db,
+    entities: createEntitiesModule(db, subscribeToChanges),
     auth,
     schema,
-    // Realtime "doorbell": the app schema's grants are revoked, so Supabase
-    // `postgres_changes` never fires. Instead the server broadcasts a
-    // row-data-free ping on the PUBLIC channel "bool:" + schema whenever any
-    // row changes. Subscribe with the anon key (no token needed) and REFETCH
-    // on each ping.
-    subscribeToChanges(listener) {
-      const channel = db
-        .channel("bool:" + schema)
-        .on("broadcast", { event: "*" }, (msg) =>
-          listener((msg as { payload?: BoolChangePayload }).payload ?? {}),
-        )
-        .subscribe();
-      return () => {
-        void db.removeChannel(channel);
-      };
-    },
+    subscribeToChanges,
   };
 
   setDefaultBoolClient(client);
