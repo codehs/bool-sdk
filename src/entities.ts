@@ -7,35 +7,46 @@
 //   const todos = await bool.entities.todos.list("-created_at");
 //   const one   = await bool.entities.todos.create({ title: "hi" });
 //   await bool.entities.todos.update(one.id, { done: true });
+//   await bool.entities.todos.filter({ status: "active", count: { $gte: 10 } });
 //
-// Methods return the row data directly and THROW on error (unlike supabase-js's
-// `{ data, error }`), so app code reads clean. Every method is a thin,
-// well-understood translation to what `db` (the gateway client) already does.
+// The method surface and filter DSL mirror Base44's entities module one-to-one
+// (MongoDB-style `$`-operators, `-col` sort, bulk + *Many ops), so there's no
+// need to drop down to raw SQL. Methods return row data directly and THROW on
+// error (unlike supabase-js's `{ data, error }`), so app code reads clean.
 import type { BoolChangePayload, BoolDb } from "./client.js";
 
 /** Sort by a column, `-col` for descending (`+col`/`col` ascending).
  * Entity tables always have `created_at`, so it's the default. */
 export type SortSpec = string;
 
-/** PostgREST comparison operators usable in a filter query. */
+/** MongoDB-style comparison operators for a single field. Mirrors Base44. */
 export type FilterOperators = Partial<{
-  eq: unknown;
-  neq: unknown;
-  gt: unknown;
-  gte: unknown;
-  lt: unknown;
-  lte: unknown;
-  like: string;
-  ilike: string;
-  in: unknown[];
+  $eq: unknown;
+  $ne: unknown;
+  $gt: unknown;
+  $gte: unknown;
+  $lt: unknown;
+  $lte: unknown;
+  $in: unknown[];
+  $nin: unknown[];
+  $exists: boolean;
+  /** POSIX regex (maps to PostgREST `match`/`~`). */
+  $regex: string;
+  /** Array column contains all of these values. */
+  $all: unknown[];
+  /** Negate a single inner operator, e.g. `{ $not: { $eq: 5 } }`. */
+  $not: Partial<
+    Record<"$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" | "$in" | "$regex", unknown>
+  >;
 }>;
 
 /**
  * A filter query. Each key is a column; the value is:
  *   - a scalar → exact match (`{ status: "active" }`)
  *   - `null` → IS NULL (`{ archived_at: null }`)
- *   - an array → matches any of (`{ id: ["a", "b"] }`)
- *   - an operator object → `{ count: { gte: 100 } }`
+ *   - an array → matches any of (`{ id: ["a", "b"] }`, i.e. `$in` shorthand)
+ *   - an operator object → `{ count: { $gte: 100 } }`
+ * Root-level `$and`/`$or`/`$nor` combine sub-queries.
  */
 export type FilterValue =
   | string
@@ -44,28 +55,67 @@ export type FilterValue =
   | null
   | Array<string | number | boolean>
   | FilterOperators;
-export type FilterQuery = Record<string, FilterValue>;
+export type FilterQuery = {
+  [column: string]: FilterValue | FilterQuery[] | undefined;
+  $and?: FilterQuery[];
+  $or?: FilterQuery[];
+  $nor?: FilterQuery[];
+};
+
+/** MongoDB-style update operators. `$set` is applied as one atomic PATCH; the
+ * others (`$inc`/`$mul`/`$push`/`$pull`/`$unset`) are applied read-modify-write
+ * (see updateMany docs — not atomic under concurrent writers). */
+export type UpdateOps = Partial<{
+  $set: Record<string, unknown>;
+  $inc: Record<string, number>;
+  $mul: Record<string, number>;
+  $push: Record<string, unknown>;
+  $pull: Record<string, unknown>;
+  $unset: Record<string, true>;
+}>;
+
+export type DeleteResult = { success: boolean };
+export type DeleteManyResult = { success: boolean; deleted: number };
+export type UpdateManyResult = { success: boolean; updated: number; has_more: boolean };
+export type ImportResult<T = any> = {
+  status: "success" | "error";
+  details: string | null;
+  output: T[] | null;
+};
 
 /** CRUD + realtime for one entity table. `T` defaults to `any` (untyped);
- * apps can pass a row type for autocomplete. */
+ * apps can pass a row type for autocomplete. Mirrors Base44's EntityHandler. */
 export interface EntityHandler<T = any> {
-  /** All rows, newest first by default. `limit` defaults to 50. */
-  list(sort?: SortSpec, limit?: number, offset?: number): Promise<T[]>;
+  /** All rows, newest first by default. `limit` defaults to 50, max 1000.
+   * `fields` restricts the columns returned. */
+  list(sort?: SortSpec, limit?: number, skip?: number, fields?: (keyof T & string)[]): Promise<T[]>;
   /** Rows matching `query`. See {@link FilterQuery}. */
   filter(
     query: FilterQuery,
     sort?: SortSpec,
     limit?: number,
-    offset?: number,
+    skip?: number,
+    fields?: (keyof T & string)[],
   ): Promise<T[]>;
   /** One row by id. Throws if it doesn't exist. */
   get(id: string): Promise<T>;
   /** Insert a row; returns the created row (with server-filled id/created_at). */
   create(values: Partial<T>): Promise<T>;
+  /** Insert many rows in one request; returns the created rows. */
+  bulkCreate(values: Partial<T>[]): Promise<T[]>;
   /** Patch a row by id; returns the updated row. */
   update(id: string, values: Partial<T>): Promise<T>;
+  /** Update many specific rows, each by its own `id`; returns the updated rows. */
+  bulkUpdate(values: (Partial<T> & { id: string })[]): Promise<T[]>;
+  /** Apply the same update to every row matching `query`. Pass Mongo-style
+   * update operators (`{ $set: {...} }`) or a plain object (treated as `$set`). */
+  updateMany(query: FilterQuery, ops: UpdateOps | Partial<T>): Promise<UpdateManyResult>;
   /** Delete a row by id. */
-  delete(id: string): Promise<void>;
+  delete(id: string): Promise<DeleteResult>;
+  /** Delete every row matching `query`. */
+  deleteMany(query: FilterQuery): Promise<DeleteManyResult>;
+  /** Import rows from a CSV File (parsed client-side, then bulk-created). */
+  importEntities(file: File): Promise<ImportResult<T>>;
   /** Fire `cb` whenever any row in THIS table changes (refetch on each ping —
    * the payload carries no row data). Returns an unsubscribe function. */
   subscribe(cb: (change: BoolChangePayload) => void): () => void;
@@ -76,30 +126,101 @@ export type EntitiesModule = { [table: string]: EntityHandler };
 
 const DEFAULT_SORT = "-created_at";
 const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 1000;
 
 // A supabase-js filter/query builder is chainable and thenable; we only need
 // the handful of methods below, so keep it loosely typed rather than importing
 // supabase-js's internal builder generics.
 type QueryBuilder = any;
 
-function applySort(query: QueryBuilder, sort: SortSpec): QueryBuilder {
-  const ascending = !sort.startsWith("-");
-  const column = sort.replace(/^[-+]/, "");
-  return query.order(column, { ascending });
+const MONGO_TO_PG: Record<string, string> = {
+  $eq: "eq",
+  $ne: "neq",
+  $gt: "gt",
+  $gte: "gte",
+  $lt: "lt",
+  $lte: "lte",
+  $in: "in",
+  $regex: "match",
+};
+
+/** Map a Mongo comparison operator to the supabase-js builder call. */
+function applyOperator(q: QueryBuilder, column: string, op: string, value: unknown): QueryBuilder {
+  switch (op) {
+    case "$eq":
+      return value === null ? q.is(column, null) : q.eq(column, value);
+    case "$ne":
+      return value === null ? q.not(column, "is", null) : q.neq(column, value);
+    case "$gt":
+      return q.gt(column, value);
+    case "$gte":
+      return q.gte(column, value);
+    case "$lt":
+      return q.lt(column, value);
+    case "$lte":
+      return q.lte(column, value);
+    case "$in":
+      return q.in(column, value as unknown[]);
+    case "$nin":
+      return q.not(column, "in", `(${(value as unknown[]).join(",")})`);
+    case "$exists":
+      return value ? q.not(column, "is", null) : q.is(column, null);
+    case "$regex":
+      // PostgREST `match` operator (~). Supabase supports it.
+      return q.filter(column, "match", value);
+    case "$all":
+      return q.contains(column, value as unknown[]);
+    case "$not": {
+      // Single inner operator, e.g. { $not: { $eq: 5 } }.
+      const [innerOp, innerVal] = Object.entries(value as Record<string, unknown>)[0] ?? [];
+      const pg = MONGO_TO_PG[innerOp as string];
+      if (pg) return q.not(column, pg, innerVal);
+      return q;
+    }
+    default:
+      return q; // unsupported operator ($size) — silently ignored (documented)
+  }
+}
+
+/** Serialize a flat sub-query to a PostgREST `or()` condition string, e.g.
+ * `{ status: "active", count: { $gte: 3 } }` → `status.eq.active,count.gte.3`.
+ * Only scalar equality + comparison operators are supported inside $or/$nor. */
+function toPgConditions(query: FilterQuery): string {
+  const parts: string[] = [];
+  for (const [column, value] of Object.entries(query)) {
+    if (column === "$and" || column === "$or" || column === "$nor") continue;
+    if (value === null) parts.push(`${column}.is.null`);
+    else if (Array.isArray(value)) parts.push(`${column}.in.(${(value as unknown[]).join(",")})`);
+    else if (typeof value === "object") {
+      for (const [op, v] of Object.entries(value as Record<string, unknown>)) {
+        const pg = MONGO_TO_PG[op];
+        if (pg) parts.push(`${column}.${pg}.${v}`);
+      }
+    } else {
+      parts.push(`${column}.eq.${value}`);
+    }
+  }
+  return parts.join(",");
 }
 
 function applyFilter(query: QueryBuilder, filter: FilterQuery): QueryBuilder {
   let q = query;
   for (const [column, value] of Object.entries(filter)) {
-    if (value === null) {
+    if (value === undefined) continue;
+    if (column === "$and") {
+      for (const sub of value as FilterQuery[]) q = applyFilter(q, sub);
+    } else if (column === "$or") {
+      q = q.or((value as FilterQuery[]).map(toPgConditions).join(","));
+    } else if (column === "$nor") {
+      q = q.not("or", `(${(value as FilterQuery[]).map(toPgConditions).join(",")})`);
+    } else if (value === null) {
       q = q.is(column, null);
     } else if (Array.isArray(value)) {
-      q = q.in(column, value);
+      q = q.in(column, value as unknown[]);
     } else if (typeof value === "object") {
-      for (const [op, operand] of Object.entries(value)) {
+      for (const [op, operand] of Object.entries(value as Record<string, unknown>)) {
         if (operand === undefined) continue;
-        // op is one of the PostgREST methods on the builder (eq/gt/in/like/…).
-        q = q[op](column, operand);
+        q = applyOperator(q, column, op, operand);
       }
     } else {
       q = q.eq(column, value);
@@ -108,58 +229,172 @@ function applyFilter(query: QueryBuilder, filter: FilterQuery): QueryBuilder {
   return q;
 }
 
+function applySort(query: QueryBuilder, sort: SortSpec): QueryBuilder {
+  const ascending = !sort.startsWith("-");
+  const column = sort.replace(/^[-+]/, "");
+  return query.order(column, { ascending });
+}
+
+/** Minimal RFC-4180-ish CSV parser: handles quoted fields, escaped quotes, and
+ * embedded commas/newlines. Good enough for `importEntities`; swap for a full
+ * parser if apps need exotic dialects. */
+function parseCsv(text: string): Record<string, string>[] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ",") {
+      row.push(field);
+      field = "";
+    } else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(field);
+      field = "";
+      if (row.length > 1 || row[0] !== "") rows.push(row);
+      row = [];
+    } else field += c;
+  }
+  if (field !== "" || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+  if (rows.length === 0) return [];
+  const header = rows[0]!;
+  return rows.slice(1).map((r) => {
+    const obj: Record<string, string> = {};
+    header.forEach((h, i) => {
+      obj[h] = r[i] ?? "";
+    });
+    return obj;
+  });
+}
+
+function applyUpdateOps(row: Record<string, any>, ops: UpdateOps): void {
+  if (ops.$set) Object.assign(row, ops.$set);
+  if (ops.$inc) for (const [k, v] of Object.entries(ops.$inc)) row[k] = (row[k] ?? 0) + v;
+  if (ops.$mul) for (const [k, v] of Object.entries(ops.$mul)) row[k] = (row[k] ?? 0) * v;
+  if (ops.$push) for (const [k, v] of Object.entries(ops.$push)) row[k] = [...(row[k] ?? []), v];
+  if (ops.$pull)
+    for (const [k, v] of Object.entries(ops.$pull))
+      row[k] = (row[k] ?? []).filter((x: unknown) => x !== v);
+  if (ops.$unset) for (const k of Object.keys(ops.$unset)) row[k] = null;
+}
+
+const UPDATE_OP_KEYS = ["$set", "$inc", "$mul", "$push", "$pull", "$unset"];
+function isUpdateOps(ops: Record<string, unknown>): ops is UpdateOps {
+  return Object.keys(ops).some((k) => UPDATE_OP_KEYS.includes(k));
+}
+
 function createEntityHandler(
   db: BoolDb,
   subscribeToChanges: (listener: (p: BoolChangePayload) => void) => () => void,
   table: string,
 ): EntityHandler {
-  function paginate(query: QueryBuilder, limit: number, offset: number): QueryBuilder {
-    return query.range(offset, offset + limit - 1);
+  function select(fields?: string[]): string {
+    return fields && fields.length ? fields.join(",") : "*";
   }
-  return {
-    async list(sort = DEFAULT_SORT, limit = DEFAULT_LIMIT, offset = 0) {
-      const query = paginate(
-        applySort(db.from(table).select("*"), sort),
-        limit,
-        offset,
+  function paginate(query: QueryBuilder, limit: number, skip: number): QueryBuilder {
+    const capped = Math.min(limit, MAX_LIMIT);
+    return query.range(skip, skip + capped - 1);
+  }
+  async function unwrap<R>(query: QueryBuilder): Promise<R> {
+    const { data, error } = await query;
+    if (error) throw error;
+    return data as R;
+  }
+
+  const handler: EntityHandler = {
+    async list(sort = DEFAULT_SORT, limit = DEFAULT_LIMIT, skip = 0, fields) {
+      return (
+        (await unwrap<any[]>(
+          paginate(applySort(db.from(table).select(select(fields)), sort), limit, skip),
+        )) ?? []
       );
-      const { data, error } = await query;
-      if (error) throw error;
-      return data ?? [];
     },
-    async filter(filter, sort = DEFAULT_SORT, limit = DEFAULT_LIMIT, offset = 0) {
-      const query = paginate(
-        applySort(applyFilter(db.from(table).select("*"), filter), sort),
-        limit,
-        offset,
+    async filter(filter, sort = DEFAULT_SORT, limit = DEFAULT_LIMIT, skip = 0, fields) {
+      return (
+        (await unwrap<any[]>(
+          paginate(
+            applySort(applyFilter(db.from(table).select(select(fields)), filter), sort),
+            limit,
+            skip,
+          ),
+        )) ?? []
       );
-      const { data, error } = await query;
-      if (error) throw error;
-      return data ?? [];
     },
     async get(id) {
-      const { data, error } = await db.from(table).select("*").eq("id", id).single();
-      if (error) throw error;
-      return data;
+      return unwrap(db.from(table).select("*").eq("id", id).single());
     },
     async create(values) {
-      const { data, error } = await db.from(table).insert(values).select().single();
-      if (error) throw error;
-      return data;
+      return unwrap(db.from(table).insert(values).select().single());
+    },
+    async bulkCreate(values) {
+      return (await unwrap<any[]>(db.from(table).insert(values).select())) ?? [];
     },
     async update(id, values) {
-      const { data, error } = await db
-        .from(table)
-        .update(values)
-        .eq("id", id)
-        .select()
-        .single();
-      if (error) throw error;
-      return data;
+      return unwrap(db.from(table).update(values).eq("id", id).select().single());
+    },
+    async bulkUpdate(values) {
+      // Upsert on the primary key: each row must include `id`.
+      return (await unwrap<any[]>(db.from(table).upsert(values).select())) ?? [];
+    },
+    async updateMany(query, ops) {
+      const normalized: UpdateOps = isUpdateOps(ops as Record<string, unknown>)
+        ? (ops as UpdateOps)
+        : { $set: ops as Record<string, unknown> };
+      const setOnly =
+        !normalized.$inc &&
+        !normalized.$mul &&
+        !normalized.$push &&
+        !normalized.$pull &&
+        !normalized.$unset;
+      if (setOnly) {
+        // One atomic PATCH across all matching rows.
+        const rows =
+          (await unwrap<any[]>(
+            applyFilter(db.from(table).update(normalized.$set ?? {}), query).select("id"),
+          )) ?? [];
+        return { success: true, updated: rows.length, has_more: false };
+      }
+      // Read-modify-write for arithmetic/array operators. NOT atomic under
+      // concurrent writers (a Postgres RPC would be — tracked as a follow-up).
+      const rows = (await unwrap<any[]>(applyFilter(db.from(table).select("*"), query))) ?? [];
+      for (const row of rows) applyUpdateOps(row, normalized);
+      if (rows.length) await unwrap(db.from(table).upsert(rows).select("id"));
+      return { success: true, updated: rows.length, has_more: false };
     },
     async delete(id) {
-      const { error } = await db.from(table).delete().eq("id", id);
-      if (error) throw error;
+      await unwrap(db.from(table).delete().eq("id", id));
+      return { success: true };
+    },
+    async deleteMany(query) {
+      const rows =
+        (await unwrap<any[]>(applyFilter(db.from(table).delete(), query).select("id"))) ?? [];
+      return { success: true, deleted: rows.length };
+    },
+    async importEntities(file) {
+      try {
+        const rows = parseCsv(await file.text());
+        if (!rows.length) return { status: "success", details: "No rows to import", output: [] };
+        const output = await handler.bulkCreate(rows as any);
+        return { status: "success", details: `Imported ${output.length} rows`, output };
+      } catch (err) {
+        return {
+          status: "error",
+          details: (err as Error)?.message ?? "Import failed",
+          output: null,
+        };
+      }
     },
     subscribe(cb) {
       // The doorbell pings for the whole schema; forward only this table's.
@@ -168,6 +403,7 @@ function createEntityHandler(
       });
     },
   };
+  return handler;
 }
 
 export function createEntitiesModule(

@@ -2,19 +2,34 @@
 
 ## 0.2.0
 
-Adds the **entities data layer** — a Base44-style CRUD API over the gateway so
+Adds the **entities data layer** — a Base44-parity data API over the gateway so
 apps read/write data without touching Supabase, SQL, or credentials directly:
 
 ```ts
 const todos = await bool.entities.todos.list("-created_at");
 const one   = await bool.entities.todos.create({ title: "hi" });
 await bool.entities.todos.update(one.id, { done: true });
-await bool.entities.todos.filter({ status: "active", count: { gte: 10 } });
+await bool.entities.todos.filter({ status: "active", count: { $gte: 10 } });
 ```
 
-`bool.entities.<table>` exposes `list`, `filter`, `get`, `create`, `update`,
-`delete`, and `subscribe`. Methods return row data directly and throw on error.
-Additive and backward-compatible — `bool.db` / `supabase` still work.
+`bool.entities.<table>` mirrors Base44's entity surface one-to-one:
+- **Reads:** `list`, `filter`, `get` — with `sort` (`-col`), `limit`, `skip`,
+  and `fields` (column selection).
+- **Writes:** `create`, `bulkCreate`, `update`, `bulkUpdate`, `delete`.
+- **Bulk-by-query:** `updateMany(query, { $set })`, `deleteMany(query)`.
+- **Import:** `importEntities(csvFile)` (parsed client-side → `bulkCreate`).
+- **Realtime:** `subscribe(cb)` (gateway doorbell).
+- **Filter DSL:** MongoDB-style — `$eq $ne $gt $gte $lt $lte $in $nin $exists
+  $regex $all $not` per field, `$and`/`$or`/`$nor` at the root, array shorthand,
+  and `null` → IS NULL.
+
+Methods return row data directly and throw on error. Additive and
+backward-compatible — `bool.db` / `supabase` still work.
+
+Known gaps vs. Base44 (documented, follow-ups): `updateMany` with
+`$inc/$mul/$push/$pull` is read-modify-write (not atomic under concurrent
+writers — a Postgres RPC would make it atomic); `$size` (filter by array
+length) isn't expressible over PostgREST and is omitted.
 
 ## 0.1.1
 

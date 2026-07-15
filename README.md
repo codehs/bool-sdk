@@ -12,15 +12,19 @@ tested, and upgradable independently of any one app.
 ## What it does
 
 - **Entities data API.** `client.entities.<table>` is the recommended way to
-  read/write data — `list`, `filter`, `get`, `create`, `update`, `delete`,
-  `subscribe`. It hides Supabase/SQL entirely; methods return rows directly and
-  throw on error:
+  read/write data — a one-to-one mirror of Base44's entity surface: `list`,
+  `filter`, `get`, `create`, `bulkCreate`, `update`, `bulkUpdate`, `updateMany`,
+  `delete`, `deleteMany`, `importEntities`, `subscribe`. It hides Supabase/SQL
+  entirely; methods return rows directly and throw on error:
   ```ts
   const todos = await bool.entities.todos.list("-created_at");
   const one   = await bool.entities.todos.create({ title: "hi" });
   await bool.entities.todos.update(one.id, { done: true });
-  await bool.entities.todos.filter({ status: "active", count: { gte: 10 } });
+  await bool.entities.todos.filter({ status: "active", count: { $gte: 10 } });
+  await bool.entities.todos.updateMany({ done: false }, { $set: { done: true } });
   ```
+  Filters use MongoDB-style operators (`$eq $ne $gt $gte $lt $lte $in $nin
+  $exists $regex $all $not`, plus `$and`/`$or`/`$nor`); sort is a `-col` string.
 - **Data + Storage through the Bool gateway.** `client.db` is a standard
   [supabase-js](https://supabase.com/docs/reference/javascript) client (what
   `entities` is built on) whose REST and Storage traffic is routed to the Bool

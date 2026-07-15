@@ -66,11 +66,11 @@ describe("entities: read paths → PostgREST", () => {
     expect(reqQuery(calls[0]!).get("offset")).toBe("20");
   });
 
-  test("filter() maps scalar, operator, array, and null to PostgREST ops", async () => {
+  test("filter() maps scalar, $-operator, array, and null to PostgREST ops", async () => {
     const bool = createBoolClient(CONFIG);
     await bool.entities.todos.filter({
       status: "active",
-      count: { gte: 100 },
+      count: { $gte: 100 },
       priority: ["high", "urgent"],
       archived_at: null,
     });
@@ -79,6 +79,37 @@ describe("entities: read paths → PostgREST", () => {
     expect(q.get("count")).toBe("gte.100");
     expect(q.get("priority")).toBe("in.(high,urgent)");
     expect(q.get("archived_at")).toBe("is.null");
+  });
+
+  test("filter() maps the richer Base44 operators", async () => {
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.filter({
+      a: { $ne: 1 },
+      b: { $nin: [2, 3] },
+      c: { $exists: true },
+      d: { $exists: false },
+      e: { $regex: "^x" },
+      tags: { $all: ["red", "blue"] },
+    });
+    const q = reqQuery(calls[0]!);
+    expect(q.get("a")).toBe("neq.1");
+    expect(q.get("b")).toBe("not.in.(2,3)");
+    expect(q.get("c")).toBe("not.is.null");
+    expect(q.get("d")).toBe("is.null");
+    expect(q.get("e")).toBe("match.^x");
+    expect(q.get("tags")).toBe("cs.{red,blue}");
+  });
+
+  test("filter() supports root $or", async () => {
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.filter({ $or: [{ status: "active" }, { priority: { $gte: 3 } }] });
+    expect(reqQuery(calls[0]!).get("or")).toBe("(status.eq.active,priority.gte.3)");
+  });
+
+  test("fields limits the selected columns", async () => {
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.list("-created_at", 50, 0, ["id", "title"]);
+    expect(reqQuery(calls[0]!).get("select")).toBe("id,title");
   });
 
   test("get(id) fetches one row by id", async () => {
@@ -121,11 +152,99 @@ describe("entities: write paths → PostgREST", () => {
     expect(updated).toEqual({ id: "t1", done: true });
   });
 
-  test("delete(id) DELETEs the matched row", async () => {
+  test("delete(id) DELETEs the matched row and reports success", async () => {
     const bool = createBoolClient(CONFIG);
-    await bool.entities.todos.delete("t1");
+    const res = await bool.entities.todos.delete("t1");
     expect(calls[0]!.init?.method).toBe("DELETE");
     expect(reqQuery(calls[0]!).get("id")).toBe("eq.t1");
+    expect(res).toEqual({ success: true });
+  });
+
+  test("bulkCreate() inserts an array in one POST", async () => {
+    respond = () => Response.json([{ id: "a" }, { id: "b" }]);
+    const bool = createBoolClient(CONFIG);
+    const rows = await bool.entities.todos.bulkCreate([{ title: "a" }, { title: "b" }]);
+    expect(calls[0]!.init?.method).toBe("POST");
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual([{ title: "a" }, { title: "b" }]);
+    expect(rows).toHaveLength(2);
+  });
+
+  test("bulkUpdate() upserts rows by id", async () => {
+    respond = () => Response.json([{ id: "a", done: true }]);
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.bulkUpdate([{ id: "a", done: true }]);
+    // Upsert is a POST with an on-conflict resolution / merge preference.
+    expect(calls[0]!.init?.method).toBe("POST");
+    const prefer = new Headers(calls[0]!.init?.headers).get("prefer") ?? "";
+    expect(prefer).toContain("resolution=merge-duplicates");
+  });
+
+  test("updateMany() with $set is one atomic PATCH", async () => {
+    respond = () => Response.json([{ id: "a" }, { id: "b" }]);
+    const bool = createBoolClient(CONFIG);
+    const res = await bool.entities.todos.updateMany({ status: "pending" }, { $set: { status: "done" } });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.init?.method).toBe("PATCH");
+    expect(reqQuery(calls[0]!).get("status")).toBe("eq.pending");
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ status: "done" });
+    expect(res).toEqual({ success: true, updated: 2, has_more: false });
+  });
+
+  test("updateMany() with a plain object is treated as $set", async () => {
+    respond = () => Response.json([{ id: "a" }]);
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.updateMany({ id: "a" }, { done: true });
+    expect(calls[0]!.init?.method).toBe("PATCH");
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ done: true });
+  });
+
+  test("updateMany() with $inc reads then writes (read-modify-write)", async () => {
+    let phase = 0;
+    respond = (_url, init) => {
+      // First call: the SELECT of matching rows. Second: the upsert.
+      if (init?.method === "GET" || (!init?.method && phase === 0)) {
+        phase = 1;
+        return Response.json([{ id: "a", views: 5 }]);
+      }
+      return Response.json([{ id: "a", views: 6 }]);
+    };
+    const bool = createBoolClient(CONFIG);
+    const res = await bool.entities.posts.updateMany({ id: "a" }, { $inc: { views: 1 } });
+    // A read (GET) followed by a write (POST upsert).
+    expect(calls[0]!.init?.method ?? "GET").toBe("GET");
+    expect(calls[1]!.init?.method).toBe("POST");
+    expect(JSON.parse(String(calls[1]!.init?.body))).toEqual([{ id: "a", views: 6 }]);
+    expect(res.updated).toBe(1);
+  });
+
+  test("deleteMany() deletes matching rows and counts them", async () => {
+    respond = () => Response.json([{ id: "a" }, { id: "b" }, { id: "c" }]);
+    const bool = createBoolClient(CONFIG);
+    const res = await bool.entities.todos.deleteMany({ done: true });
+    expect(calls[0]!.init?.method).toBe("DELETE");
+    expect(reqQuery(calls[0]!).get("done")).toBe("eq.true");
+    expect(res).toEqual({ success: true, deleted: 3 });
+  });
+
+  test("importEntities() parses CSV client-side and bulk-creates", async () => {
+    const created: unknown[] = [];
+    respond = (_url, init) => {
+      if (init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        created.push(...body);
+        return Response.json(body);
+      }
+      return new Response("[]");
+    };
+    const bool = createBoolClient(CONFIG);
+    const csv = 'title,done\n"Buy, milk",false\n"Say ""hi""",true\n';
+    const file = new File([csv], "todos.csv", { type: "text/csv" });
+    const res = await bool.entities.todos.importEntities(file);
+    expect(res.status).toBe("success");
+    expect(created).toEqual([
+      { title: "Buy, milk", done: "false" },
+      { title: 'Say "hi"', done: "true" },
+    ]);
   });
 });
 
