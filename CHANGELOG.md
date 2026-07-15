@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+Publishing now goes through npm OIDC trusted publishing (no long-lived token).
+No functional or API changes.
+
 ## 0.1.0
 
 Initial release. Lifts the previously-vendored Bool v2 ("gateway") app client

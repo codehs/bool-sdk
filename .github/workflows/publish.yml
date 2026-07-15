@@ -1,6 +1,12 @@
 # Publishes to npm when a GitHub release is published (tag `vX.Y.Z`).
-# Requires an npm automation token in the repo secret NPM_TOKEN with publish
-# rights on the package.
+#
+# Auth is OIDC "trusted publishing" — no npm token. The package is configured
+# on npmjs.com (bool-sdk → Settings → Trusted Publisher) to trust this repo +
+# this workflow file, and `id-token: write` below lets the runner mint the OIDC
+# token npm verifies. Provenance is generated automatically on OIDC publishes.
+#
+# Requires npm >= 11.5.1 (installed below) — the Node bundled with setup-node
+# ships an older npm that predates trusted publishing.
 name: Publish
 
 on:
@@ -9,18 +15,20 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm provenance
+  id-token: write # OIDC trusted publishing + provenance
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - name: Upgrade npm for trusted publishing (OIDC)
+        run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun test
@@ -34,5 +42,3 @@ jobs:
             exit 1
           fi
       - run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
