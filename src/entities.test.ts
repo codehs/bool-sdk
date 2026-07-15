@@ -106,6 +106,52 @@ describe("entities: read paths → PostgREST", () => {
     expect(reqQuery(calls[0]!).get("or")).toBe("(status.eq.active,priority.gte.3)");
   });
 
+  test("filter() $not negates a single inner operator", async () => {
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.filter({ age: { $not: { $gt: 18 } } });
+    expect(reqQuery(calls[0]!).get("age")).toBe("not.gt.18");
+  });
+
+  test("filter() $nor negates every sub-condition (De Morgan, valid PostgREST)", async () => {
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.filter({ $nor: [{ status: "done" }, { pinned: true }] });
+    const q = reqQuery(calls[0]!);
+    // NOR = NOT status=done AND NOT pinned=true — two negated params, no garbage.
+    expect(q.get("status")).toBe("not.eq.done");
+    expect(q.get("pinned")).toBe("not.eq.true");
+    expect(new URL(calls[0]!.url).search).not.toContain("undefined");
+  });
+
+  test("filter() $and merges nested sub-queries", async () => {
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.filter({ $and: [{ status: "active" }, { priority: { $gte: 3 } }] });
+    const q = reqQuery(calls[0]!);
+    expect(q.get("status")).toBe("eq.active");
+    expect(q.get("priority")).toBe("gte.3");
+  });
+
+  test("filter() ignores unsupported $size rather than emitting bad SQL", async () => {
+    const bool = createBoolClient(CONFIG);
+    // $size is intentionally unsupported (not in the type) — cast to prove it's
+    // silently dropped rather than emitting invalid SQL.
+    await bool.entities.todos.filter({ tags: { $size: 3 } } as any);
+    expect(new URL(calls[0]!.url).search).not.toContain("size");
+    expect(new URL(calls[0]!.url).search).not.toContain("undefined");
+  });
+
+  test("sort accepts an explicit + prefix for ascending", async () => {
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.list("+title");
+    expect(reqQuery(calls[0]!).get("order")).toBe("title.asc");
+  });
+
+  test("list caps the limit at 1000", async () => {
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.list("-created_at", 99999);
+    // range(0, 999) → limit 1000
+    expect(reqQuery(calls[0]!).get("limit")).toBe("1000");
+  });
+
   test("fields limits the selected columns", async () => {
     const bool = createBoolClient(CONFIG);
     await bool.entities.todos.list("-created_at", 50, 0, ["id", "title"]);
@@ -236,6 +282,66 @@ describe("entities: write paths → PostgREST", () => {
     )!;
     expect(JSON.parse(String(upsert.init?.body))).toEqual([{ id: "a", views: 6 }]);
     expect(res.updated).toBe(1);
+  });
+
+  test("updateMany() with $mul goes through the atomic RPC", async () => {
+    respond = (url) =>
+      url.includes("/rpc/bool_apply_numeric")
+        ? new Response(null, { status: 204 })
+        : Response.json([{ id: "a" }]);
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.posts.updateMany({ id: "a" }, { $mul: { score: 2 } });
+    const rpc = calls.find((c) => c.url.includes("/rpc/bool_apply_numeric"))!;
+    expect(JSON.parse(String(rpc.init?.body))).toEqual({
+      p_table: "posts",
+      p_ids: ["a"],
+      p_inc: null,
+      p_mul: { score: 2 },
+    });
+  });
+
+  test("updateMany() with $unset PATCHes the columns to null (one atomic call)", async () => {
+    respond = () => Response.json([{ id: "a" }]);
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.updateMany({ id: "a" }, { $unset: { note: true } });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.init?.method).toBe("PATCH");
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ note: null });
+  });
+
+  test("updateMany() with $set + $inc PATCHes the set fields then calls the RPC for the arithmetic", async () => {
+    respond = (url) =>
+      url.includes("/rpc/bool_apply_numeric")
+        ? new Response(null, { status: 204 })
+        : Response.json([{ id: "a" }]);
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.posts.updateMany({ id: "a" }, { $set: { status: "hot" }, $inc: { views: 1 } });
+    const patch = calls.find((c) => c.init?.method === "PATCH")!;
+    expect(JSON.parse(String(patch.init?.body))).toEqual({ status: "hot" });
+    const rpc = calls.find((c) => c.url.includes("/rpc/bool_apply_numeric"))!;
+    expect(JSON.parse(String(rpc.init?.body)).p_inc).toEqual({ views: 1 });
+  });
+
+  test("updateMany() with $push read-modify-writes the array (documented non-atomic)", async () => {
+    respond = (url, init) => {
+      if (init?.method === "POST") return Response.json([{ id: "a", tags: ["x", "y"] }]);
+      return Response.json([{ id: "a", tags: ["x"] }]); // the SELECT
+    };
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.posts.updateMany({ id: "a" }, { $push: { tags: "y" } });
+    const upsert = calls.find((c) => c.init?.method === "POST")!;
+    expect(JSON.parse(String(upsert.init?.body))).toEqual([{ id: "a", tags: ["x", "y"] }]);
+  });
+
+  test("updateMany() with $pull removes the value from the array", async () => {
+    respond = (url, init) => {
+      if (init?.method === "POST") return Response.json([{ id: "a", tags: ["x"] }]);
+      return Response.json([{ id: "a", tags: ["x", "y"] }]);
+    };
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.posts.updateMany({ id: "a" }, { $pull: { tags: "y" } });
+    const upsert = calls.find((c) => c.init?.method === "POST")!;
+    expect(JSON.parse(String(upsert.init?.body))).toEqual([{ id: "a", tags: ["x"] }]);
   });
 
   test("deleteMany() deletes matching rows and counts them", async () => {

@@ -203,6 +203,27 @@ function toPgConditions(query: FilterQuery): string {
   return parts.join(",");
 }
 
+/** Apply the negation of a flat sub-query (used for `$nor`): every condition
+ * becomes its NOT, and the results AND together. Only scalar/comparison
+ * conditions are supported inside `$nor`. */
+function applyNegated(query: QueryBuilder, sub: FilterQuery): QueryBuilder {
+  let q = query;
+  for (const [col, cond] of Object.entries(sub)) {
+    if (col === "$and" || col === "$or" || col === "$nor") continue;
+    if (cond === null) q = q.not(col, "is", null);
+    else if (Array.isArray(cond)) q = q.not(col, "in", `(${(cond as unknown[]).join(",")})`);
+    else if (typeof cond === "object") {
+      for (const [op, v] of Object.entries(cond as Record<string, unknown>)) {
+        const pg = MONGO_TO_PG[op];
+        if (pg) q = q.not(col, pg, v);
+      }
+    } else {
+      q = q.not(col, "eq", cond);
+    }
+  }
+  return q;
+}
+
 function applyFilter(query: QueryBuilder, filter: FilterQuery): QueryBuilder {
   let q = query;
   for (const [column, value] of Object.entries(filter)) {
@@ -212,7 +233,9 @@ function applyFilter(query: QueryBuilder, filter: FilterQuery): QueryBuilder {
     } else if (column === "$or") {
       q = q.or((value as FilterQuery[]).map(toPgConditions).join(","));
     } else if (column === "$nor") {
-      q = q.not("or", `(${(value as FilterQuery[]).map(toPgConditions).join(",")})`);
+      // NOR = AND of negated conditions (De Morgan). `.not("or", …)` isn't a
+      // valid supabase-js call, so negate each sub-condition individually.
+      for (const sub of value as FilterQuery[]) q = applyNegated(q, sub);
     } else if (value === null) {
       q = q.is(column, null);
     } else if (Array.isArray(value)) {
