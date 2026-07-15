@@ -41,4 +41,20 @@ jobs:
             echo "package.json version ($PKG_VERSION) != release tag ($TAG)" >&2
             exit 1
           fi
-      - run: npm publish
+      # Route to a dist-tag derived from the version. A prerelease version
+      # (`0.2.0-next.0`) publishes to that channel's tag (`next`) — invisible to
+      # `latest` and to caret ranges, so no production app can pull it. A plain
+      # version (`0.2.0`) publishes to `latest`. This is the whole two-channel
+      # (stable / canary) mechanism; the GitHub release's "prerelease" checkbox
+      # is cosmetic — the version string is the source of truth.
+      - name: Publish (dist-tag from version)
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [[ "$VERSION" == *-* ]]; then
+            DIST_TAG="${VERSION#*-}"   # 0.2.0-next.0 -> next.0
+            DIST_TAG="${DIST_TAG%%.*}" # next.0 -> next
+          else
+            DIST_TAG="latest"
+          fi
+          echo "Publishing $VERSION to dist-tag '$DIST_TAG'"
+          npm publish --tag "$DIST_TAG"
