@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0-next.8
+
+Adds per-user API keys (Base44 convention): the gateway's `/users/me` lazily
+mints and returns a personal `api_key` for the signed-in end user.
+
+- `BoolUser.apiKey?: string` — typed access to the key.
+- `auth.rotateApiKey()` — rotates the key; the old one stops working
+  immediately. Surfaces a 503 if keys aren't configured on the deployment.
+
+External callers send the key as the `api_key` header and act exactly as
+that user — same per-user RLS scoping as in the app. Pairs with a gateway-side
+change that accepts `api_key` and stamps `sub` accordingly.
+
 ## 0.2.0-next.7
 
 - **Entities pagination cap raised 1000 → 5000, matching Base44.** `list` and
