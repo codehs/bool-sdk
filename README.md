@@ -25,6 +25,9 @@ tested, and upgradable independently of any one app.
   ```
   Filters use MongoDB-style operators (`$eq $ne $gt $gte $lt $lte $in $nin
   $exists $regex $all $not`, plus `$and`/`$or`/`$nor`); sort is a `-col` string.
+  `list`/`filter` are paged: **50 rows by default, 5000 max per call** (over-cap
+  throws) — page larger tables with the `limit` + `skip` args. `updateMany` /
+  `deleteMany` act on every matching row regardless of page size.
 - **Data + Storage through the Bool gateway.** `client.db` is a standard
   [supabase-js](https://supabase.com/docs/reference/javascript) client (what
   `entities` is built on) whose REST and Storage traffic is routed to the Bool

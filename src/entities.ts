@@ -86,8 +86,9 @@ export type ImportResult<T = any> = {
 /** CRUD + realtime for one entity table. `T` defaults to `any` (untyped);
  * apps can pass a row type for autocomplete. Mirrors Base44's EntityHandler. */
 export interface EntityHandler<T = any> {
-  /** All rows, newest first by default. `limit` defaults to 50, max 1000.
-   * `fields` restricts the columns returned. */
+  /** Rows, newest first by default. `limit` defaults to 50, max 5000 — page
+   * through larger result sets with `limit` + `skip` (an over-cap `limit`
+   * throws rather than silently truncating). `fields` restricts the columns. */
   list(sort?: SortSpec, limit?: number, skip?: number, fields?: (keyof T & string)[]): Promise<T[]>;
   /** Rows matching `query`. See {@link FilterQuery}. */
   filter(
@@ -145,7 +146,7 @@ export interface EntitiesModule {
 
 const DEFAULT_SORT = "-created_at";
 const DEFAULT_LIMIT = 50;
-const MAX_LIMIT = 1000;
+const MAX_LIMIT = 5000;
 
 // A supabase-js filter/query builder is chainable and thenable; we only need
 // the handful of methods below, so keep it loosely typed rather than importing
@@ -346,8 +347,15 @@ function createEntityHandler(
     return fields && fields.length ? fields.join(",") : "*";
   }
   function paginate(query: QueryBuilder, limit: number, skip: number): QueryBuilder {
-    const capped = Math.min(limit, MAX_LIMIT);
-    return query.range(skip, skip + capped - 1);
+    // A single request returns at most MAX_LIMIT rows. Refuse an over-cap limit
+    // loudly rather than silently truncating — page through with limit + skip.
+    if (limit > MAX_LIMIT) {
+      throw new Error(
+        `limit ${limit} exceeds the ${MAX_LIMIT}-row maximum per request; ` +
+          `page through larger result sets with limit + skip.`,
+      );
+    }
+    return query.range(skip, skip + limit - 1);
   }
   async function unwrap<R>(query: QueryBuilder): Promise<R> {
     const { data, error } = await query;
