@@ -62,6 +62,11 @@ export type BoolUser = {
   provider: "password" | "google";
   emailVerified: boolean;
   createdAt: string;
+  /** The user's personal API key for external/programmatic calls (sent as the
+   * `api_key` header). Acts exactly as this user — same per-user data scoping
+   * as in the app. Lazily minted by the gateway on first /me; absent when the
+   * deployment hasn't configured API keys. Rotate via auth.rotateApiKey(). */
+  apiKey?: string;
 };
 
 export type AuthEvent = "SIGNED_IN" | "SIGNED_OUT";
@@ -85,6 +90,9 @@ export type BoolAuth = {
   };
   resetPasswordForEmail(email: string): Promise<{ data: unknown; error: unknown }>;
   confirmPasswordReset(opts: { token: string; password: string }): Promise<AuthResult>;
+  /** Mint a replacement personal API key; the old one stops working
+   * immediately. Returns the new key (also reflected by the next getUser()). */
+  rotateApiKey(): Promise<{ data: { apiKey: string | null }; error: unknown }>;
 };
 
 /** A row-data-free change notification: some row in `table` saw `op`. Refetch
@@ -385,6 +393,13 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     async getUser(): Promise<AuthResult> {
       const { res, body } = await usersCall("/me", { method: "GET" });
       return { data: { user: res.ok && body ? body.user : null }, error: null };
+    },
+    async rotateApiKey(): Promise<{ data: { apiKey: string | null }; error: unknown }> {
+      const { res, body } = await usersCall("/api-key/rotate", { method: "POST" });
+      if (!res.ok) {
+        return { data: { apiKey: null }, error: body || { error: "rotate_failed" } };
+      }
+      return { data: { apiKey: body?.apiKey ?? null }, error: null };
     },
     onAuthStateChange(callback: AuthChangeListener) {
       authListeners.add(callback);
