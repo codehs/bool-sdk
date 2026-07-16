@@ -240,6 +240,48 @@ describe("end-user auth (gateway users plane)", () => {
   });
 });
 
+describe("per-user API key", () => {
+  test("getUser passes the gateway's apiKey field through on the user", async () => {
+    respond = () =>
+      new Response(
+        JSON.stringify({
+          user: { id: "u1", email: "a@b.c", apiKey: "boolk_abc123" },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    const client = createBoolClient(CONFIG);
+    const { data } = await client.auth.getUser();
+    expect((data.user as any).apiKey).toBe("boolk_abc123");
+  });
+
+  test("rotateApiKey POSTs the rotate route and returns the fresh key", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ apiKey: "boolk_fresh456" }), {
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const { data, error } = await client.auth.rotateApiKey();
+    expect(error).toBeNull();
+    expect(data.apiKey).toBe("boolk_fresh456");
+    expect(calls[0]!.url).toBe(
+      "https://bool.test/served/my-app/_bool/v1/users/api-key/rotate",
+    );
+    expect(calls[0]!.init?.method).toBe("POST");
+  });
+
+  test("rotateApiKey surfaces a 503 (keys not configured) as an error, null key", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "api_keys_not_configured" }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const { data, error } = await client.auth.rotateApiKey();
+    expect(data.apiKey).toBeNull();
+    expect(error).toEqual({ error: "api_keys_not_configured" });
+  });
+});
+
 describe("default client registry", () => {
   test("the last-created client is the default (hot reload re-registers)", () => {
     const first = createBoolClient(CONFIG);
