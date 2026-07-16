@@ -145,11 +145,25 @@ describe("entities: read paths → PostgREST", () => {
     expect(reqQuery(calls[0]!).get("order")).toBe("title.asc");
   });
 
-  test("list caps the limit at 1000", async () => {
+  test("list() allows an explicit limit up to the max (5000)", async () => {
     const bool = createBoolClient(CONFIG);
-    await bool.entities.todos.list("-created_at", 99999);
-    // range(0, 999) → limit 1000
-    expect(reqQuery(calls[0]!).get("limit")).toBe("1000");
+    await bool.entities.todos.list("-created_at", 5000);
+    expect(reqQuery(calls[0]!).get("limit")).toBe("5000");
+  });
+
+  test("list() throws on an over-cap limit instead of silently truncating", async () => {
+    const bool = createBoolClient(CONFIG);
+    await expect(bool.entities.todos.list("-created_at", 5001)).rejects.toThrow(/maximum/i);
+    // It fails before touching the network — no partial/truncated request goes out.
+    expect(calls).toHaveLength(0);
+  });
+
+  test("filter() defaults to the same 50-row page", async () => {
+    const bool = createBoolClient(CONFIG);
+    await bool.entities.todos.filter({ status: "active" });
+    const q = reqQuery(calls[0]!);
+    expect(q.get("status")).toBe("eq.active");
+    expect(q.get("limit")).toBe("50");
   });
 
   test("fields limits the selected columns", async () => {

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0-next.7
+
+- **Entities pagination cap raised 1000 → 5000, matching Base44.** `list` and
+  `filter` still page (50 rows by default) but now allow up to 5000 rows per
+  call. A `limit` above the cap **throws** instead of silently truncating, so
+  over-large reads fail loudly rather than returning a partial result the caller
+  mistakes for the whole set. Page larger tables with `limit` + `skip`.
+
 ## 0.2.0-next.6
 
 Combines the entities data layer (next.0–next.4) with the auth fail-safe fix
