@@ -384,9 +384,12 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     },
     onAuthStateChange(callback: AuthChangeListener) {
       authListeners.add(callback);
-      auth.getUser().then(({ data }) =>
-        callback(data.user ? "SIGNED_IN" : "SIGNED_OUT", data.user),
-      );
+      auth
+        .getUser()
+        .then(({ data }) =>
+          callback(data.user ? "SIGNED_IN" : "SIGNED_OUT", data.user),
+        )
+        .catch(() => callback("SIGNED_OUT", null));
       return {
         data: {
           subscription: {
