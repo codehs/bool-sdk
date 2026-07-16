@@ -12,3 +12,16 @@ export {
   type AuthResult,
   type Credentials,
 } from "./client.js";
+export {
+  type EntitiesModule,
+  type EntityHandler,
+  type FilterQuery,
+  type FilterValue,
+  type FilterOperators,
+  type UpdateOps,
+  type SortSpec,
+  type DeleteResult,
+  type DeleteManyResult,
+  type UpdateManyResult,
+  type ImportResult,
+} from "./entities.js";
