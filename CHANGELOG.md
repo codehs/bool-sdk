@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0-next.5
+
+Fix: `onAuthStateChange` (and thus `<AuthGate>`) no longer hangs forever when
+the initial `/users/me` session check rejects (cross-origin/network failure —
+e.g. the sandbox-preview context used for project-card screenshots). A rejected
+check now fires `SIGNED_OUT` instead of leaving `loading` stuck, so the app
+renders its sign-in screen rather than a blank page. Adds a regression test.
+
 ## 0.1.1
 
 Publishing now goes through npm OIDC trusted publishing (no long-lived token).

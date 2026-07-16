@@ -199,6 +199,21 @@ describe("end-user auth (gateway users plane)", () => {
     expect(events).toHaveLength(1);
   });
 
+  test("onAuthStateChange still fires SIGNED_OUT when the session check rejects (no hang)", async () => {
+    // A cross-origin / network failure makes the /users/me fetch reject. Without
+    // a .catch the callback never fires, `loading` never clears, and <AuthGate>
+    // hangs on a blank screen forever — which is what left project-card
+    // screenshots capturing an empty background. Treat a rejection as signed-out.
+    globalThis.fetch = (async () => {
+      throw new TypeError("Failed to fetch");
+    }) as unknown as typeof fetch;
+    const client = createBoolClient(CONFIG);
+    const events: unknown[][] = [];
+    client.auth.onAuthStateChange((event, user) => events.push([event, user]));
+    await tick();
+    expect(events).toEqual([["SIGNED_OUT", null]]);
+  });
+
   test("resetPasswordForEmail always resolves ok (no account probing), even on server error", async () => {
     respond = () => new Response("boom", { status: 500 });
     const client = createBoolClient(CONFIG);
