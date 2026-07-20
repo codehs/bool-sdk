@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.0-next.9
+
+Fix: `AuthGate` / `useSignInForm` no longer disagree about a pending
+`?bool_reset_token=` link.
+
+- Signing out after a password reset no longer bounces back to "set a new
+  password" — the token is now stripped from the URL exactly once, at the
+  provider, instead of lingering forever and being re-read on every
+  unauthenticated remount.
+- Clicking a reset link while already signed in (e.g. from a previous reset,
+  which signs you in on the new password) now correctly prompts for a new
+  password instead of silently auto-logging in — `AuthGate` forces the
+  reset screen whenever a token is pending, even over an active session.
+
+`src/react.tsx` was unchanged since `0.1.0`, so this bug shipped to every
+already-created app on the stable `^0.1.0` range too.
+
 ## 0.2.0-next.8
 
 Adds per-user API keys (Base44 convention): the gateway's `/users/me` lazily
