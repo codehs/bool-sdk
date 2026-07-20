@@ -29,9 +29,34 @@ export type BoolAuthState = {
   signOut: () => Promise<void>;
   resetPassword: (email: string) => Promise<void>;
   confirmReset: (token: string, password: string) => Promise<AuthActionResult>;
+  /** A `?bool_reset_token=…` was found in the URL on load and hasn't been
+   * consumed yet. Internal plumbing consumed by AuthGate (to force the reset
+   * screen even over an existing session) and useSignInForm (to drive the
+   * newPassword step) — app code doesn't need to read this directly. */
+  pendingResetToken: string | null;
+  /** Drop the pending reset token (after a successful confirmReset, or when
+   * the visitor backs out of the reset flow) so AuthGate and useSignInForm
+   * fall back to deciding purely on session state. */
+  clearPendingReset: () => void;
 };
 
 const BoolAuthContext = createContext<BoolAuthState | null>(null);
+
+/** Extract `bool_reset_token` from a `location.search` string, returning the
+ * token (or null if absent) and the search string with just that param
+ * removed — every other param is preserved. Pure string logic so it's
+ * unit-testable without a DOM; the caller applies `rest` via
+ * history.replaceState. */
+export function takeResetTokenFromSearch(
+  search: string,
+): { token: string | null; rest: string } {
+  const params = new URLSearchParams(search);
+  const token = params.get("bool_reset_token");
+  if (token === null) return { token: null, rest: search };
+  params.delete("bool_reset_token");
+  const rest = params.toString();
+  return { token, rest: rest ? `?${rest}` : "" };
+}
 
 export function BoolAuthProvider({
   children,
@@ -45,6 +70,7 @@ export function BoolAuthProvider({
   const bool = client ?? getDefaultBoolClient();
   const [user, setUser] = useState<BoolUser | null>(null);
   const [loading, setLoading] = useState(true);
+  const [pendingResetToken, setPendingResetToken] = useState<string | null>(null);
 
   useEffect(() => {
     // Fires once with the current session (or null), then on every sign in/out.
@@ -57,9 +83,30 @@ export function BoolAuthProvider({
     return () => data.subscription.unsubscribe();
   }, [bool]);
 
+  // A reset email links back here with ?bool_reset_token=… — capture it into
+  // state ONCE and strip it from the URL immediately. Runs at the provider
+  // (not inside useSignInForm, which only mounts when AuthGate picks the
+  // fallback branch) so the token is visible to AuthGate too, and stripping it
+  // here — rather than leaving it in the URL until the reset is confirmed —
+  // means a later sign-out or hard refresh can never resurrect the
+  // newPassword screen from a long-stale query param.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const { token, rest } = takeResetTokenFromSearch(window.location.search);
+    if (!token) return;
+    setPendingResetToken(token);
+    const url = new URL(window.location.href);
+    url.search = rest;
+    window.history.replaceState(window.history.state, "", url.toString());
+  }, []);
+
   const value: BoolAuthState = {
     user,
     loading,
+    pendingResetToken,
+    clearPendingReset() {
+      setPendingResetToken(null);
+    },
     async signIn(email, password) {
       const { data, error } = await bool.auth.signInWithPassword({ email, password });
       if (data.user) setUser(data.user);
@@ -97,7 +144,11 @@ export function useBoolAuth(): BoolAuthState {
 }
 
 // Renders `children` for a signed-in user, otherwise `fallback` (your login
-// screen). Renders nothing while the initial session check is in flight.
+// screen). Renders nothing while the initial session check is in flight. A
+// pending reset token forces `fallback` even over an existing session — a
+// reset link is an explicit ask to set a new password, so it must always
+// reach that screen instead of silently landing in the already-signed-in app
+// (e.g. a stale session from a previous reset, or a shared device).
 export function AuthGate({
   children,
   fallback,
@@ -105,8 +156,9 @@ export function AuthGate({
   children: ReactNode;
   fallback: ReactNode;
 }) {
-  const { user, loading } = useBoolAuth();
+  const { user, loading, pendingResetToken } = useBoolAuth();
   if (loading) return null;
+  if (pendingResetToken) return <>{fallback}</>;
   return <>{user ? children : fallback}</>;
 }
 
@@ -121,23 +173,31 @@ export type SignInMode = "signin" | "signup" | "reset" | "newPassword";
 //   <button onClick={f.signInWithGoogle}>Continue with Google</button>
 //   <button onClick={() => f.setMode("signup")}>Create an account</button>
 export function useSignInForm() {
-  const { signIn, signUp, signInWithGoogle, resetPassword, confirmReset } = useBoolAuth();
-  const [mode, setMode] = useState<SignInMode>("signin");
+  const { signIn, signUp, signInWithGoogle, resetPassword, confirmReset, pendingResetToken, clearPendingReset } =
+    useBoolAuth();
+  // Lazy-init from the provider's already-captured token (BoolAuthProvider is
+  // an ancestor and reads/strips the URL on its own mount, which always
+  // completes before this component can mount — AuthGate renders nothing
+  // until then). The effect below covers the rare case it lands a tick late.
+  const [mode, setModeState] = useState<SignInMode>(() =>
+    pendingResetToken ? "newPassword" : "signin",
+  );
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [resetToken, setResetToken] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // A reset email links back here with ?bool_reset_token=… — switch to the
-  // "set a new password" mode when that's present.
   useEffect(() => {
-    const token = new URLSearchParams(window.location.search).get("bool_reset_token");
-    if (token) {
-      setResetToken(token);
-      setMode("newPassword");
-    }
-  }, []);
+    if (pendingResetToken) setModeState("newPassword");
+  }, [pendingResetToken]);
+
+  // Leaving newPassword mode without finishing the reset (e.g. "Back to sign
+  // in") drops the pending token — otherwise AuthGate would keep forcing this
+  // screen even after the visitor has navigated away from it.
+  function setMode(next: SignInMode) {
+    if (next !== "newPassword" && pendingResetToken) clearPendingReset();
+    setModeState(next);
+  }
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -153,9 +213,10 @@ export function useSignInForm() {
       } else if (mode === "reset") {
         await resetPassword(email);
         setMessage("If that email has an account, a reset link is on its way.");
-      } else if (mode === "newPassword" && resetToken) {
-        const { error } = await confirmReset(resetToken, password);
+      } else if (mode === "newPassword" && pendingResetToken) {
+        const { error } = await confirmReset(pendingResetToken, password);
         if (error) setMessage("That reset link is invalid or has expired.");
+        else clearPendingReset();
       }
     } finally {
       setBusy(false);
