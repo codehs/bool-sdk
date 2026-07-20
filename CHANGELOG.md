@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.0-next.10
+
+Adds `bool.secrets` — the gateway "escape hatch" for calling external APIs with
+a server-side secret, so a third-party key never reaches the client.
+
+- `bool.secrets.fetch(name, path, init)` — call an external API through the
+  gateway with a stored secret injected server-side. `name` is the secret's
+  name (configured in the app's Secrets dashboard); `path` is the sub-path under
+  the destination the secret is bound to. Returns the destination's raw
+  `Response`, used just like `fetch`:
+
+  ```ts
+  const res = await bool.secrets.fetch("OPENAI_KEY", "/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o-mini", messages }),
+  });
+  ```
+
+The value is stored encrypted on Bool's server and bound to one destination —
+Bool attaches it only on the server, and only to that destination, so a static
+app can call a paid API without ever exposing the key. Pairs with the gateway
+secret plane (`/_bool/v1/secret/<name>/*`) in the Bool platform repo.
+
 ## 0.2.0-next.9
 
 Fix: `AuthGate` / `useSignInForm` no longer disagree about a pending

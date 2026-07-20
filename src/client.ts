@@ -99,6 +99,33 @@ export type BoolAuth = {
  * whatever you derive from that table — the ping never carries the data. */
 export type BoolChangePayload = { table?: string; op?: string };
 
+/** Server-side secrets — the gateway "escape hatch". A deployed Bool is a static
+ * bundle, so a third-party API key can never live in it. Instead the app owner
+ * stores the secret on Bool's server, bound to one destination, and the app
+ * reaches that destination THROUGH the gateway, which injects the real value
+ * server-side. The value never enters the client. */
+export type BoolSecrets = {
+  /**
+   * Call an external API with a stored secret injected server-side. `name` is the
+   * secret's name (as configured in the app's Secrets dashboard); `path` is the
+   * sub-path under the destination the secret is bound to. Use it like `fetch`:
+   *
+   * ```ts
+   * const res = await bool.secrets.fetch("OPENAI_KEY", "/v1/chat/completions", {
+   *   method: "POST",
+   *   headers: { "Content-Type": "application/json" },
+   *   body: JSON.stringify({ model: "gpt-4o-mini", messages }),
+   * });
+   * const data = await res.json();
+   * ```
+   *
+   * Returns the destination's raw `Response`. The secret value is NEVER exposed
+   * to the client — Bool attaches it only on the server, and only to the
+   * destination the secret is bound to.
+   */
+  fetch(name: string, path: string, init?: RequestInit): Promise<Response>;
+};
+
 /** The gateway-routed supabase-js client. Loosely typed on the schema-name
  * generic because each Bool runs in its own non-"public" schema. */
 export type BoolDb = SupabaseClient<any, any, any, any, any>;
@@ -113,6 +140,9 @@ export type BoolClient = {
   entities: EntitiesModule;
   /** End-user auth for this app (gateway users plane). */
   auth: BoolAuth;
+  /** Call external APIs with server-side secrets injected by the gateway
+   * (`bool.secrets.fetch(name, path, init)`). The secret never reaches the client. */
+  secrets: BoolSecrets;
   /** This app's private Postgres schema name. */
   schema: string;
   /** Subscribe to the app's realtime "doorbell": fires whenever any row in the
@@ -445,6 +475,25 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     },
   };
 
+  // Server-side secrets (the gateway "escape hatch", /_bool/v1/secret/<name>/*).
+  // Route the app's call to the gateway, which resolves the secret, injects the
+  // real value, and forwards to the bound destination — the value never reaches
+  // here. credentials:include + the viewer/eu-session headers mirror the db and
+  // users planes so the same live-gate identity flows (same-origin cookie when
+  // deployed, viewer token cross-origin in preview).
+  const secrets: BoolSecrets = {
+    fetch(name: string, path: string, init?: RequestInit): Promise<Response> {
+      const headers = new Headers(init?.headers ?? {});
+      if (viewerToken) headers.set("x-bool-viewer", viewerToken);
+      if (euSessionToken) headers.set("x-bool-eu-session", euSessionToken);
+      const sub = path.startsWith("/") ? path : "/" + path;
+      return fetch(
+        `${GATEWAY}/_bool/${GATEWAY_API}/secret/${encodeURIComponent(name)}${sub}`,
+        { ...init, headers, credentials: "include" },
+      );
+    },
+  };
+
   // Realtime "doorbell": the app schema's grants are revoked, so Supabase
   // `postgres_changes` never fires. Instead the server broadcasts a
   // row-data-free ping on the PUBLIC channel "bool:" + schema whenever any
@@ -468,6 +517,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     db,
     entities: createEntitiesModule(db, subscribeToChanges),
     auth,
+    secrets,
     schema,
     subscribeToChanges,
   };

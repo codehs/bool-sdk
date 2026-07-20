@@ -42,6 +42,20 @@ tested, and upgradable independently of any one app.
   `onAuthStateChange`, password reset) but talks to the Bool gateway's users
   plane, so each app has its own isolated accounts and the client never
   handles a credential.
+- **Server-side secrets** (the gateway "escape hatch"). `bool.secrets.fetch(name,
+  path, init)` calls an external API with a stored secret injected server-side,
+  so a third-party key never ships to the client. The owner stores the secret
+  once (encrypted, bound to one destination) in the app's Secrets dashboard; the
+  app just does:
+  ```ts
+  const res = await bool.secrets.fetch("OPENAI_KEY", "/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o-mini", messages }),
+  });
+  ```
+  Bool attaches the real value only on the server, and only to the bound
+  destination — routed to the gateway secret plane (`/_bool/v1/secret/<name>/*`).
 - **React auth layer** (`bool-sdk/react`): `<BoolAuthProvider>`,
   `useBoolAuth()`, `<AuthGate>`, and the headless `useSignInForm()` state
   machine that login forms bind to.
@@ -83,7 +97,8 @@ create more than one.
 
 ## Compatibility
 
-The gateway wire paths (`/_bool/v1/db`, `/_bool/v1/users`) are append-only:
+The gateway wire paths (`/_bool/v1/db`, `/_bool/v1/users`, `/_bool/v1/secret`)
+are append-only:
 new server behavior ships under a new version segment, never by mutating what
 existing SDK versions call. Keep this SDK in sync with the gateway routes in
 the Bool platform repo (`lib/gateway/`).

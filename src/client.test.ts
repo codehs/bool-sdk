@@ -282,6 +282,54 @@ describe("per-user API key", () => {
   });
 });
 
+describe("secrets (gateway escape hatch)", () => {
+  test("fetch routes to /_bool/v1/secret/<name>/<path> through the gateway, credentials included", async () => {
+    respond = () => Response.json({ ok: true });
+    const client = createBoolClient(CONFIG);
+    await client.secrets.fetch("OPENAI_KEY", "/v1/chat/completions", { method: "POST" });
+    expect(calls[0]!.url).toBe(
+      "https://bool.test/served/my-app/_bool/v1/secret/OPENAI_KEY/v1/chat/completions",
+    );
+    expect(calls[0]!.init?.method).toBe("POST");
+    expect(calls[0]!.init?.credentials).toBe("include");
+  });
+
+  test("uses a same-origin relative path when deployed at <slug>.<host>", async () => {
+    (globalThis as any).location = { host: "my-app.bool.test" };
+    respond = () => Response.json({ ok: true });
+    const client = createBoolClient(CONFIG);
+    await client.secrets.fetch("OPENAI_KEY", "/v1/models");
+    expect(calls[0]!.url).toBe("/_bool/v1/secret/OPENAI_KEY/v1/models");
+  });
+
+  test("a path without a leading slash is normalized", async () => {
+    respond = () => Response.json({ ok: true });
+    const client = createBoolClient(CONFIG);
+    await client.secrets.fetch("STRIPE_KEY", "v1/charges");
+    expect(calls[0]!.url).toBe(
+      "https://bool.test/served/my-app/_bool/v1/secret/STRIPE_KEY/v1/charges",
+    );
+  });
+
+  test("the secret name is URL-encoded into the path segment", async () => {
+    respond = () => Response.json({ ok: true });
+    const client = createBoolClient(CONFIG);
+    await client.secrets.fetch("A B", "/x");
+    expect(calls[0]!.url).toBe(
+      "https://bool.test/served/my-app/_bool/v1/secret/A%20B/x",
+    );
+  });
+
+  test("the viewer + eu-session tokens ride the call (preview identity)", async () => {
+    sessionStore.set("bool_eu_session_token", "eu-tok");
+    respond = () => Response.json({ ok: true });
+    const client = createBoolClient({ ...CONFIG, viewerToken: "vt-1" });
+    await client.secrets.fetch("OPENAI_KEY", "/v1/models");
+    expect(headersOf(calls[0]!).get("x-bool-viewer")).toBe("vt-1");
+    expect(headersOf(calls[0]!).get("x-bool-eu-session")).toBe("eu-tok");
+  });
+});
+
 describe("default client registry", () => {
   test("the last-created client is the default (hot reload re-registers)", () => {
     const first = createBoolClient(CONFIG);
