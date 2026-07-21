@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0-next.11
+## 0.2.0-next.10
 
 Adds `bool.ai` — the AI battery. A deployed app can call a model with NO API key
 in the bundle: the call routes through the gateway's AI plane (`/_bool/v1/ai`),
