@@ -42,6 +42,28 @@ tested, and upgradable independently of any one app.
   `onAuthStateChange`, password reset) but talks to the Bool gateway's users
   plane, so each app has its own isolated accounts and the client never
   handles a credential.
+- **AI battery.** `client.ai` gives a deployed app server-side AI with **no API
+  key in the bundle** — calls route through the gateway's AI plane
+  (`/_bool/v1/ai`), which runs the prompt against Bool's provider credential and
+  meters one AI credit against the app owner. Returns results directly and throws
+  a `BoolAiError` (with `status` + `code`, e.g. `"out_of_ai_credits"`) on failure:
+  ```ts
+  const text = await bool.ai.generate("Summarize this review: " + review);
+
+  const { sentiment, topics } = await bool.ai.generate<{
+    sentiment: string; topics: string[];
+  }>({
+    prompt: review,
+    schema: {
+      type: "object",
+      properties: { sentiment: { type: "string" }, topics: { type: "array", items: { type: "string" } } },
+      required: ["sentiment", "topics"],
+    },
+  });
+
+  for await (const chunk of bool.ai.stream("Write a haiku")) setText((t) => t + chunk);
+  ```
+  Requires the workspace to be opted into the `bool-ai` server flag.
 - **React auth layer** (`bool-sdk/react`): `<BoolAuthProvider>`,
   `useBoolAuth()`, `<AuthGate>`, and the headless `useSignInForm()` state
   machine that login forms bind to.
@@ -83,10 +105,10 @@ create more than one.
 
 ## Compatibility
 
-The gateway wire paths (`/_bool/v1/db`, `/_bool/v1/users`) are append-only:
-new server behavior ships under a new version segment, never by mutating what
-existing SDK versions call. Keep this SDK in sync with the gateway routes in
-the Bool platform repo (`lib/gateway/`).
+The gateway wire paths (`/_bool/v1/db`, `/_bool/v1/users`, `/_bool/v1/ai`) are
+append-only: new server behavior ships under a new path/version segment, never
+by mutating what existing SDK versions call. Keep this SDK in sync with the
+gateway routes in the Bool platform repo (`lib/gateway/`).
 
 ## Development
 

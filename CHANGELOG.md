@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0-next.10
+
+Adds `bool.ai` — the AI battery. A deployed app can call a model with NO API key
+in the bundle: the call routes through the gateway's AI plane (`/_bool/v1/ai`),
+which runs the prompt against Bool's own provider credential and meters one AI
+credit against the app owner's workspace. The key never reaches the client.
+
+- `bool.ai.generate(prompt)` → `Promise<string>` — plain text.
+- `bool.ai.generate({ prompt, schema })` → `Promise<T>` — structured output
+  validated against a JSON Schema; returns the parsed, typed object.
+- `bool.ai.stream(prompt)` → `AsyncIterable<string>` — text chunks for
+  typewriter UIs.
+- New exports: `BoolAi`, `BoolAiSchema`, and `BoolAiError` (carries `status` +
+  machine-readable `code`, e.g. `"out_of_ai_credits"` on a 402).
+
+Additive on the canary channel. The plane is gated server-side by the `bool-ai`
+feature flag (off by default), so `bool.ai` only works where the workspace has
+been opted in.
+
+Requires the gateway AI plane in the Bool platform repo (`lib/gateway/ai-route.ts`).
+
 ## 0.2.0-next.9
 
 Fix: `AuthGate` / `useSignInForm` no longer disagree about a pending

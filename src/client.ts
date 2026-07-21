@@ -99,6 +99,41 @@ export type BoolAuth = {
  * whatever you derive from that table — the ping never carries the data. */
 export type BoolChangePayload = { table?: string; op?: string };
 
+/** A JSON Schema describing the shape `bool.ai.generate` should return. Passed
+ * straight to the gateway, which validates the model's output against it. e.g.
+ * `{ type: "object", properties: { sentiment: { type: "string" } }, required: ["sentiment"] }`. */
+export type BoolAiSchema = Record<string, unknown>;
+
+/** Thrown when a bool.ai call fails. `status` is the gateway HTTP status and
+ * `code` its machine-readable error (e.g. "out_of_ai_credits" on a 402,
+ * "rate_limited" on a 429) so app code can branch without string-matching. */
+export class BoolAiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  constructor(code: string, status: number) {
+    super(`bool.ai failed: ${code} (${status})`);
+    this.name = "BoolAiError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+/** The AI battery — server-side AI with NO API key in the app bundle. Each call
+ * routes through the Bool gateway (/_bool/v1/ai), which runs the prompt against
+ * Bool's own provider credential and meters one AI credit against the app
+ * owner's workspace. The key never reaches the client. Returns results directly
+ * and THROWS a {@link BoolAiError} on failure (same ergonomics as `entities`). */
+export type BoolAi = {
+  /** Generate plain text from a prompt. */
+  generate(prompt: string): Promise<string>;
+  /** Generate structured output validated against a JSON Schema. Returns the
+   * parsed object, typed as `T` when you supply it. */
+  generate<T = unknown>(opts: { prompt: string; schema: BoolAiSchema }): Promise<T>;
+  /** Stream generated text as it's produced — an async iterator of text chunks,
+   * for typewriter UIs: `for await (const chunk of bool.ai.stream(p)) …`. */
+  stream(prompt: string): AsyncIterable<string>;
+};
+
 /** The gateway-routed supabase-js client. Loosely typed on the schema-name
  * generic because each Bool runs in its own non-"public" schema. */
 export type BoolDb = SupabaseClient<any, any, any, any, any>;
@@ -113,6 +148,9 @@ export type BoolClient = {
   entities: EntitiesModule;
   /** End-user auth for this app (gateway users plane). */
   auth: BoolAuth;
+  /** The AI battery: `ai.generate(prompt)` / `ai.generate({prompt, schema})` /
+   * `ai.stream(prompt)`. Server-side AI with no API key in the bundle. */
+  ai: BoolAi;
   /** This app's private Postgres schema name. */
   schema: string;
   /** Subscribe to the app's realtime "doorbell": fires whenever any row in the
@@ -445,6 +483,74 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     },
   };
 
+  // bool.ai battery — POST the prompt to the gateway AI plane
+  // (/_bool/v1/ai/*), which runs it against Bool's provider credential and
+  // meters one AI credit against the app owner. credentials:include + the
+  // viewer/eu-session identity headers mirror the db and users planes so the
+  // same live-gate identity flows (same-origin cookie deployed, viewer token
+  // cross-origin in preview).
+  function aiHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (viewerToken) headers["x-bool-viewer"] = viewerToken;
+    if (euSessionToken) headers["x-bool-eu-session"] = euSessionToken;
+    return headers;
+  }
+  const ai: BoolAi = {
+    // One impl covers both overloads (string prompt → text; {prompt, schema} →
+    // structured object). The public BoolAi type exposes the two typed forms.
+    generate: (async (
+      promptOrOpts: string | { prompt: string; schema?: BoolAiSchema },
+    ): Promise<unknown> => {
+      const opts =
+        typeof promptOrOpts === "string" ? { prompt: promptOrOpts } : promptOrOpts;
+      const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/ai/generate`, {
+        method: "POST",
+        headers: aiHeaders(),
+        credentials: "include",
+        body: JSON.stringify({ prompt: opts.prompt, schema: opts.schema }),
+      });
+      let body: any = null;
+      try {
+        body = await res.json();
+      } catch (_) {}
+      if (!res.ok) throw new BoolAiError(body?.error ?? "ai_failed", res.status);
+      // Structured → { object }; plain → { text }. Return the inner value.
+      return opts.schema ? body?.object : body?.text;
+    }) as BoolAi["generate"],
+
+    async *stream(prompt: string): AsyncIterable<string> {
+      const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/ai/stream`, {
+        method: "POST",
+        headers: aiHeaders(),
+        credentials: "include",
+        body: JSON.stringify({ prompt }),
+      });
+      if (!res.ok || !res.body) {
+        let body: any = null;
+        try {
+          body = await res.json();
+        } catch (_) {}
+        throw new BoolAiError(body?.error ?? "ai_failed", res.status);
+      }
+      // The gateway streams raw text deltas (text/plain). Decode and yield each
+      // chunk as it arrives.
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          if (chunk) yield chunk;
+        }
+        const tail = decoder.decode();
+        if (tail) yield tail;
+      } finally {
+        reader.releaseLock();
+      }
+    },
+  };
+
   // Realtime "doorbell": the app schema's grants are revoked, so Supabase
   // `postgres_changes` never fires. Instead the server broadcasts a
   // row-data-free ping on the PUBLIC channel "bool:" + schema whenever any
@@ -468,6 +574,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     db,
     entities: createEntitiesModule(db, subscribeToChanges),
     auth,
+    ai,
     schema,
     subscribeToChanges,
   };

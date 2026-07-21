@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import { createBoolClient, getDefaultBoolClient, type BoolClientConfig } from "./client";
+import {
+  createBoolClient,
+  getDefaultBoolClient,
+  BoolAiError,
+  type BoolClientConfig,
+} from "./client";
 
 // Behavioral tests for the gateway client with fetch/sessionStorage stubbed.
 // These pin the invariants that make the client correct + secure: REST and
@@ -279,6 +284,84 @@ describe("per-user API key", () => {
     const { data, error } = await client.auth.rotateApiKey();
     expect(data.apiKey).toBeNull();
     expect(error).toEqual({ error: "api_keys_not_configured" });
+  });
+});
+
+describe("bool.ai battery", () => {
+  test("generate(prompt) POSTs to the ai plane and returns text", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ text: "a summary" }), {
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const out = await client.ai.generate("summarize this");
+    expect(out).toBe("a summary");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("https://bool.test/served/my-app/_bool/v1/ai/generate");
+    expect(calls[0]!.init?.method).toBe("POST");
+    expect(calls[0]!.init?.credentials).toBe("include");
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ prompt: "summarize this" });
+  });
+
+  test("generate({prompt, schema}) sends the schema and returns the object", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ object: { sentiment: "positive" } }), {
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const out = await client.ai.generate<{ sentiment: string }>({
+      prompt: "rate this",
+      schema: { type: "object", properties: { sentiment: { type: "string" } } },
+    });
+    expect(out).toEqual({ sentiment: "positive" });
+    const body = JSON.parse(String(calls[0]!.init?.body));
+    expect(body.schema).toEqual({ type: "object", properties: { sentiment: { type: "string" } } });
+  });
+
+  test("generate throws BoolAiError carrying status + code on failure", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "out_of_ai_credits" }), {
+        status: 402,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err).toBeInstanceOf(BoolAiError);
+    expect(err.status).toBe(402);
+    expect(err.code).toBe("out_of_ai_credits");
+  });
+
+  test("stream yields decoded text chunks", async () => {
+    respond = () => new Response("Hello, world");
+    const client = createBoolClient(CONFIG);
+    let acc = "";
+    for await (const chunk of client.ai.stream("tell me a story")) acc += chunk;
+    expect(acc).toBe("Hello, world");
+    expect(calls[0]!.url).toBe("https://bool.test/served/my-app/_bool/v1/ai/stream");
+    expect(calls[0]!.init?.method).toBe("POST");
+  });
+
+  test("stream throws BoolAiError on a non-ok response", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const iter = client.ai.stream("go");
+    const err = await iter[Symbol.asyncIterator]().next().catch((e) => e);
+    expect(err).toBeInstanceOf(BoolAiError);
+    expect((err as BoolAiError).code).toBe("rate_limited");
+  });
+
+  test("replays the preview viewer token as x-bool-viewer", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ text: "ok" }), {
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient({ ...CONFIG, viewerToken: "viewer-123" });
+    await client.ai.generate("hi");
+    expect(headersOf(calls[0]!).get("x-bool-viewer")).toBe("viewer-123");
   });
 });
 
