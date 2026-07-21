@@ -17,8 +17,7 @@ credit against the app owner's workspace. The key never reaches the client.
 
 Additive on the canary channel. The plane is gated server-side by the `bool-ai`
 feature flag (off by default), so `bool.ai` only works where the workspace has
-been opted in. (Numbered `.11`; `.10` is reserved for the in-flight
-`bool.secrets` branch.)
+been opted in.
 
 Requires the gateway AI plane in the Bool platform repo (`lib/gateway/ai-route.ts`).
 
