@@ -55,7 +55,15 @@ describe("parseArgs", () => {
   test("parses command and flag forms", () => {
     expect(parseArgs(["link", "--project", "p1", "--api-url=https://x", "--verbose"])).toEqual({
       command: "link",
+      positionals: [],
       flags: { project: "p1", "api-url": "https://x", verbose: true },
+    });
+  });
+  test("captures subcommand positionals", () => {
+    expect(parseArgs(["entities", "push", "--dir", "x"])).toEqual({
+      command: "entities",
+      positionals: ["push"],
+      flags: { dir: "x" },
     });
   });
 });
@@ -254,6 +262,85 @@ describe("entities", () => {
     const out = logs.join("\n");
     expect(out).toContain("todos (private)");
     expect(out).toContain("title: string (required)");
+  });
+});
+
+describe("entities push / pull", () => {
+  const BANNER = "// Data model managed by Bool.\n";
+
+  test("push declares every local schema and refreshes types", async () => {
+    writeFileSync(join(cwd, CONFIG_FILE), JSON.stringify({ ...CONNECTION, apiUrl: "https://bool.test", typesPath: "bool/types.d.ts" }));
+    mkdirSync(join(cwd, "bool/entities"), { recursive: true });
+    writeFileSync(
+      join(cwd, "bool/entities/todos.jsonc"),
+      BANNER +
+        JSON.stringify({
+          name: "todos",
+          type: "object",
+          properties: { title: { type: "string" } },
+          required: ["title"],
+          "x-bool-access": "private",
+        }),
+    );
+    writeFileSync(
+      join(cwd, "bool/entities/games.jsonc"),
+      BANNER + JSON.stringify({ name: "games", type: "object", properties: { score: { type: "number" } }, "x-bool-access": "public" }),
+    );
+    const pushed: unknown[] = [];
+    const { deps, logs } = makeDeps(cwd, {
+      "/api/projects/p1/entities": (init) => {
+        const body = JSON.parse(String(init?.body));
+        pushed.push(body);
+        return json({ ok: true, entity: body.name, changed: body.name === "todos", warnings: body.name === "todos" ? ["heads up"] : [] });
+      },
+      "/api/projects/p1/entities/types": () => new Response("// regenerated"),
+    });
+    expect(await runCli(["entities", "push"], deps)).toBe(0);
+    // Alphabetical file order; access carried through from x-bool-access.
+    expect(pushed.map((p) => (p as { name: string }).name)).toEqual(["games", "todos"]);
+    expect((pushed[0] as { access: string }).access).toBe("public");
+    expect((pushed[1] as { access: string; required: string[] }).required).toEqual(["title"]);
+    const out = logs.join("\n");
+    expect(out).toContain("✓ todos: migrated");
+    expect(out).toContain("✓ games: already up to date");
+    expect(out).toContain("⚠ heads up");
+    expect(readFileSync(join(cwd, "bool/types.d.ts"), "utf8")).toBe("// regenerated");
+  });
+
+  test("push reports per-entity failures and exits 1", async () => {
+    writeFileSync(join(cwd, CONFIG_FILE), JSON.stringify({ ...CONNECTION, apiUrl: "https://bool.test" }));
+    mkdirSync(join(cwd, "bool/entities"), { recursive: true });
+    writeFileSync(join(cwd, "bool/entities/bad.jsonc"), "{ not json");
+    writeFileSync(
+      join(cwd, "bool/entities/ok.jsonc"),
+      JSON.stringify({ name: "ok", properties: { a: { type: "string" } } }),
+    );
+    const { deps, errors } = makeDeps(cwd, {
+      "/api/projects/p1/entities": () => json({ ok: true, entity: "ok", changed: false, warnings: [] }),
+      "/api/projects/p1/entities/types": () => new Response("// t"),
+    });
+    expect(await runCli(["entities", "push"], deps)).toBe(1);
+    expect(errors.join("\n")).toContain("✗ bad.jsonc");
+    expect(errors.join("\n")).toContain("1 of 2 entities failed");
+  });
+
+  test("pull writes the raw schema files and refreshes types", async () => {
+    writeFileSync(join(cwd, CONFIG_FILE), JSON.stringify({ ...CONNECTION, apiUrl: "https://bool.test", typesPath: "bool/types.d.ts" }));
+    const { deps, errors } = makeDeps(cwd, {
+      "/api/projects/p1/entities/schemas": () =>
+        json({
+          schemas: [
+            { path: "bool/entities/todos.jsonc", content: '// banner\n{"name":"todos"}' },
+            { path: "../pull-escape-evil.txt", content: "evil" },
+          ],
+        }),
+      "/api/projects/p1/entities/types": () => new Response("// t"),
+    });
+    expect(await runCli(["entities", "pull"], deps)).toBe(0);
+    expect(readFileSync(join(cwd, "bool/entities/todos.jsonc"), "utf8")).toBe('// banner\n{"name":"todos"}');
+    // A hostile path from the network is skipped, never written.
+    expect(errors.join("\n")).toContain("Skipping unexpected path");
+    expect(existsSync(join(cwd, "../pull-escape-evil.txt"))).toBe(false);
   });
 });
 

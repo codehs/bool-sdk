@@ -10,6 +10,9 @@
 //   bool types                 refresh bool/types.d.ts from the project's
 //                              entity schemas
 //   bool entities              list the project's entities + fields
+//   bool entities pull         write the project's schema files to bool/entities/
+//   bool entities push         declare local bool/entities/*.jsonc on the
+//                              project (additive migrations, server-side)
 //   bool deploy [--dir .]      zip the app source and publish it on Bool
 //                              (Bool builds in the cloud; the URL is stable)
 //
@@ -73,16 +76,22 @@ function defaults(): CliDeps {
   };
 }
 
-/** Tiny flag parser: `--key value` / `--key=value` / bare `--flag`. */
+/** Tiny arg parser: `--key value` / `--key=value` / bare `--flag`, plus bare
+ * positionals (subcommands like `entities push`). */
 export function parseArgs(argv: string[]): {
   command: string | undefined;
+  positionals: string[];
   flags: Record<string, string | boolean>;
 } {
   const [command, ...rest] = argv;
   const flags: Record<string, string | boolean> = {};
+  const positionals: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i]!;
-    if (!arg.startsWith("--")) continue;
+    if (!arg.startsWith("--")) {
+      positionals.push(arg);
+      continue;
+    }
     const eq = arg.indexOf("=");
     if (eq !== -1) {
       flags[arg.slice(2, eq)] = arg.slice(eq + 1);
@@ -92,7 +101,7 @@ export function parseArgs(argv: string[]): {
       flags[arg.slice(2)] = true;
     }
   }
-  return { command, flags };
+  return { command, positionals, flags };
 }
 
 class CliError extends Error {}
@@ -277,6 +286,133 @@ async function cmdTypes(
   return 0;
 }
 
+/** Where local entity schema files live — the same layout the platform uses
+ * inside a project, so pull/push round-trip byte-for-byte. */
+export const ENTITIES_DIR = "bool/entities";
+
+/** Parse one local entity `.jsonc` file (JSON with whole-line `//` comments —
+ * the platform's banner format). Mirrors the server's parser. */
+export function parseEntitySchemaFile(content: string): {
+  name: string;
+  properties: Record<string, unknown>;
+  required?: string[];
+  access: "private" | "public";
+} | null {
+  const stripped = content
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("//"))
+    .join("\n");
+  let doc: unknown;
+  try {
+    doc = JSON.parse(stripped);
+  } catch {
+    return null;
+  }
+  if (!doc || typeof doc !== "object") return null;
+  const obj = doc as Record<string, unknown>;
+  if (typeof obj.name !== "string" || !obj.properties || typeof obj.properties !== "object") {
+    return null;
+  }
+  return {
+    name: obj.name,
+    properties: obj.properties as Record<string, unknown>,
+    required: Array.isArray(obj.required)
+      ? (obj.required.filter((r) => typeof r === "string") as string[])
+      : undefined,
+    access: obj["x-bool-access"] === "public" ? "public" : "private",
+  };
+}
+
+/** `bool entities push`: declare every local bool/entities/*.jsonc on the
+ * project (additive-only server-side — it never drops columns), then refresh
+ * types. Continues past a bad file and reports it; exits 1 if any failed. */
+async function cmdEntitiesPush(
+  flags: Record<string, string | boolean>,
+  deps: CliDeps,
+): Promise<number> {
+  const config = readConfig(deps.cwd);
+  const tok = token(flags, deps);
+  const dir = resolve(deps.cwd, str(flags.dir) ?? ENTITIES_DIR);
+  if (!existsSync(dir)) {
+    throw new CliError(`No ${relative(deps.cwd, dir)}/ directory — run \`bool entities pull\` first, or create <name>.jsonc files there.`);
+  }
+  const files = readdirSync(dir)
+    .filter((f) => f.endsWith(".jsonc"))
+    .sort();
+  if (files.length === 0) {
+    throw new CliError(`No .jsonc entity files in ${relative(deps.cwd, dir)}/.`);
+  }
+
+  let failed = 0;
+  for (const file of files) {
+    const parsed = parseEntitySchemaFile(readFileSync(join(dir, file), "utf8"));
+    if (!parsed) {
+      deps.error(`✗ ${file}: not a valid entity schema (needs "name" + "properties")`);
+      failed++;
+      continue;
+    }
+    const res = await deps.fetch(
+      `${config.apiUrl.replace(/\/$/, "")}/api/projects/${config.projectId}/entities`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" },
+        body: JSON.stringify(parsed),
+      },
+    );
+    const body = (await res.json().catch(() => null)) as
+      | { ok?: boolean; changed?: boolean; warnings?: string[]; error?: string }
+      | null;
+    if (!res.ok || !body?.ok) {
+      deps.error(`✗ ${parsed.name}: ${body?.error ?? `HTTP ${res.status}`}`);
+      failed++;
+      continue;
+    }
+    deps.log(`✓ ${parsed.name}: ${body.changed ? "migrated" : "already up to date"}`);
+    for (const w of body.warnings ?? []) deps.log(`  ⚠ ${w}`);
+  }
+
+  await pullTypes(config, tok, deps);
+  if (failed > 0) {
+    deps.error(`${failed} of ${files.length} entities failed to push.`);
+    return 1;
+  }
+  return 0;
+}
+
+/** `bool entities pull`: write the project's entity schema files verbatim into
+ * bool/entities/ (so they can be edited and pushed back), then refresh types. */
+async function cmdEntitiesPull(
+  flags: Record<string, string | boolean>,
+  deps: CliDeps,
+): Promise<number> {
+  const config = readConfig(deps.cwd);
+  const tok = token(flags, deps);
+  const { schemas } = await apiJson<{ schemas: Array<{ path: string; content: string }> }>(
+    deps,
+    tok,
+    config.apiUrl,
+    `/api/projects/${config.projectId}/entities/schemas`,
+  );
+  if (schemas.length === 0) {
+    deps.log("The project has no declared entities yet — nothing to pull.");
+    return 0;
+  }
+  for (const s of schemas) {
+    // Paths come from the platform (`bool/entities/<name>.jsonc`), but never
+    // trust a path from the network with the filesystem: resolve and confine.
+    const out = resolve(deps.cwd, s.path);
+    if (!out.startsWith(resolve(deps.cwd, ENTITIES_DIR) + "/")) {
+      deps.error(`Skipping unexpected path from server: ${s.path}`);
+      continue;
+    }
+    mkdirSync(dirname(out), { recursive: true });
+    writeFileSync(out, s.content);
+    deps.log(`✓ ${s.path}`);
+  }
+  await pullTypes(config, tok, deps);
+  return 0;
+}
+
 async function cmdEntities(
   flags: Record<string, string | boolean>,
   deps: CliDeps,
@@ -416,7 +552,9 @@ const USAGE = `bool — develop locally against a Bool project, deploy to Bool
 Usage:
   bool link --project <id> [--api-url <url>] [--token <pat>] [--types <path>]
   bool types [--out <path>] [--token <pat>]
-  bool entities [--token <pat>]
+  bool entities [--token <pat>]            list the project's data models
+  bool entities pull [--token <pat>]       write schemas to ${ENTITIES_DIR}/
+  bool entities push [--dir <path>]        declare local schemas on the project
   bool deploy [--dir <path>] [--token <pat>]
 
 Auth: pass --token or set BOOL_TOKEN (Bool → Settings → Access tokens).
@@ -425,7 +563,7 @@ createBoolClient as \`apiKey\`.`;
 
 export async function runCli(argv: string[], overrides?: Partial<CliDeps>): Promise<number> {
   const deps: CliDeps = { ...defaults(), ...overrides };
-  const { command, flags } = parseArgs(argv);
+  const { command, positionals, flags } = parseArgs(argv);
   try {
     switch (command) {
       case "link":
@@ -433,7 +571,17 @@ export async function runCli(argv: string[], overrides?: Partial<CliDeps>): Prom
       case "types":
         return await cmdTypes(flags, deps);
       case "entities":
-        return await cmdEntities(flags, deps);
+        switch (positionals[0]) {
+          case undefined:
+            return await cmdEntities(flags, deps);
+          case "push":
+            return await cmdEntitiesPush(flags, deps);
+          case "pull":
+            return await cmdEntitiesPull(flags, deps);
+          default:
+            deps.error(`Unknown entities subcommand "${positionals[0]}".\n\n${USAGE}`);
+            return 1;
+        }
       case "deploy":
         return await cmdDeploy(flags, deps);
       case undefined:

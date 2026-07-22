@@ -16,6 +16,10 @@ machine, and publish back to Bool — without leaving your editor.
   - `types` — regenerates `bool/types.d.ts` from the project's entity schemas,
     so `bool.entities.<name>` is fully typed locally.
   - `entities` — prints the project's declared entities + fields.
+  - `entities pull` / `entities push` — round-trip the entity schema files
+    (`bool/entities/*.jsonc`) between the project and disk: pull writes them
+    verbatim, push declares every local file on the project (additive
+    migrations server-side; per-file results and warnings reported).
   - `deploy` — zips the app source (node_modules/.git/env files excluded) and
     publishes it on Bool via the drop pipeline: Bool builds in the cloud and
     the project URL stays stable.

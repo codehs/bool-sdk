@@ -81,6 +81,8 @@ export BOOL_TOKEN=bool_live_…       # personal access token (Bool → Settings
 npx bool link --project <id>    # writes bool.config.json + .env.bool + types
 npx bool types                  # refresh bool/types.d.ts after schema changes
 npx bool entities               # list the project's data models
+npx bool entities pull          # write schema files to bool/entities/
+npx bool entities push          # declare edited local schemas on the project
 npx bool deploy                 # zip the source, Bool builds + hosts it
 ```
 
