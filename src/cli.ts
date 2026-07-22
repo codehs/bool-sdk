@@ -381,7 +381,14 @@ async function cmdCreate(
   deps.log(`Linked ${CONFIG_FILE} to project ${project.id}.`);
 
   // 4. Declare the todos entity so the table exists, then refresh types.
-  await cmdEntitiesPush(flags, sub);
+  //    If this fails the app has no data — don't ship a broken deploy; tell the
+  //    user to re-push once the cause is fixed.
+  const pushCode = await cmdEntitiesPush(flags, sub);
+  if (pushCode !== 0) {
+    throw new CliError(
+      `The todos entity didn't get created, so the app would have no data. Once the cause above is resolved, finish with:\n  cd ${relative(deps.cwd, dir) || "."}\n  bool entities push\n  bool deploy`,
+    );
+  }
   await pullTypes(config, tok, sub);
 
   // 5. Optionally publish.

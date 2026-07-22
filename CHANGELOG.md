@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0-next.15
+
+- `bool create` now aborts (exit 1) if the entity push fails, instead of
+  deploying an app whose data model was never created. It prints how to finish
+  (`bool entities push` + `bool deploy`) once the cause is fixed.
+- The scaffolded todo app shows the real error message instead of
+  "[object Object]" — bool-sdk throws the raw (often non-Error) error, so the
+  template now extracts `.message` from it.
+
 ## 0.2.0-next.14
 
 - Fix `bool create`: the scaffolded app now lists `@supabase/supabase-js`

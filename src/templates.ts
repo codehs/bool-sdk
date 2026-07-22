@@ -10,7 +10,7 @@
 
 // Keep in sync with the CLI's own version so the scaffolded app pulls the
 // matching client. Injected into package.json at scaffold time.
-export const TEMPLATE_BOOL_SDK_VERSION = "0.2.0-next.14";
+export const TEMPLATE_BOOL_SDK_VERSION = "0.2.0-next.15";
 
 function packageJson(name: string): string {
   return (
@@ -139,6 +139,17 @@ type Todo = {
   created_at: string;
 };
 
+// bool-sdk throws the raw error, which may be a plain object (e.g. a Postgres
+// error), not an Error — so pull a message off it instead of String()'ing it
+// into "[object Object]".
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (e && typeof e === "object" && "message" in e) {
+    return String((e as { message: unknown }).message);
+  }
+  return String(e);
+}
+
 export default function App() {
   const [todos, setTodos] = useState<Todo[]>([]);
   const [title, setTitle] = useState("");
@@ -150,7 +161,7 @@ export default function App() {
       setTodos((await bool.entities.todos.list("-created_at")) as Todo[]);
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setLoading(false);
     }

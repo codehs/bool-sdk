@@ -109,6 +109,17 @@ describe("create", () => {
     expect(logs.join("\n")).toContain('Created project "My Todo"');
   });
 
+  test("aborts before deploy when the entity push fails", async () => {
+    const routes = createRoutes();
+    routes["/api/projects/new1/entities"] = () =>
+      new Response(JSON.stringify({ error: "Method Not Allowed" }), { status: 405 });
+    const { deps, calls, errors } = makeDeps(cwd, routes);
+    expect(await runCli(["create", "my-todo", "--deploy"], deps)).toBe(1);
+    // Never deployed a broken app.
+    expect(calls.some((c) => c.url.includes("/api/drops"))).toBe(false);
+    expect(errors.join("\n")).toContain("bool entities push");
+  });
+
   test("refuses a non-empty target directory", async () => {
     const dir = join(cwd, "taken");
     mkdirSync(dir, { recursive: true });
