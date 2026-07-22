@@ -106,6 +106,13 @@ export const bool = createBoolClient({
 const todos = await bool.entities.todos.list(); // typed via bool/types.d.ts
 ```
 
+One admin-key gotcha: on a **private** entity, `create` must set `owner_id`
+explicitly (`{ title: "hi", owner_id: user.id }`). The column normally
+defaults to the signed-in end user, but the admin key has no end-user
+identity, so on a fresh private table (where `owner_id` is NOT NULL) the
+insert is rejected without it. Public entities are unaffected, as are
+end-user (`boolk_`) keys — those carry the user.
+
 Coding agents can do all of the above through Bool's MCP server instead
 (`list_entities`, `define_entity`, `list_records`, `get_entity_types`,
 `get_project_connection`, …) — see the platform docs.

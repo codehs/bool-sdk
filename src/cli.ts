@@ -257,6 +257,8 @@ Next steps:
      });
 
   3. Use your data: await bool.entities.<name>.list()
+     (admin-key note: creates on a PRIVATE entity must set owner_id explicitly —
+      the admin key has no end-user identity to default it from)
   4. Publish anytime: bool deploy`);
   return 0;
 }
