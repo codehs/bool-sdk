@@ -30,6 +30,26 @@ const GATEWAY_API = "v1";
 // used, and the server never returns a token), so it's never exposed there.
 const EU_SESSION_KEY = "bool_eu_session_token";
 
+/** True when `host` is a single-label deployment subdomain of `appHost` (e.g.
+ * "acme.bool.so" under "bool.so") — the exact shape the platform proxy rewrites
+ * to /served/<label>/… keyed on the request host. Mirrors `deploymentSlugFromHost`
+ * in the platform proxy: the label must be a valid slug (lowercase letters,
+ * digits, dashes) with no further dots, so multi-label hosts and the bare apex
+ * don't qualify. The port is ignored so it holds in local dev too.
+ *
+ * Deliberately does NOT compare the label to the baked `VITE_BOOL_SLUG`: the
+ * proxy resolves the slug from the live host, so any deployment subdomain is
+ * same-origin. Tying it to the baked slug is what made a renamed app route its
+ * gateway calls to the old slug cross-origin and 404. */
+export function isDeploymentSubdomain(host: string, appHost: string): boolean {
+  if (!host || !appHost) return false;
+  const h = host.split(":")[0]!; // drop any :port
+  const suffix = "." + appHost;
+  if (!h.endsWith(suffix)) return false;
+  const label = h.slice(0, -suffix.length);
+  return /^[a-z0-9-]+$/.test(label);
+}
+
 /** Everything the client needs to reach its Bool. Injected by Bool at boot
  * (the app's `src/lib/supabase.ts` passes these from `import.meta.env`). */
 export type BoolClientConfig = {
@@ -218,17 +238,22 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
   }
 
   // Where the gateway lives, decided at runtime by where the app is running:
-  //  - Deployed at <slug>.<host>: the gateway is same-origin (the platform
-  //    proxy rewrites /_bool → /served/<slug>/_bool), so use a relative path —
-  //    no CORS.
-  //  - Preview (sandbox) or a custom domain: reach the slug gateway
-  //    cross-origin.
+  //  - Deployed on a <label>.<appHost> subdomain: the gateway is same-origin
+  //    (the platform proxy rewrites /_bool → /served/<slug>/_bool keyed on the
+  //    REQUEST host, not the baked slug), so use a relative path — no CORS. This
+  //    matches on the subdomain SHAPE, not on the baked slug: a project whose
+  //    slug/domain changed after this bundle was built serves a stale
+  //    VITE_BOOL_SLUG, but the host is always current, so relative URLs keep
+  //    hitting the right gateway. (Comparing to the baked slug was the bug: a
+  //    renamed app fell through to a cross-origin URL for the OLD slug and 404'd
+  //    — most visibly on the "Continue with Google" tab.)
+  //  - Preview (sandbox *.vercel.run) or a custom domain: reach the slug gateway
+  //    cross-origin at the baked appOrigin.
   function boolGatewayBase(): string {
     if (
       appHost &&
-      slug &&
       typeof location !== "undefined" &&
-      location.host === slug + "." + appHost
+      isDeploymentSubdomain(location.host, appHost)
     ) {
       return "";
     }

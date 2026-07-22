@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import {
   createBoolClient,
   getDefaultBoolClient,
+  isDeploymentSubdomain,
   BoolAiError,
   type BoolClientConfig,
 } from "./client";
@@ -67,6 +68,18 @@ describe("gateway routing", () => {
 
   test("REST calls use a same-origin relative path when deployed at <slug>.<host>", async () => {
     (globalThis as any).location = { host: "my-app.bool.test" };
+    const client = createBoolClient(CONFIG);
+    await client.db.from("todos").select("*");
+    expect(calls[0]!.url).toBe("/_bool/v1/db/rest/v1/todos?select=*");
+  });
+
+  test("stays same-origin when the live subdomain differs from the baked slug (renamed app)", async () => {
+    // The bundle was built with slug "my-app" but the project was later renamed
+    // to "renamed-app". The proxy resolves the gateway slug from the host, so a
+    // relative path still reaches the right gateway. Comparing the live host to
+    // the baked slug (the old behavior) routed cross-origin to /served/my-app,
+    // which no longer exists → 404 (the "Continue with Google 404s" bug).
+    (globalThis as any).location = { host: "renamed-app.bool.test" };
     const client = createBoolClient(CONFIG);
     await client.db.from("todos").select("*");
     expect(calls[0]!.url).toBe("/_bool/v1/db/rest/v1/todos?select=*");
@@ -407,5 +420,35 @@ describe("default client registry", () => {
     expect(getDefaultBoolClient()).toBe(first);
     const second = createBoolClient(CONFIG);
     expect(getDefaultBoolClient()).toBe(second);
+  });
+});
+
+describe("isDeploymentSubdomain", () => {
+  test("any single-label subdomain of appHost qualifies — not just the baked slug", () => {
+    expect(isDeploymentSubdomain("my-app.bool.test", "bool.test")).toBe(true);
+    expect(isDeploymentSubdomain("renamed-app.bool.test", "bool.test")).toBe(true);
+    expect(isDeploymentSubdomain("a1b2c3.bool.test", "bool.test")).toBe(true);
+  });
+
+  test("ignores a :port so it holds in local dev", () => {
+    expect(isDeploymentSubdomain("my-app.bool.test:3010", "bool.test")).toBe(true);
+  });
+
+  test("the bare apex is not a deployment subdomain", () => {
+    expect(isDeploymentSubdomain("bool.test", "bool.test")).toBe(false);
+  });
+
+  test("multi-label hosts don't qualify (proxy only rewrites single-label)", () => {
+    expect(isDeploymentSubdomain("foo.bar.bool.test", "bool.test")).toBe(false);
+  });
+
+  test("a different registrable domain (custom domain / preview sandbox) is cross-origin", () => {
+    expect(isDeploymentSubdomain("my-app.example.com", "bool.test")).toBe(false);
+    expect(isDeploymentSubdomain("abc123.vercel.run", "bool.test")).toBe(false);
+  });
+
+  test("empty inputs are safe", () => {
+    expect(isDeploymentSubdomain("", "bool.test")).toBe(false);
+    expect(isDeploymentSubdomain("my-app.bool.test", "")).toBe(false);
   });
 });
