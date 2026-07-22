@@ -81,7 +81,7 @@ describe("entities: read paths → PostgREST", () => {
     expect(q.get("archived_at")).toBe("is.null");
   });
 
-  test("filter() maps the richer Base44 operators", async () => {
+  test("filter() maps the richer Mongo-style operators", async () => {
     const bool = createBoolClient(CONFIG);
     await bool.entities.todos.filter({
       a: { $ne: 1 },

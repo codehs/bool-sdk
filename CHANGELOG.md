@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.2.0-next.16
+
+- `bool create` no longer requires a name — a bare `bool create` generates a
+  friendly one (e.g. `swift-otter-42`) and scaffolds into a matching folder.
+  Pass a name to override. Combined with the default API URL (or `BOOL_API_URL`),
+  `bool create` alone stands up a new todo app + project.
+
+## 0.2.0-next.15
+
+- `bool create` now aborts (exit 1) if the entity push fails, instead of
+  deploying an app whose data model was never created. It prints how to finish
+  (`bool entities push` + `bool deploy`) once the cause is fixed.
+- The scaffolded todo app shows the real error message instead of
+  "[object Object]" — bool-sdk throws the raw (often non-Error) error, so the
+  template now extracts `.message` from it.
+
+## 0.2.0-next.14
+
+- Fix `bool create`: the scaffolded app now lists `@supabase/supabase-js`
+  (a bool-sdk peer dependency) in its `package.json`, so the deploy/cloud build
+  can resolve it — previously `vite build` failed with "Rollup failed to resolve
+  import @supabase/supabase-js". Verified with a real `npm install && vite build`.
+
+  Note: `bool create` / `bool entities push` also need the platform's
+  `POST /api/projects/[id]/entities` endpoint (added in codehs/bool#488). Without
+  it the entity push returns HTTP 405.
+
+## 0.2.0-next.13
+
+- New `bool create <name> [--path <dir>] [--deploy]` — scaffold a new Bool
+  project and a working todo-list app in one command. Creates the project
+  (`POST /api/projects`), writes a self-contained Vite + React todo app wired to
+  the project through `bool-sdk`, links it (`bool.config.json` + `.env.bool` +
+  types), and declares a public `todos` entity so the deployed app works with no
+  sign-in. `--deploy` publishes it immediately.
+
+## 0.2.0-next.12
+
+- CLI: fail with a clear message instead of crashing when the API returns a
+  non-JSON `2xx` response. This happens when `--api-url` points at a host that
+  serves the HTML app shell (e.g. the Bool API isn't deployed there yet) — the
+  `link`, `entities`, and `entities pull` commands previously threw an
+  unhandled `TypeError` (`Cannot read properties of null`). They now report
+  `expected a JSON response … — check --api-url` and exit 1.
+
+## 0.2.0-next.11
+
+Local development: use a Bool project as a managed backend from your own
+machine, and publish back to Bool — without leaving your editor.
+
+- `createBoolClient({ ..., apiKey })` — a Bool data API key (`boolsk_` project
+  admin key, or a `boolk_` end-user key) is sent as the `api_key` header on
+  every gateway call (db, users, ai), so the client now works from anywhere:
+  Node scripts, a local Vite app, CI. Without `apiKey`, behavior is unchanged.
+- New CLI (`npx bool-sdk <command>`, zero dependencies):
+  - `link --project <id>` — connects a local folder to a Bool project. Writes
+    `bool.config.json` (public connection config), puts the project's admin
+    data key in `.env.bool` (gitignored; owner only), and pulls entity types.
+  - `types` — regenerates `bool/types.d.ts` from the project's entity schemas,
+    so `bool.entities.<name>` is fully typed locally.
+  - `entities` — prints the project's declared entities + fields.
+  - `entities pull` / `entities push` — round-trip the entity schema files
+    (`bool/entities/*.jsonc`) between the project and disk: pull writes them
+    verbatim, push declares every local file on the project (additive
+    migrations server-side; per-file results and warnings reported).
+  - `deploy` — zips the app source (node_modules/.git/env files excluded) and
+    publishes it on Bool via the drop pipeline: Bool builds in the cloud and
+    the project URL stays stable.
+  - Platform calls authenticate with a personal access token (`--token` or
+    `BOOL_TOKEN`).
+
+Requires the local-dev endpoints in the Bool platform repo
+(`/api/projects/[id]/connection`, `/api/projects/[id]/entities/types`,
+`POST /api/drops`).
+
 ## 0.2.0-next.10
 
 Adds `bool.ai` — the AI battery. A deployed app can call a model with NO API key
@@ -40,7 +115,7 @@ already-created app on the stable `^0.1.0` range too.
 
 ## 0.2.0-next.8
 
-Adds per-user API keys (Base44 convention): the gateway's `/users/me` lazily
+Adds per-user API keys: the gateway's `/users/me` lazily
 mints and returns a personal `api_key` for the signed-in end user.
 
 - `BoolUser.apiKey?: string` — typed access to the key.
@@ -53,7 +128,7 @@ change that accepts `api_key` and stamps `sub` accordingly.
 
 ## 0.2.0-next.7
 
-- **Entities pagination cap raised 1000 → 5000, matching Base44.** `list` and
+- **Entities pagination cap raised 1000 → 5000.** `list` and
   `filter` still page (50 rows by default) but now allow up to 5000 rows per
   call. A `limit` above the cap **throws** instead of silently truncating, so
   over-large reads fail loudly rather than returning a partial result the caller
@@ -72,7 +147,7 @@ app renders its sign-in screen rather than a blank page. Adds a regression test.
 
 ## 0.2.0
 
-Adds the **entities data layer** — a Base44-parity data API over the gateway so
+Adds the **entities data layer** — a high-level data API over the gateway so
 apps read/write data without touching Supabase, SQL, or credentials directly:
 
 ```ts
@@ -82,7 +157,7 @@ await bool.entities.todos.update(one.id, { done: true });
 await bool.entities.todos.filter({ status: "active", count: { $gte: 10 } });
 ```
 
-`bool.entities.<table>` mirrors Base44's entity surface one-to-one:
+`bool.entities.<table>` exposes the full entity surface:
 - **Reads:** `list`, `filter`, `get` — with `sort` (`-col`), `limit`, `skip`,
   and `fields` (column selection).
 - **Writes:** `create`, `bulkCreate`, `update`, `bulkUpdate`, `delete`.
@@ -96,7 +171,7 @@ await bool.entities.todos.filter({ status: "active", count: { $gte: 10 } });
 Methods return row data directly and throw on error. Additive and
 backward-compatible — `bool.db` / `supabase` still work.
 
-Known gaps vs. Base44 (documented, follow-ups): `updateMany` with
+Known gaps (documented, follow-ups): `updateMany` with
 `$inc/$mul/$push/$pull` is read-modify-write (not atomic under concurrent
 writers — a Postgres RPC would make it atomic); `$size` (filter by array
 length) isn't expressible over PostgREST and is omitted.

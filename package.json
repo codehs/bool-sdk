@@ -1,10 +1,13 @@
 {
   "name": "bool-sdk",
-  "version": "0.2.0-next.10",
-  "description": "Client SDK for apps built on Bool — gateway data access, end-user auth, the AI battery, and the React auth layer.",
+  "version": "0.2.0-next.16",
+  "description": "Client SDK for apps built on Bool — gateway data access, end-user auth, the AI battery, the React auth layer, and the local-dev CLI (link, types, deploy).",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "bool": "./dist/cli-entry.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

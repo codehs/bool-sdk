@@ -12,7 +12,7 @@ tested, and upgradable independently of any one app.
 ## What it does
 
 - **Entities data API.** `client.entities.<table>` is the recommended way to
-  read/write data — a one-to-one mirror of Base44's entity surface: `list`,
+  read/write data — a simple, high-level entity surface: `list`,
   `filter`, `get`, `create`, `bulkCreate`, `update`, `bulkUpdate`, `updateMany`,
   `delete`, `deleteMany`, `importEntities`, `subscribe`. It hides Supabase/SQL
   entirely; methods return rows directly and throw on error:
@@ -67,6 +67,78 @@ tested, and upgradable independently of any one app.
 - **React auth layer** (`bool-sdk/react`): `<BoolAuthProvider>`,
   `useBoolAuth()`, `<AuthGate>`, and the headless `useSignInForm()` state
   machine that login forms bind to.
+
+## Local Development (Your Own Machine)
+
+Build an app on your computer, use a Bool project as your backend, then
+publish to `https://<slug>.bool.so`. This is the one case where you install
+the SDK yourself.
+
+### Quick Start
+
+```bash
+npm install bool-sdk
+export BOOL_TOKEN=bool_live_xxxxx  # from Bool → Settings → Access tokens
+
+npx bool link --project <id>       # connect to a Bool project
+npx bool entities push --dir bool/entities  # push schema changes
+npx bool deploy                    # publish when ready
+```
+
+**Three new files after `link`:**
+- `bool.config.json` — project metadata (commit this)
+- `.env.bool` — admin key (gitignore, keep secret)
+- `bool/types.d.ts` — TypeScript types (auto-updated)
+
+**Then in your app:**
+
+```ts
+import { createBoolClient } from "bool-sdk";
+import config from "./bool.config.json";
+
+export const bool = createBoolClient({
+  supabaseUrl: config.supabaseUrl,
+  supabaseAnonKey: config.supabaseAnonKey,
+  schema: config.schema,
+  appOrigin: config.appOrigin,
+  slug: config.slug,
+  apiKey: process.env.BOOL_API_KEY, // from .env.bool
+});
+
+// Now use your data
+const todos = await bool.entities.todos.list();
+```
+
+### Documentation
+
+Complete guides and API reference at **[bool.com/docs](https://bool.com/docs)**:
+
+- **[Local Development](https://bool.com/docs/local-development)** — complete
+  walkthrough with use cases, workflows, and tips
+- **[CLI Reference](https://bool.com/docs/cli)** — command-line tools
+- **[SDK Reference](https://bool.com/docs/sdk-reference)** — API documentation
+- **[Data Design](https://bool.com/docs/database)** — schema patterns and
+  privacy
+
+### Admin Key Gotcha
+
+When using the admin key (`apiKey`), on a **private** entity (one with
+`user_id` owner field), you must set `user_id` explicitly:
+
+```ts
+// ❌ Fails on private entity (NOT NULL constraint)
+await bool.entities.tasks.create({ title: "Task" });
+
+// ✅ Works
+await bool.entities.tasks.create({ title: "Task", user_id: userId });
+```
+
+The admin key has no user identity, so it can't default `user_id`. End-user
+clients and `boolk_` keys carry the user and default automatically.
+
+Coding agents can do all of the above through Bool's MCP server instead
+(`list_entities`, `define_entity`, `list_records`, `get_entity_types`,
+`get_project_connection`, …) — see the platform docs.
 
 ## Usage
 

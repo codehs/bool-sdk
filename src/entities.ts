@@ -1,4 +1,4 @@
-// The Bool entities layer: a Base44-style data API over the gateway-routed
+// The Bool entities layer: a high-level data API over the gateway-routed
 // Supabase client. App code (and the AI that writes it) works with
 // `bool.entities.<table>` instead of raw `supabase.from(...)`, so a generated
 // app never mentions Supabase, SQL, PostgREST, or credentials — the whole
@@ -9,7 +9,7 @@
 //   await bool.entities.todos.update(one.id, { done: true });
 //   await bool.entities.todos.filter({ status: "active", count: { $gte: 10 } });
 //
-// The method surface and filter DSL mirror Base44's entities module one-to-one
+// The method surface and filter DSL are deliberately Mongo-flavored
 // (MongoDB-style `$`-operators, `-col` sort, bulk + *Many ops), so there's no
 // need to drop down to raw SQL. Methods return row data directly and THROW on
 // error (unlike supabase-js's `{ data, error }`), so app code reads clean.
@@ -19,7 +19,7 @@ import type { BoolChangePayload, BoolDb } from "./client.js";
  * Entity tables always have `created_at`, so it's the default. */
 export type SortSpec = string;
 
-/** MongoDB-style comparison operators for a single field. Mirrors Base44. */
+/** MongoDB-style comparison operators for a single field. */
 export type FilterOperators = Partial<{
   $eq: unknown;
   $ne: unknown;
@@ -84,7 +84,7 @@ export type ImportResult<T = any> = {
 };
 
 /** CRUD + realtime for one entity table. `T` defaults to `any` (untyped);
- * apps can pass a row type for autocomplete. Mirrors Base44's EntityHandler. */
+ * apps can pass a row type for autocomplete. */
 export interface EntityHandler<T = any> {
   /** Rows, newest first by default. `limit` defaults to 50, max 5000 — page
    * through larger result sets with `limit` + `skip` (an over-cap `limit`
