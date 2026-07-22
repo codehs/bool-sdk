@@ -109,18 +109,21 @@ export const bool = createBoolClient({
 const todos = await bool.entities.todos.list();
 ```
 
-### Guides
+### Documentation
 
-- **[Local Development](./docs/LOCAL-DEVELOPMENT.md)** — detailed walkthrough
-  with use cases, workflows, and tips
-- **[Deployment](./docs/DEPLOYMENT.md)** — publishing, CI/CD, monitoring
-- **[Data Modeling](./docs/DATA-MODELING.md)** — schema patterns, privacy,
-  relationships
+Complete guides and API reference at **[bool.com/docs](https://bool.com/docs)**:
+
+- **[Local Development](https://bool.com/docs/local-development)** — complete
+  walkthrough with use cases, workflows, and tips
+- **[CLI Reference](https://bool.com/docs/cli)** — command-line tools
+- **[SDK Reference](https://bool.com/docs/sdk-reference)** — API documentation
+- **[Data Design](https://bool.com/docs/database)** — schema patterns and
+  privacy
 
 ### Admin Key Gotcha
 
 When using the admin key (`apiKey`), on a **private** entity (one with
-`user_id` owner field), you must set `owner_id` explicitly:
+`user_id` owner field), you must set `user_id` explicitly:
 
 ```ts
 // ❌ Fails on private entity (NOT NULL constraint)
@@ -130,7 +133,7 @@ await bool.entities.tasks.create({ title: "Task" });
 await bool.entities.tasks.create({ title: "Task", user_id: userId });
 ```
 
-The admin key has no user identity, so it can't default `owner_id`. End-user
+The admin key has no user identity, so it can't default `user_id`. End-user
 clients and `boolk_` keys carry the user and default automatically.
 
 Coding agents can do all of the above through Bool's MCP server instead
