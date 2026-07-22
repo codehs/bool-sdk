@@ -9,7 +9,7 @@
 //   await bool.entities.todos.update(one.id, { done: true });
 //   await bool.entities.todos.filter({ status: "active", count: { $gte: 10 } });
 //
-// The method surface and filter DSL follow a familiar app-builder convention
+// The method surface and filter DSL are deliberately Mongo-flavored
 // (MongoDB-style `$`-operators, `-col` sort, bulk + *Many ops), so there's no
 // need to drop down to raw SQL. Methods return row data directly and THROW on
 // error (unlike supabase-js's `{ data, error }`), so app code reads clean.

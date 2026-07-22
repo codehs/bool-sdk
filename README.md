@@ -12,7 +12,7 @@ tested, and upgradable independently of any one app.
 ## What it does
 
 - **Entities data API.** `client.entities.<table>` is the recommended way to
-  read/write data — a familiar high-level entity surface: `list`,
+  read/write data — a simple, high-level entity surface: `list`,
   `filter`, `get`, `create`, `bulkCreate`, `update`, `bulkUpdate`, `updateMany`,
   `delete`, `deleteMany`, `importEntities`, `subscribe`. It hides Supabase/SQL
   entirely; methods return rows directly and throw on error:
