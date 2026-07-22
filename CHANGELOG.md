@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0-next.18
+
+- `bool create` now verifies the new project can be developed against *before*
+  writing any files. A project that isn't on the gateway runtime can't be used
+  as a local backend; previously `create` scaffolded the whole app and only then
+  hit the error, leaving an orphaned folder. It now fails immediately with the
+  server's reason and scaffolds nothing.
+- The scaffolded app pins `bool-sdk@0.2.0-next.17` (the latest published
+  release), catching the template pin up from `next.16`.
+
+## 0.2.0-next.17
+
+- `createBoolClient` routes the gateway same-origin for any deployment
+  subdomain, not just the canonical one — fixes a 404 when a deployed app is
+  reached via a renamed slug.
+
 ## 0.2.0-next.16
 
 - `bool create` no longer requires a name — a bare `bool create` generates a

@@ -138,6 +138,23 @@ describe("create", () => {
     expect(logs.join("\n")).toMatch(/Created project ".+"/);
     expect(logs.join("\n")).toMatch(/Scaffolded a todo app in [a-z]+-[a-z]+-\d+\//);
   });
+
+  test("fails fast (no scaffold) when the new project isn't a gateway project", async () => {
+    const routes = createRoutes();
+    routes["/api/projects/new1/connection"] = () =>
+      json({ error: "not_gateway_project", message: "This project runs on the v1 runtime" }, 409);
+    const { deps, calls, errors } = makeDeps(cwd, routes);
+
+    expect(await runCli(["create", "my-todo"], deps)).toBe(1);
+    // Surfaces the server's reason plus the reassurance that nothing was written.
+    expect(errors.join("\n")).toContain("v1 runtime");
+    expect(errors.join("\n")).toContain("nothing was scaffolded");
+    // No files scaffolded — the target dir was never created.
+    expect(existsSync(join(cwd, "my-todo"))).toBe(false);
+    // Bailed at the connection check: never scaffolded, linked, or pushed.
+    expect(calls.some((c) => c.url.endsWith("/api/projects/new1/api-key"))).toBe(false);
+    expect(calls.some((c) => c.url.endsWith("/api/projects/new1/entities"))).toBe(false);
+  });
 });
 
 describe("link", () => {

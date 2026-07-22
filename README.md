@@ -111,30 +111,28 @@ const todos = await bool.entities.todos.list();
 
 ### Documentation
 
-Complete guides and API reference at **[bool.com/docs](https://bool.com/docs)**:
+Complete guides at **[bool.com/docs](https://bool.com/docs)**:
 
-- **[Local Development](https://bool.com/docs/local-development)** — complete
-  walkthrough with use cases, workflows, and tips
-- **[CLI Reference](https://bool.com/docs/cli)** — command-line tools
-- **[SDK Reference](https://bool.com/docs/sdk-reference)** — API documentation
-- **[Data Design](https://bool.com/docs/database)** — schema patterns and
-  privacy
+- **[Develop locally (CLI)](https://bool.com/docs/cli)** — the CLI commands, the
+  local workflow, client setup, and deploying
+- **[Database](https://bool.com/docs/database)** — entities, records, and your
+  data model
 
 ### Admin Key Gotcha
 
-When using the admin key (`apiKey`), on a **private** entity (one with
-`user_id` owner field), you must set `user_id` explicitly:
+When using the admin key (`apiKey`), on a **private** entity (one Bool gives an
+`owner_id` owner column), you must set `owner_id` explicitly:
 
 ```ts
-// ❌ Fails on private entity (NOT NULL constraint)
+// ❌ Fails on private entity (owner_id has no value to default to)
 await bool.entities.tasks.create({ title: "Task" });
 
 // ✅ Works
-await bool.entities.tasks.create({ title: "Task", user_id: userId });
+await bool.entities.tasks.create({ title: "Task", owner_id: userId });
 ```
 
-The admin key has no user identity, so it can't default `user_id`. End-user
-clients and `boolk_` keys carry the user and default automatically.
+The admin key has no user identity, so it can't default `owner_id`. End-user
+clients and `boolk_` keys carry the user and default it automatically.
 
 Coding agents can do all of the above through Bool's MCP server instead
 (`list_entities`, `define_entity`, `list_records`, `get_entity_types`,
