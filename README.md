@@ -111,14 +111,12 @@ const todos = await bool.entities.todos.list();
 
 ### Documentation
 
-Complete guides and API reference at **[bool.com/docs](https://bool.com/docs)**:
+Complete guides at **[bool.com/docs](https://bool.com/docs)**:
 
-- **[Local Development](https://bool.com/docs/local-development)** — complete
-  walkthrough with use cases, workflows, and tips
-- **[CLI Reference](https://bool.com/docs/cli)** — command-line tools
-- **[SDK Reference](https://bool.com/docs/sdk-reference)** — API documentation
-- **[Data Design](https://bool.com/docs/database)** — schema patterns and
-  privacy
+- **[Develop locally (CLI)](https://bool.com/docs/cli)** — the CLI commands, the
+  local workflow, client setup, and deploying
+- **[Database](https://bool.com/docs/database)** — entities, records, and your
+  data model
 
 ### Admin Key Gotcha
 
