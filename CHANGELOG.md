@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0-next.13
+
+- New `bool create <name> [--path <dir>] [--deploy]` — scaffold a new Bool
+  project and a working todo-list app in one command. Creates the project
+  (`POST /api/projects`), writes a self-contained Vite + React todo app wired to
+  the project through `bool-sdk`, links it (`bool.config.json` + `.env.bool` +
+  types), and declares a public `todos` entity so the deployed app works with no
+  sign-in. `--deploy` publishes it immediately.
+
 ## 0.2.0-next.12
 
 - CLI: fail with a clear message instead of crashing when the API returns a

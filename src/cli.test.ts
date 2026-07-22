@@ -68,6 +68,65 @@ describe("parseArgs", () => {
   });
 });
 
+describe("create", () => {
+  function createRoutes() {
+    return {
+      "/api/projects": () =>
+        json({ id: "new1", name: "My Todo" }, 201),
+      "/api/projects/new1/connection": () =>
+        json({ ...CONNECTION, projectId: "new1", name: "My Todo" }),
+      "/api/projects/new1/api-key": () => json({ apiKey: "boolsk_secret" }),
+      "/api/projects/new1/entities": () =>
+        json({ ok: true, entity: "todos", changed: true, warnings: [] }),
+      "/api/projects/new1/entities/types": () => new Response("// todo types"),
+    };
+  }
+
+  test("creates a project, scaffolds a todo app, links, pushes the entity", async () => {
+    const { deps, calls, logs } = makeDeps(cwd, createRoutes());
+    const code = await runCli(["create", "my-todo"], deps);
+    expect(code).toBe(0);
+
+    const dir = join(cwd, "my-todo");
+    // Scaffolded app files.
+    expect(existsSync(join(dir, "package.json"))).toBe(true);
+    expect(readFileSync(join(dir, "index.html"), "utf8")).toContain("my-todo");
+    expect(readFileSync(join(dir, "src/App.tsx"), "utf8")).toContain("bool.entities.todos");
+    const entity = readFileSync(join(dir, "bool/entities/todos.jsonc"), "utf8");
+    expect(entity).toContain('"x-bool-access": "public"');
+
+    // Linked into the new dir (config + secret key), not the cwd.
+    const config = JSON.parse(readFileSync(join(dir, CONFIG_FILE), "utf8"));
+    expect(config.projectId).toBe("new1");
+    expect(existsSync(join(cwd, CONFIG_FILE))).toBe(false);
+    expect(readFileSync(join(dir, ENV_FILE), "utf8")).toBe("BOOL_API_KEY=boolsk_secret\n");
+
+    // Created the project and declared the entity.
+    expect(calls.some((c) => c.url.endsWith("/api/projects") && c.init?.method === "POST")).toBe(true);
+    expect(calls.some((c) => c.url.endsWith("/api/projects/new1/entities") && c.init?.method === "POST")).toBe(true);
+    // No deploy without --deploy.
+    expect(calls.some((c) => c.url.includes("/api/drops"))).toBe(false);
+    expect(logs.join("\n")).toContain('Created project "My Todo"');
+  });
+
+  test("refuses a non-empty target directory", async () => {
+    const dir = join(cwd, "taken");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "keep.txt"), "x");
+    const { deps, errors, calls } = makeDeps(cwd, createRoutes());
+    expect(await runCli(["create", "taken"], deps)).toBe(1);
+    expect(errors.join("\n")).toContain("isn't empty");
+    // Bailed before creating anything server-side.
+    expect(calls.length).toBe(0);
+  });
+
+  test("requires a name", async () => {
+    const { deps, errors } = makeDeps(cwd, {});
+    expect(await runCli(["create"], deps)).toBe(1);
+    expect(errors.join("\n")).toContain("Usage: bool create");
+  });
+});
+
 describe("link", () => {
   test("writes config + env + gitignore and pulls types", async () => {
     const { deps, calls, logs } = makeDeps(cwd, {

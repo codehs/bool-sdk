@@ -3,6 +3,8 @@
 // Run via `npx bool-sdk <command>` / `bunx bool-sdk`, or just `bool <command>`
 // once installed. Zero dependencies — plain fetch + node:fs.
 //
+//   bool create <name>         scaffold a new Bool todo app + project here,
+//                              then link it (add --deploy to publish it too)
 //   bool link --project <id>   connect this folder to a Bool project:
 //                              writes bool.config.json (public config),
 //                              .env.bool (the secret BOOL_API_KEY), and
@@ -32,6 +34,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { createZip, type ZipEntry } from "./zip.js";
+import { todoTemplate } from "./templates.js";
 
 export const CONFIG_FILE = "bool.config.json";
 export const ENV_FILE = ".env.bool";
@@ -160,6 +163,37 @@ async function apiJson<T>(
   return body as T;
 }
 
+async function apiPost<T>(
+  deps: CliDeps,
+  tok: string,
+  base: string,
+  path: string,
+  payload: unknown,
+): Promise<T> {
+  const res = await deps.fetch(`${base.replace(/\/$/, "")}${path}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${tok}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    const msg =
+      (body as { error?: string; message?: string } | null)?.message ??
+      (body as { error?: string } | null)?.error ??
+      `HTTP ${res.status}`;
+    throw new CliError(`${path} failed: ${msg}`);
+  }
+  if (body === null || typeof body !== "object") {
+    throw new CliError(
+      `${path}: expected a JSON response from ${base} but got something else — check --api-url (is the Bool API deployed there?).`,
+    );
+  }
+  return body as T;
+}
+
 export function readConfig(cwd: string): BoolConfig {
   const path = join(cwd, CONFIG_FILE);
   if (!existsSync(path)) {
@@ -204,15 +238,17 @@ type Connection = {
   supabaseAnonKey: string;
 };
 
-async function cmdLink(
-  flags: Record<string, string | boolean>,
+// Fetch a project's connection descriptor, write bool.config.json, and (for the
+// owner) the admin data key to .env.bool — all into deps.cwd. Returns the config
+// so the caller can pull types / push entities against it. Shared by `link` and
+// `create`.
+async function writeConfigAndKey(
+  projectId: string,
+  apiUrl: string,
+  tok: string,
+  typesPath: string,
   deps: CliDeps,
-): Promise<number> {
-  const projectId = str(flags.project);
-  if (!projectId) throw new CliError("Usage: bool link --project <id> [--api-url <url>] [--token <pat>]");
-  const apiUrl = str(flags["api-url"]) ?? deps.env.BOOL_API_URL ?? DEFAULT_API_URL;
-  const tok = token(flags, deps);
-
+): Promise<{ config: BoolConfig; name: string }> {
   const conn = await apiJson<Connection>(
     deps,
     tok,
@@ -229,10 +265,9 @@ async function cmdLink(
     schema: conn.schema,
     supabaseUrl: conn.supabaseUrl,
     supabaseAnonKey: conn.supabaseAnonKey,
-    typesPath: str(flags.types) ?? DEFAULT_TYPES_PATH,
+    typesPath,
   };
   writeFileSync(join(deps.cwd, CONFIG_FILE), JSON.stringify(config, null, 2) + "\n");
-  deps.log(`Linked to "${conn.name}" (${conn.projectId}) — wrote ${CONFIG_FILE}.`);
 
   // The admin data key is owner-only; a non-owner link still works for
   // types/entities/deploy, they just bring their own key.
@@ -246,6 +281,22 @@ async function cmdLink(
       `Skipped the admin data key (${keyRes.status === 404 ? "owner-only" : `HTTP ${keyRes.status}`}) — set BOOL_API_KEY yourself to read/write data locally.`,
     );
   }
+
+  return { config, name: conn.name };
+}
+
+async function cmdLink(
+  flags: Record<string, string | boolean>,
+  deps: CliDeps,
+): Promise<number> {
+  const projectId = str(flags.project);
+  if (!projectId) throw new CliError("Usage: bool link --project <id> [--api-url <url>] [--token <pat>]");
+  const apiUrl = str(flags["api-url"]) ?? deps.env.BOOL_API_URL ?? DEFAULT_API_URL;
+  const tok = token(flags, deps);
+
+  const typesPath = str(flags.types) ?? DEFAULT_TYPES_PATH;
+  const { config, name } = await writeConfigAndKey(projectId, apiUrl, tok, typesPath, deps);
+  deps.log(`Linked to "${name}" (${config.projectId}) — wrote ${CONFIG_FILE}.`);
 
   await pullTypes(config, tok, deps);
 
@@ -270,6 +321,81 @@ Next steps:
      (admin-key note: creates on a PRIVATE entity must set owner_id explicitly —
       the admin key has no end-user identity to default it from)
   4. Publish anytime: bool deploy`);
+  return 0;
+}
+
+async function cmdCreate(
+  positionals: string[],
+  flags: Record<string, string | boolean>,
+  deps: CliDeps,
+): Promise<number> {
+  const name = positionals[0] ?? str(flags.name);
+  if (!name) {
+    throw new CliError(
+      "Usage: bool create <name> [--path <dir>] [--deploy] [--token <pat>]",
+    );
+  }
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9 _-]*$/.test(name)) {
+    throw new CliError(
+      `Invalid project name "${name}" — use letters, numbers, spaces, dashes, underscores.`,
+    );
+  }
+  const apiUrl = str(flags["api-url"]) ?? deps.env.BOOL_API_URL ?? DEFAULT_API_URL;
+  const tok = token(flags, deps);
+  const dir = resolve(deps.cwd, str(flags.path) ?? name);
+
+  if (existsSync(dir) && readdirSync(dir).length > 0) {
+    throw new CliError(
+      `${relative(deps.cwd, dir) || dir} already exists and isn't empty — pick another name or --path.`,
+    );
+  }
+
+  // 1. Create the project. template stays vite-react so Bool cloud-builds the
+  //    app we deploy; the server also provisions the project's schema.
+  const project = await apiPost<{ id: string; name?: string }>(
+    deps,
+    tok,
+    apiUrl,
+    "/api/projects",
+    { name, template: "vite-react" },
+  );
+  deps.log(`Created project "${project.name ?? name}" (${project.id}).`);
+
+  // 2. Scaffold the todo app into dir.
+  mkdirSync(dir, { recursive: true });
+  const files = todoTemplate(name);
+  for (const [rel, content] of Object.entries(files)) {
+    const out = join(dir, rel);
+    mkdirSync(dirname(out), { recursive: true });
+    writeFileSync(out, content);
+  }
+  deps.log(
+    `Scaffolded a todo app in ${relative(deps.cwd, dir) || "."}/ (${Object.keys(files).length} files).`,
+  );
+
+  // Everything below runs inside the new project dir.
+  const sub: CliDeps = { ...deps, cwd: dir };
+
+  // 3. Write bool.config.json + .env.bool into the project dir.
+  const { config } = await writeConfigAndKey(project.id, apiUrl, tok, DEFAULT_TYPES_PATH, sub);
+  deps.log(`Linked ${CONFIG_FILE} to project ${project.id}.`);
+
+  // 4. Declare the todos entity so the table exists, then refresh types.
+  await cmdEntitiesPush(flags, sub);
+  await pullTypes(config, tok, sub);
+
+  // 5. Optionally publish.
+  if (flags.deploy) {
+    await cmdDeploy(flags, sub);
+  } else {
+    const rel = relative(deps.cwd, dir) || ".";
+    deps.log(`
+Next:
+  cd ${rel}
+  npm install
+  npm run dev        # develop locally (data goes to your Bool project)
+  bool deploy        # publish to Bool hosting`);
+  }
   return 0;
 }
 
@@ -562,6 +688,8 @@ async function cmdDeploy(
 const USAGE = `bool — develop locally against a Bool project, deploy to Bool
 
 Usage:
+  bool create <name> [--path <dir>] [--deploy] [--token <pat>]
+                                           scaffold a new Bool todo app + project
   bool link --project <id> [--api-url <url>] [--token <pat>] [--types <path>]
   bool types [--out <path>] [--token <pat>]
   bool entities [--token <pat>]            list the project's data models
@@ -578,6 +706,8 @@ export async function runCli(argv: string[], overrides?: Partial<CliDeps>): Prom
   const { command, positionals, flags } = parseArgs(argv);
   try {
     switch (command) {
+      case "create":
+        return await cmdCreate(positionals, flags, deps);
       case "link":
         return await cmdLink(flags, deps);
       case "types":
