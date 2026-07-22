@@ -147,6 +147,16 @@ async function apiJson<T>(
       `HTTP ${res.status}`;
     throw new CliError(`${path} failed: ${msg}`);
   }
+  // A 2xx with a body we couldn't parse as a JSON object means we didn't reach
+  // the Bool API — most often --api-url points at a host that serves an HTML
+  // page (e.g. the app shell when the endpoint isn't deployed there yet, or a
+  // login/redirect page). Fail with a clear message instead of returning null
+  // and letting the caller crash on `body.projectId`.
+  if (body === null || typeof body !== "object") {
+    throw new CliError(
+      `${path}: expected a JSON response from ${base} but got something else — check --api-url (is the Bool API deployed there?).`,
+    );
+  }
   return body as T;
 }
 

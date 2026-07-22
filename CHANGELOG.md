@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0-next.12
+
+- CLI: fail with a clear message instead of crashing when the API returns a
+  non-JSON `2xx` response. This happens when `--api-url` points at a host that
+  serves the HTML app shell (e.g. the Bool API isn't deployed there yet) — the
+  `link`, `entities`, and `entities pull` commands previously threw an
+  unhandled `TypeError` (`Cannot read properties of null`). They now report
+  `expected a JSON response … — check --api-url` and exit 1.
+
 ## 0.2.0-next.11
 
 Local development: use a Bool project as a managed backend from your own

@@ -126,6 +126,22 @@ describe("link", () => {
     expect(await runCli(["link", "--project", "p1"], deps)).toBe(1);
     expect(errors.join("\n")).toContain("v1 runtime");
   });
+
+  // Regression: a 200 with a non-JSON body (e.g. --api-url points at a host
+  // that serves the HTML app shell because the Bool API isn't deployed there)
+  // must fail cleanly, not crash on `conn.projectId`.
+  test("fails cleanly when the API returns a non-JSON 200 (wrong --api-url)", async () => {
+    const { deps, errors } = makeDeps(cwd, {
+      "/api/projects/p1/connection": () =>
+        new Response("<!DOCTYPE html><html><body>app</body></html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        }),
+    });
+    expect(await runCli(["link", "--project", "p1", "--api-url", "https://not-the-api.test"], deps)).toBe(1);
+    expect(errors.join("\n")).toContain("--api-url");
+    expect(errors.join("\n")).not.toContain("projectId");
+  });
 });
 
 describe("types", () => {
