@@ -68,27 +68,29 @@ tested, and upgradable independently of any one app.
   `useBoolAuth()`, `<AuthGate>`, and the headless `useSignInForm()` state
   machine that login forms bind to.
 
-## Local development (Bool as a managed backend)
+## Local Development (Your Own Machine)
 
-You can also build an app on your OWN machine — your own editor, your own
-framework, a coding agent — and use a Bool project as its backend (data,
-end-user auth, AI), then publish it back to Bool. This is the one case where
-you do install this package yourself.
+Build an app on your computer, use a Bool project as your backend, then
+publish to `https://<slug>.bool.so`. This is the one case where you install
+the SDK yourself.
 
-```sh
+### Quick Start
+
+```bash
 npm install bool-sdk
-export BOOL_TOKEN=bool_live_…       # personal access token (Bool → Settings)
-npx bool link --project <id>    # writes bool.config.json + .env.bool + types
-npx bool types                  # refresh bool/types.d.ts after schema changes
-npx bool entities               # list the project's data models
-npx bool entities pull          # write schema files to bool/entities/
-npx bool entities push          # declare edited local schemas on the project
-npx bool deploy                 # zip the source, Bool builds + hosts it
+export BOOL_TOKEN=bool_live_xxxxx  # from Bool → Settings → Access tokens
+
+npx bool link --project <id>       # connect to a Bool project
+npx bool entities push --dir bool/entities  # push schema changes
+npx bool deploy                    # publish when ready
 ```
 
-`link` fetches the project's connection config and (owner-only) its admin data
-key. The key goes to `.env.bool` (gitignored) — it authorizes full data access
-through the gateway, so treat it like any secret. Then:
+**Three new files after `link`:**
+- `bool.config.json` — project metadata (commit this)
+- `.env.bool` — admin key (gitignore, keep secret)
+- `bool/types.d.ts` — TypeScript types (auto-updated)
+
+**Then in your app:**
 
 ```ts
 import { createBoolClient } from "bool-sdk";
@@ -103,15 +105,33 @@ export const bool = createBoolClient({
   apiKey: process.env.BOOL_API_KEY, // from .env.bool
 });
 
-const todos = await bool.entities.todos.list(); // typed via bool/types.d.ts
+// Now use your data
+const todos = await bool.entities.todos.list();
 ```
 
-One admin-key gotcha: on a **private** entity, `create` must set `owner_id`
-explicitly (`{ title: "hi", owner_id: user.id }`). The column normally
-defaults to the signed-in end user, but the admin key has no end-user
-identity, so on a fresh private table (where `owner_id` is NOT NULL) the
-insert is rejected without it. Public entities are unaffected, as are
-end-user (`boolk_`) keys — those carry the user.
+### Guides
+
+- **[Local Development](./docs/LOCAL-DEVELOPMENT.md)** — detailed walkthrough
+  with use cases, workflows, and tips
+- **[Deployment](./docs/DEPLOYMENT.md)** — publishing, CI/CD, monitoring
+- **[Data Modeling](./docs/DATA-MODELING.md)** — schema patterns, privacy,
+  relationships
+
+### Admin Key Gotcha
+
+When using the admin key (`apiKey`), on a **private** entity (one with
+`user_id` owner field), you must set `owner_id` explicitly:
+
+```ts
+// ❌ Fails on private entity (NOT NULL constraint)
+await bool.entities.tasks.create({ title: "Task" });
+
+// ✅ Works
+await bool.entities.tasks.create({ title: "Task", user_id: userId });
+```
+
+The admin key has no user identity, so it can't default `owner_id`. End-user
+clients and `boolk_` keys carry the user and default automatically.
 
 Coding agents can do all of the above through Bool's MCP server instead
 (`list_entities`, `define_entity`, `list_records`, `get_entity_types`,
