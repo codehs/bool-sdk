@@ -10,7 +10,7 @@
 
 // Keep in sync with the CLI's own version so the scaffolded app pulls the
 // matching client. Injected into package.json at scaffold time.
-export const TEMPLATE_BOOL_SDK_VERSION = "0.2.0-next.13";
+export const TEMPLATE_BOOL_SDK_VERSION = "0.2.0-next.14";
 
 function packageJson(name: string): string {
   return (
@@ -25,6 +25,9 @@ function packageJson(name: string): string {
           preview: "vite preview --host",
         },
         dependencies: {
+          // bool-sdk declares @supabase/supabase-js as a peer, so the app must
+          // install it directly — else the deploy build fails to resolve it.
+          "@supabase/supabase-js": "^2.105.0",
           "bool-sdk": TEMPLATE_BOOL_SDK_VERSION,
           react: "^19.2.0",
           "react-dom": "^19.2.0",

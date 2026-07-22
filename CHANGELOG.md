@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0-next.14
+
+- Fix `bool create`: the scaffolded app now lists `@supabase/supabase-js`
+  (a bool-sdk peer dependency) in its `package.json`, so the deploy/cloud build
+  can resolve it — previously `vite build` failed with "Rollup failed to resolve
+  import @supabase/supabase-js". Verified with a real `npm install && vite build`.
+
+  Note: `bool create` / `bool entities push` also need the platform's
+  `POST /api/projects/[id]/entities` endpoint (added in codehs/bool#488). Without
+  it the entity push returns HTTP 405.
+
 ## 0.2.0-next.13
 
 - New `bool create <name> [--path <dir>] [--deploy]` — scaffold a new Bool
