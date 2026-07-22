@@ -10,7 +10,7 @@
 
 // Keep in sync with the CLI's own version so the scaffolded app pulls the
 // matching client. Injected into package.json at scaffold time.
-export const TEMPLATE_BOOL_SDK_VERSION = "0.2.0-next.15";
+export const TEMPLATE_BOOL_SDK_VERSION = "0.2.0-next.16";
 
 function packageJson(name: string): string {
   return (

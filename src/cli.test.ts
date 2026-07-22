@@ -131,10 +131,12 @@ describe("create", () => {
     expect(calls.length).toBe(0);
   });
 
-  test("requires a name", async () => {
-    const { deps, errors } = makeDeps(cwd, {});
-    expect(await runCli(["create"], deps)).toBe(1);
-    expect(errors.join("\n")).toContain("Usage: bool create");
+  test("generates a name when none is given (bare `bool create`)", async () => {
+    const { deps, logs } = makeDeps(cwd, createRoutes());
+    expect(await runCli(["create"], deps)).toBe(0);
+    // A project was created and something got scaffolded under a generated name.
+    expect(logs.join("\n")).toMatch(/Created project ".+"/);
+    expect(logs.join("\n")).toMatch(/Scaffolded a todo app in [a-z]+-[a-z]+-\d+\//);
   });
 });
 

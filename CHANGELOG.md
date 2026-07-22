@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0-next.16
+
+- `bool create` no longer requires a name — a bare `bool create` generates a
+  friendly one (e.g. `swift-otter-42`) and scaffolds into a matching folder.
+  Pass a name to override. Combined with the default API URL (or `BOOL_API_URL`),
+  `bool create` alone stands up a new todo app + project.
+
 ## 0.2.0-next.15
 
 - `bool create` now aborts (exit 1) if the entity push fails, instead of

@@ -324,17 +324,21 @@ Next steps:
   return 0;
 }
 
+// A friendly default project name for bare `bool create` (adjective-noun-NN).
+function generateProjectName(): string {
+  const adjectives = ["swift", "cozy", "bright", "calm", "bold", "keen", "lucky", "sunny", "brave", "clever"];
+  const nouns = ["otter", "maple", "harbor", "meadow", "comet", "pixel", "willow", "ember", "cedar", "finch"];
+  const pick = <T,>(a: T[]) => a[Math.floor(Math.random() * a.length)];
+  return `${pick(adjectives)}-${pick(nouns)}-${Math.floor(Math.random() * 90 + 10)}`;
+}
+
 async function cmdCreate(
   positionals: string[],
   flags: Record<string, string | boolean>,
   deps: CliDeps,
 ): Promise<number> {
-  const name = positionals[0] ?? str(flags.name);
-  if (!name) {
-    throw new CliError(
-      "Usage: bool create <name> [--path <dir>] [--deploy] [--token <pat>]",
-    );
-  }
+  // Name is optional — bare `bool create` picks a friendly one so it just works.
+  const name = positionals[0] ?? str(flags.name) ?? generateProjectName();
   if (!/^[a-zA-Z0-9][a-zA-Z0-9 _-]*$/.test(name)) {
     throw new CliError(
       `Invalid project name "${name}" — use letters, numbers, spaces, dashes, underscores.`,
@@ -695,8 +699,9 @@ async function cmdDeploy(
 const USAGE = `bool — develop locally against a Bool project, deploy to Bool
 
 Usage:
-  bool create <name> [--path <dir>] [--deploy] [--token <pat>]
+  bool create [name] [--path <dir>] [--deploy] [--token <pat>]
                                            scaffold a new Bool todo app + project
+                                           (name is optional — one is generated)
   bool link --project <id> [--api-url <url>] [--token <pat>] [--types <path>]
   bool types [--out <path>] [--token <pat>]
   bool entities [--token <pat>]            list the project's data models
