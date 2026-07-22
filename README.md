@@ -122,19 +122,19 @@ Complete guides and API reference at **[bool.com/docs](https://bool.com/docs)**:
 
 ### Admin Key Gotcha
 
-When using the admin key (`apiKey`), on a **private** entity (one with
-`user_id` owner field), you must set `user_id` explicitly:
+When using the admin key (`apiKey`), on a **private** entity (one Bool gives an
+`owner_id` owner column), you must set `owner_id` explicitly:
 
 ```ts
-// ❌ Fails on private entity (NOT NULL constraint)
+// ❌ Fails on private entity (owner_id has no value to default to)
 await bool.entities.tasks.create({ title: "Task" });
 
 // ✅ Works
-await bool.entities.tasks.create({ title: "Task", user_id: userId });
+await bool.entities.tasks.create({ title: "Task", owner_id: userId });
 ```
 
-The admin key has no user identity, so it can't default `user_id`. End-user
-clients and `boolk_` keys carry the user and default automatically.
+The admin key has no user identity, so it can't default `owner_id`. End-user
+clients and `boolk_` keys carry the user and default it automatically.
 
 Coding agents can do all of the above through Bool's MCP server instead
 (`list_entities`, `define_entity`, `list_records`, `get_entity_types`,
