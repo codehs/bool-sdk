@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.0-next.11
+
+Local development: use a Bool project as a managed backend from your own
+machine, and publish back to Bool — without leaving your editor.
+
+- `createBoolClient({ ..., apiKey })` — a Bool data API key (`boolsk_` project
+  admin key, or a `boolk_` end-user key) is sent as the `api_key` header on
+  every gateway call (db, users, ai), so the client now works from anywhere:
+  Node scripts, a local Vite app, CI. Without `apiKey`, behavior is unchanged.
+- New CLI (`npx bool-sdk <command>`, zero dependencies):
+  - `link --project <id>` — connects a local folder to a Bool project. Writes
+    `bool.config.json` (public connection config), puts the project's admin
+    data key in `.env.bool` (gitignored; owner only), and pulls entity types.
+  - `types` — regenerates `bool/types.d.ts` from the project's entity schemas,
+    so `bool.entities.<name>` is fully typed locally.
+  - `entities` — prints the project's declared entities + fields.
+  - `deploy` — zips the app source (node_modules/.git/env files excluded) and
+    publishes it on Bool via the drop pipeline: Bool builds in the cloud and
+    the project URL stays stable.
+  - Platform calls authenticate with a personal access token (`--token` or
+    `BOOL_TOKEN`).
+
+Requires the local-dev endpoints in the Bool platform repo
+(`/api/projects/[id]/connection`, `/api/projects/[id]/entities/types`,
+`POST /api/drops`).
+
 ## 0.2.0-next.10
 
 Adds `bool.ai` — the AI battery. A deployed app can call a model with NO API key
@@ -40,7 +66,7 @@ already-created app on the stable `^0.1.0` range too.
 
 ## 0.2.0-next.8
 
-Adds per-user API keys (Base44 convention): the gateway's `/users/me` lazily
+Adds per-user API keys: the gateway's `/users/me` lazily
 mints and returns a personal `api_key` for the signed-in end user.
 
 - `BoolUser.apiKey?: string` — typed access to the key.
@@ -53,7 +79,7 @@ change that accepts `api_key` and stamps `sub` accordingly.
 
 ## 0.2.0-next.7
 
-- **Entities pagination cap raised 1000 → 5000, matching Base44.** `list` and
+- **Entities pagination cap raised 1000 → 5000.** `list` and
   `filter` still page (50 rows by default) but now allow up to 5000 rows per
   call. A `limit` above the cap **throws** instead of silently truncating, so
   over-large reads fail loudly rather than returning a partial result the caller
@@ -72,7 +98,7 @@ app renders its sign-in screen rather than a blank page. Adds a regression test.
 
 ## 0.2.0
 
-Adds the **entities data layer** — a Base44-parity data API over the gateway so
+Adds the **entities data layer** — a high-level data API over the gateway so
 apps read/write data without touching Supabase, SQL, or credentials directly:
 
 ```ts
@@ -82,7 +108,7 @@ await bool.entities.todos.update(one.id, { done: true });
 await bool.entities.todos.filter({ status: "active", count: { $gte: 10 } });
 ```
 
-`bool.entities.<table>` mirrors Base44's entity surface one-to-one:
+`bool.entities.<table>` exposes the full entity surface:
 - **Reads:** `list`, `filter`, `get` — with `sort` (`-col`), `limit`, `skip`,
   and `fields` (column selection).
 - **Writes:** `create`, `bulkCreate`, `update`, `bulkUpdate`, `delete`.
@@ -96,7 +122,7 @@ await bool.entities.todos.filter({ status: "active", count: { $gte: 10 } });
 Methods return row data directly and throw on error. Additive and
 backward-compatible — `bool.db` / `supabase` still work.
 
-Known gaps vs. Base44 (documented, follow-ups): `updateMany` with
+Known gaps (documented, follow-ups): `updateMany` with
 `$inc/$mul/$push/$pull` is read-modify-write (not atomic under concurrent
 writers — a Postgres RPC would make it atomic); `$size` (filter by array
 length) isn't expressible over PostgREST and is omitted.

@@ -287,6 +287,42 @@ describe("per-user API key", () => {
   });
 });
 
+describe("local development (config.apiKey)", () => {
+  const LOCAL = { ...CONFIG, apiKey: "boolsk_admin123" };
+
+  test("db calls carry the api_key header", async () => {
+    const client = createBoolClient(LOCAL);
+    await client.db.from("todos").select("*");
+    expect(headersOf(calls[0]!).get("api_key")).toBe("boolsk_admin123");
+  });
+
+  test("users-plane calls carry the api_key header", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ user: { id: "u1" } }), {
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(LOCAL);
+    await client.auth.getUser();
+    expect(headersOf(calls[0]!).get("api_key")).toBe("boolsk_admin123");
+  });
+
+  test("ai-plane calls carry the api_key header", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ text: "hi" }), {
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(LOCAL);
+    await client.ai.generate("hello");
+    expect(headersOf(calls[0]!).get("api_key")).toBe("boolsk_admin123");
+  });
+
+  test("no api_key header without the config option", async () => {
+    const client = createBoolClient(CONFIG);
+    await client.db.from("todos").select("*");
+    expect(headersOf(calls[0]!).get("api_key")).toBeNull();
+  });
+});
+
 describe("bool.ai battery", () => {
   test("generate(prompt) POSTs to the ai plane and returns text", async () => {
     respond = () =>

@@ -12,7 +12,7 @@ tested, and upgradable independently of any one app.
 ## What it does
 
 - **Entities data API.** `client.entities.<table>` is the recommended way to
-  read/write data — a one-to-one mirror of Base44's entity surface: `list`,
+  read/write data — a familiar high-level entity surface: `list`,
   `filter`, `get`, `create`, `bulkCreate`, `update`, `bulkUpdate`, `updateMany`,
   `delete`, `deleteMany`, `importEntities`, `subscribe`. It hides Supabase/SQL
   entirely; methods return rows directly and throw on error:
@@ -67,6 +67,46 @@ tested, and upgradable independently of any one app.
 - **React auth layer** (`bool-sdk/react`): `<BoolAuthProvider>`,
   `useBoolAuth()`, `<AuthGate>`, and the headless `useSignInForm()` state
   machine that login forms bind to.
+
+## Local development (Bool as a managed backend)
+
+You can also build an app on your OWN machine — your own editor, your own
+framework, a coding agent — and use a Bool project as its backend (data,
+end-user auth, AI), then publish it back to Bool. This is the one case where
+you do install this package yourself.
+
+```sh
+npm install bool-sdk
+export BOOL_TOKEN=bool_live_…       # personal access token (Bool → Settings)
+npx bool link --project <id>    # writes bool.config.json + .env.bool + types
+npx bool types                  # refresh bool/types.d.ts after schema changes
+npx bool entities               # list the project's data models
+npx bool deploy                 # zip the source, Bool builds + hosts it
+```
+
+`link` fetches the project's connection config and (owner-only) its admin data
+key. The key goes to `.env.bool` (gitignored) — it authorizes full data access
+through the gateway, so treat it like any secret. Then:
+
+```ts
+import { createBoolClient } from "bool-sdk";
+import config from "./bool.config.json";
+
+export const bool = createBoolClient({
+  supabaseUrl: config.supabaseUrl,
+  supabaseAnonKey: config.supabaseAnonKey,
+  schema: config.schema,
+  appOrigin: config.appOrigin,
+  slug: config.slug,
+  apiKey: process.env.BOOL_API_KEY, // from .env.bool
+});
+
+const todos = await bool.entities.todos.list(); // typed via bool/types.d.ts
+```
+
+Coding agents can do all of the above through Bool's MCP server instead
+(`list_entities`, `define_entity`, `list_records`, `get_entity_types`,
+`get_project_connection`, …) — see the platform docs.
 
 ## Usage
 

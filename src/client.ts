@@ -51,6 +51,16 @@ export type BoolClientConfig = {
    * sandbox can't send the live-gate cookie). Empty when deployed — the
    * cookie is used then. (VITE_BOOL_VIEWER_TOKEN) */
   viewerToken?: string;
+  /** LOCAL / external development: a Bool data API key sent as the `api_key`
+   * header on every gateway call, instead of the cookie/viewer-token identity a
+   * deployed app uses. Two kinds (both minted by the platform):
+   *   - `boolsk_…` — the project's OWNER/ADMIN key: full access to ALL rows
+   *     (bypasses per-user RLS). For your own scripts/backends. SECRET — load
+   *     it from an env var (`bool link` writes .env.bool), never commit it.
+   *   - `boolk_…` — one END USER's personal key: acts exactly as that user.
+   * With an apiKey set the client works from anywhere (Node, a local Vite app,
+   * CI) — this is what `bool link` wires up. */
+  apiKey?: string;
 };
 
 /** The signed-in end user (mirrors what the gateway returns from /me). Never
@@ -187,6 +197,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     appOrigin = "",
     slug = "",
     viewerToken = "",
+    apiKey = "",
   } = config;
 
   let euSessionToken = (() => {
@@ -236,6 +247,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
       const headers = new Headers(init?.headers ?? {});
       if (viewerToken) headers.set("x-bool-viewer", viewerToken);
       if (euSessionToken) headers.set("x-bool-eu-session", euSessionToken);
+      if (apiKey) headers.set("api_key", apiKey);
       // credentials:include so the live-gate identity cookie flows to the
       // gateway (same-origin or custom-domain); the viewer token covers the
       // cross-origin preview.
@@ -269,6 +281,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     };
     if (viewerToken) headers["x-bool-viewer"] = viewerToken;
     if (euSessionToken) headers["x-bool-eu-session"] = euSessionToken;
+    if (apiKey) headers["api_key"] = apiKey;
     const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/users${path}`, {
       ...init,
       headers,
@@ -493,6 +506,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (viewerToken) headers["x-bool-viewer"] = viewerToken;
     if (euSessionToken) headers["x-bool-eu-session"] = euSessionToken;
+    if (apiKey) headers["api_key"] = apiKey;
     return headers;
   }
   const ai: BoolAi = {
