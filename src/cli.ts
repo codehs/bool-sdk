@@ -248,13 +248,19 @@ async function writeConfigAndKey(
   tok: string,
   typesPath: string,
   deps: CliDeps,
+  // A connection descriptor the caller already fetched (e.g. `create` checks
+  // the runtime before scaffolding). When omitted we fetch it here — the case
+  // for `link`, which has nothing to check first.
+  prefetched?: Connection,
 ): Promise<{ config: BoolConfig; name: string }> {
-  const conn = await apiJson<Connection>(
-    deps,
-    tok,
-    apiUrl,
-    `/api/projects/${projectId}/connection`,
-  );
+  const conn =
+    prefetched ??
+    (await apiJson<Connection>(
+      deps,
+      tok,
+      apiUrl,
+      `/api/projects/${projectId}/connection`,
+    ));
 
   const config: BoolConfig = {
     projectId: conn.projectId,
@@ -365,7 +371,28 @@ async function cmdCreate(
   );
   deps.log(`Created project "${project.name ?? name}" (${project.id}).`);
 
-  // 2. Scaffold the todo app into dir.
+  // 2. Confirm the project can actually be developed against BEFORE writing any
+  //    files. Local dev requires the gateway runtime; a non-gateway (v1)
+  //    project 409s here. Checking now means a v1 project fails with a clear
+  //    message and leaves no half-scaffolded folder behind (previously we
+  //    scaffolded first and only discovered the problem afterward).
+  let conn: Connection;
+  try {
+    conn = await apiJson<Connection>(
+      deps,
+      tok,
+      apiUrl,
+      `/api/projects/${project.id}/connection`,
+    );
+  } catch (e) {
+    throw new CliError(
+      `${e instanceof Error ? e.message : String(e)}\n` +
+        `Project ${project.id} was created but can't be used for local development, ` +
+        `so nothing was scaffolded.`,
+    );
+  }
+
+  // 3. Scaffold the todo app into dir.
   mkdirSync(dir, { recursive: true });
   const files = todoTemplate(name);
   for (const [rel, content] of Object.entries(files)) {
@@ -380,11 +407,19 @@ async function cmdCreate(
   // Everything below runs inside the new project dir.
   const sub: CliDeps = { ...deps, cwd: dir };
 
-  // 3. Write bool.config.json + .env.bool into the project dir.
-  const { config } = await writeConfigAndKey(project.id, apiUrl, tok, DEFAULT_TYPES_PATH, sub);
+  // 4. Write bool.config.json + .env.bool into the project dir, reusing the
+  //    connection descriptor we already fetched in step 2.
+  const { config } = await writeConfigAndKey(
+    project.id,
+    apiUrl,
+    tok,
+    DEFAULT_TYPES_PATH,
+    sub,
+    conn,
+  );
   deps.log(`Linked ${CONFIG_FILE} to project ${project.id}.`);
 
-  // 4. Declare the todos entity so the table exists, then refresh types.
+  // 5. Declare the todos entity so the table exists, then refresh types.
   //    If this fails the app has no data — don't ship a broken deploy; tell the
   //    user to re-push once the cause is fixed.
   const pushCode = await cmdEntitiesPush(flags, sub);
@@ -395,7 +430,7 @@ async function cmdCreate(
   }
   await pullTypes(config, tok, sub);
 
-  // 5. Optionally publish.
+  // 6. Optionally publish.
   if (flags.deploy) {
     await cmdDeploy(flags, sub);
   } else {
