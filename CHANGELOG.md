@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0-next.20
+
+- **Reverts the reload-hold behavior added in `0.2.0-next.19`.** That release
+  withheld the doorbell reload while a client's own writes were in flight, to stop
+  rows popping out and back in. It measurably reduced the flicker but did not fix
+  it, so it isn't worth the complexity it carries.
+
+  Two reasons it falls short. It bounds how long a ping can be held, so that
+  continuous editing keeps seeing other people's changes — and past that bound a
+  reload fires mid-flight and the flicker returns (reproduced at 2.6s under
+  sustained writes). More fundamentally, it guards when a reload is *issued* but
+  not when its result is *applied*: a reload already in flight still lands after
+  the next optimistic row appears and replaces the list without it.
+
+  Both are the same underlying thing — any design that replaces the whole list
+  from a server snapshot has a window in which that snapshot is stale. The fix is
+  to stop replacing the list (merge the changed row by id), not to keep shrinking
+  the window.
+
+  Preserved on the `preserve/realtime-reload-hold` branch.
+
 ## 0.2.0-next.19
 
 - Rows no longer pop out and back in when you add several quickly. The doorbell
