@@ -127,19 +127,7 @@ export type BoolAuth = {
 
 /** A row-data-free change notification: some row in `table` saw `op`. Refetch
  * whatever you derive from that table — the ping never carries the data. */
-export type BoolChangePayload = {
-  table?: string;
-  op?: string;
-  /** The changed row's id (present since the gateway's id-bearing doorbell;
-   * older triggers ping without it). Lets subscribers refetch just the changed
-   * rows instead of re-running their whole query. */
-  id?: string | null;
-  /** The full row, when the ding carries it. Today it never does — the public
-   * doorbell channel is deliberately row-data-free — but the private-channel
-   * variant (minted realtime token) will ship it, and the live layer already
-   * applies it directly when present. */
-  row?: Record<string, unknown>;
-};
+export type BoolChangePayload = { table?: string; op?: string };
 
 /** A JSON Schema describing the shape `bool.ai.generate` should return. Passed
  * straight to the gateway, which validates the model's output against it. e.g.

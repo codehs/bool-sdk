@@ -12,19 +12,11 @@ import {
   createContext,
   useContext,
   useEffect,
-  useRef,
   useState,
-  useSyncExternalStore,
   type FormEvent,
   type ReactNode,
 } from "react";
 import { getDefaultBoolClient, type BoolClient, type BoolUser } from "./client.js";
-import {
-  LiveEntityStore,
-  type EntityRow,
-  type LiveQueryOptions,
-} from "./live.js";
-import type { EntityHandler } from "./entities.js";
 
 type AuthActionResult = { error: unknown };
 
@@ -256,96 +248,5 @@ export function useSignInForm() {
     busy,
     submit,
     signInWithGoogle: startGoogleSignIn,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// useEntity — a live view of one entity table.
-//
-// The data-sync state machine (initial load, doorbell subscription, coalesced
-// delta reconciling, stale-response ordering, optimistic create/update/remove
-// with rollback) is exactly what generated app code kept getting wrong when it
-// hand-wired load() + subscribe(() => load()) — races made items pop in and
-// out. Same philosophy as the auth layer above: the SDK owns the machine
-// (LiveEntityStore in live.ts, where it's unit-tested headlessly); app code
-// just renders.
-//
-//   const todos = useEntity("todos", { sort: "-created_at" });
-//   todos.data                       // live rows — updates on every change
-//   todos.create({ title: "hi" })    // appears instantly, rolls back on error
-//   todos.update(id, { done: true })
-//   todos.remove(id)
-// ---------------------------------------------------------------------------
-
-export type UseEntityResult<T extends EntityRow = EntityRow> = {
-  /** Live rows: committed server state with in-flight optimistic writes
-   * layered on top, filtered/sorted/limited per the hook options. */
-  data: T[];
-  /** True until the first load settles. */
-  loading: boolean;
-  /** Latest load/mutation error (cleared by the next success). Mutations never
-   * throw — check this (or a mutation's return value) to surface failures. */
-  error: unknown;
-  /** Optimistic insert. Resolves to the committed row, or null on failure
-   * (already rolled back). Pass an `id` to control it; one is generated
-   * otherwise. */
-  create: (fields: Partial<T>) => Promise<T | null>;
-  /** Optimistic patch. Resolves to the committed row, or null on failure. */
-  update: (id: string, fields: Partial<T>) => Promise<T | null>;
-  /** Optimistic delete. Resolves false on failure (row restored). */
-  remove: (id: string) => Promise<boolean>;
-  /** Force a full reload (rarely needed — changes arrive on their own). */
-  refetch: () => Promise<void>;
-};
-
-export function useEntity<T extends EntityRow = EntityRow>(
-  table: string,
-  opts?: LiveQueryOptions & {
-    /** Defaults to the client created by createBoolClient() — in a Bool app
-     * you never pass this. */
-    client?: BoolClient;
-  },
-): UseEntityResult<T> {
-  const bool = opts?.client ?? getDefaultBoolClient();
-  // A new table/filter/sort/limit is a different query → fresh store. JSON
-  // keying means an inline `{ filter: {...} }` object literal is fine (no
-  // useMemo required of app code).
-  const key =
-    table +
-    " " +
-    bool.schema +
-    " " +
-    JSON.stringify([opts?.filter ?? null, opts?.sort ?? null, opts?.limit ?? null]);
-  const ref = useRef<{ key: string; store: LiveEntityStore<T> } | null>(null);
-  if (ref.current === null || ref.current.key !== key) {
-    ref.current = {
-      key,
-      store: new LiveEntityStore<T>(bool.entities[table] as unknown as EntityHandler<T>, {
-        filter: opts?.filter,
-        sort: opts?.sort,
-        limit: opts?.limit,
-      }),
-    };
-  }
-  const store = ref.current.store;
-
-  // Subscribe + initial load, torn down on unmount or query change. The store
-  // is restartable, so StrictMode's mount-unmount-mount is safe.
-  useEffect(() => store.start(), [store]);
-
-  const snap = useSyncExternalStore(
-    (cb) => store.onSnapshot(cb),
-    () => store.getSnapshot(),
-    () => store.getSnapshot(),
-  );
-
-  return {
-    data: snap.data,
-    loading: snap.loading,
-    error: snap.error,
-    create: (fields) => store.create(fields),
-    update: (id, fields) => store.update(id, fields),
-    remove: (id) => store.remove(id),
-    refetch: () => store.refetch(),
   };
 }
