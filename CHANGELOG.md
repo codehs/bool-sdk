@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.0-next.19
+
+- Rows no longer pop out and back in when you add several quickly. The doorbell
+  says "something changed" without saying which row, so an app reloads its whole
+  list on every ping — and a reload issued while the app's own inserts are still
+  in flight comes back *without* them, replacing what's on screen with a snapshot
+  missing rows the user already added. Measured on a live app: a row was absent
+  for 200ms before reappearing. It's a lost-update race, not latency; an
+  instantaneous network would still return a snapshot lacking uncommitted rows.
+
+  The SDK now withholds the reload signal while this client's own writes are
+  landing and fires once when they drain, plus a short trailing coalesce so a
+  burst collapses into one reload (the trigger fires per changed *row*, so a bulk
+  write produces N pings for one logical refresh). A ceiling bounds the hold so
+  continuous local editing can't starve the app of other users' changes.
+
+  **No app changes needed** — the existing `subscribe(() => load())` pattern
+  simply stops flickering. Apps pick this up on their next publish.
+
 ## 0.2.0-next.18
 
 - `bool create` now verifies the new project can be developed against *before*
