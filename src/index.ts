@@ -2,7 +2,6 @@ export {
   createBoolClient,
   getDefaultBoolClient,
   setDefaultBoolClient,
-  hasDefaultBoolClient,
   type BoolClient,
   type BoolClientConfig,
   type BoolAuth,
@@ -29,11 +28,3 @@ export {
   type UpdateManyResult,
   type ImportResult,
 } from "./entities.js";
-export {
-  LiveEntityStore,
-  matchesFilter,
-  compareBySort,
-  type EntityRow,
-  type LiveQueryOptions,
-  type LiveSnapshot,
-} from "./live.js";

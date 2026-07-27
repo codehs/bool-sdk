@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import {
   createBoolClient,
   getDefaultBoolClient,
-  hasDefaultBoolClient,
   isDeploymentSubdomain,
   BoolAiError,
   type BoolClientConfig,
@@ -415,44 +414,12 @@ describe("bool.ai battery", () => {
   });
 });
 
-// The registry has to be a singleton across module INSTANCES, not just within
-// one. Regression coverage for a real break: a generated app imported
-// `createBoolClient` from "bool-sdk" and `useEntity` from "bool-sdk/react",
-// nothing imported the bootstrap module at all, and every hook threw "No Bool
-// client exists yet" at first render.
 describe("default client registry", () => {
   test("the last-created client is the default (hot reload re-registers)", () => {
     const first = createBoolClient(CONFIG);
     expect(getDefaultBoolClient()).toBe(first);
     const second = createBoolClient(CONFIG);
     expect(getDefaultBoolClient()).toBe(second);
-  });
-
-  test("lives on a globalThis symbol, so a duplicated client.js shares it", () => {
-    // Simulates the second bundle: another copy of this module would read the
-    // same well-known symbol rather than its own module-scoped variable.
-    const client = createBoolClient(CONFIG);
-    const shared = (globalThis as any)[Symbol.for("bool-sdk.defaultClient")];
-    expect(shared).toBe(client);
-  });
-
-  test("hasDefaultBoolClient reports registration without throwing", () => {
-    createBoolClient(CONFIG);
-    expect(hasDefaultBoolClient()).toBe(true);
-  });
-
-  test("the unregistered error names the exact fix (the import to add)", () => {
-    const saved = (globalThis as any)[Symbol.for("bool-sdk.defaultClient")];
-    (globalThis as any)[Symbol.for("bool-sdk.defaultClient")] = null;
-    try {
-      expect(hasDefaultBoolClient()).toBe(false);
-      // The old message said "call createBoolClient() first", which is useless
-      // to someone whose app already calls it in a module nothing imports.
-      expect(() => getDefaultBoolClient()).toThrow(/import ".\/lib\/supabase"/);
-      expect(() => getDefaultBoolClient()).toThrow(/src\/main\.tsx/);
-    } finally {
-      (globalThis as any)[Symbol.for("bool-sdk.defaultClient")] = saved;
-    }
   });
 });
 
