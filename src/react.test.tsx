@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { renderToString } from "react-dom/server";
 import { createBoolClient } from "./client";
-import { AuthGate, BoolAuthProvider, takeResetTokenFromSearch, useBoolAuth } from "./react";
+import {
+  AuthGate,
+  BoolAuthProvider,
+  takeResetTokenFromSearch,
+  useBoolAuth,
+  useEntity,
+} from "./react";
 
 // SSR smoke tests: effects don't run in renderToString, so the provider is in
 // its initial loading state — enough to pin the gate/hook contract without a
@@ -95,5 +101,34 @@ describe("takeResetTokenFromSearch", () => {
 
   test("empty search — no token, no rest", () => {
     expect(takeResetTokenFromSearch("")).toEqual({ token: null, rest: "" });
+  });
+});
+
+// SSR smoke for useEntity: effects don't run in renderToString, so this pins
+// the initial contract (loading, empty data, callable shape) without a
+// browser. The live state machine itself is covered headlessly in live.test.ts.
+describe("useEntity", () => {
+  test("renders the initial loading snapshot on the server", () => {
+    createBoolClient(CONFIG);
+    function List() {
+      const todos = useEntity("todos");
+      return (
+        <div>
+          {todos.loading ? "loading" : "ready"}:{todos.data.length}
+        </div>
+      );
+    }
+    const html = renderToString(<List />);
+    expect(html).toContain("loading");
+    expect(html).toContain("0");
+  });
+
+  test("accepts an explicit client and returns mutation handles", () => {
+    const client = createBoolClient(CONFIG);
+    function Probe() {
+      const t = useEntity("todos", { client, sort: "-created_at", limit: 5 });
+      return <span>{typeof t.create === "function" ? "ok" : "bad"}</span>;
+    }
+    expect(renderToString(<Probe />)).toContain("ok");
   });
 });
