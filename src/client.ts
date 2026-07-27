@@ -30,16 +30,6 @@ const GATEWAY_API = "v1";
 // used, and the server never returns a token), so it's never exposed there.
 const EU_SESSION_KEY = "bool_eu_session_token";
 
-/** Collapse a burst of doorbell pings into one reload. The trigger fires once per
- * changed ROW, so a bulk write produces N pings for what the app should treat as
- * a single refresh. */
-const PING_COALESCE_MS = 50;
-
-/** Never hold a ping longer than this, even with writes still in flight —
- * otherwise someone editing continuously would stop seeing other people's
- * changes for as long as they kept typing. */
-const MAX_HOLD_MS = 2000;
-
 /** True when `host` is a single-label deployment subdomain of `appHost` (e.g.
  * "acme.bool.so" under "bool.so") — the exact shape the platform proxy rewrites
  * to /served/<label>/… keyed on the request host. Mirrors `deploymentSlugFromHost`
@@ -274,31 +264,6 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
 
   // Route REST + Storage through the gateway; leave everything else (the
   // realtime WebSocket, in particular) connecting directly to Supabase.
-  // ── The reload race ────────────────────────────────────────────────────────
-  // The doorbell says "something changed" without saying WHICH row, so an app
-  // reloads its whole list on every ping. If that reload is issued while the
-  // app's own writes are still in flight, the server answers WITHOUT them — and
-  // the app replaces what's on screen with a snapshot missing rows the user has
-  // already added. They vanish, then reappear on the next ping. Adding three
-  // todos quickly is enough to see it.
-  //
-  // It's a lost-update race, not latency: even an instantaneous network returns
-  // a snapshot that legitimately lacks uncommitted rows, so no amount of speed
-  // fixes it.
-  //
-  // The SDK is the one place that sees both sides — it issues every write AND
-  // owns the broadcast handler. So hold the reload signal while this client's
-  // writes are landing, then fire once when they drain. App code is untouched:
-  // the existing `subscribe(() => load())` pattern simply stops flickering.
-  let pendingWrites = 0;
-  const drainWaiters = new Set<() => void>();
-
-  function noteWriteSettled(): void {
-    pendingWrites = Math.max(0, pendingWrites - 1);
-    // Copy before iterating: a waiter may unsubscribe during the callback.
-    if (pendingWrites === 0) for (const wake of [...drainWaiters]) wake();
-  }
-
   const proxyFetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const raw =
       typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -311,19 +276,11 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
       // credentials:include so the live-gate identity cookie flows to the
       // gateway (same-origin or custom-domain); the viewer token covers the
       // cross-origin preview.
-      const call = fetch(`${GATEWAY}/_bool/${GATEWAY_API}/db${url.pathname}${url.search}`, {
+      return fetch(`${GATEWAY}/_bool/${GATEWAY_API}/db${url.pathname}${url.search}`, {
         ...init,
         headers,
         credentials: "include",
       });
-      // Count writes so doorbell pings can wait for them. Counted HERE rather
-      // than in the entities layer because both styles we teach —
-      // `supabase.from(...).insert(...)` and `bool.entities.x.create(...)` —
-      // funnel through this fetch, and only one of them goes via entities.
-      const method = (init?.method ?? "GET").toUpperCase();
-      if (method === "GET" || method === "HEAD") return call;
-      pendingWrites++;
-      return call.finally(noteWriteSettled);
     }
     return fetch(input as RequestInfo, init);
   };
@@ -641,51 +598,13 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
   const subscribeToChanges = (
     listener: (payload: BoolChangePayload) => void,
   ): (() => void) => {
-    let held: BoolChangePayload | null = null;
-    let heldSince = 0;
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
-
-    function flush(): void {
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = null;
-      }
-      const payload = held;
-      held = null;
-      heldSince = 0;
-      if (payload) listener(payload);
-    }
-
-    function scheduleFlush(): void {
-      if (flushTimer) return; // a flush is already pending; it'll take the latest
-      flushTimer = setTimeout(flush, PING_COALESCE_MS);
-    }
-
-    function onPing(payload: BoolChangePayload): void {
-      held = payload;
-      if (!heldSince) heldSince = Date.now();
-      // Wait for this client's own writes to land — but not past the ceiling, or
-      // continuous local editing would starve the app of other users' changes.
-      if (pendingWrites > 0 && Date.now() - heldSince < MAX_HOLD_MS) return;
-      scheduleFlush();
-    }
-
-    const onDrain = (): void => {
-      if (held) scheduleFlush();
-    };
-    drainWaiters.add(onDrain);
-
     const channel = db
       .channel("bool:" + schema)
       .on("broadcast", { event: "*" }, (msg) =>
-        onPing((msg as { payload?: BoolChangePayload }).payload ?? {}),
+        listener((msg as { payload?: BoolChangePayload }).payload ?? {}),
       )
       .subscribe();
-
     return () => {
-      drainWaiters.delete(onDrain);
-      if (flushTimer) clearTimeout(flushTimer);
-      held = null;
       void db.removeChannel(channel);
     };
   };
