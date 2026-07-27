@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.0-next.24
+
+- **Private realtime: live updates now arrive with the ROW on a private
+  channel, in one socket hop.** The client half of the platform's private
+  doorbell (codehs/bool#570; measured there: commit → observer ding ≈ 0–3ms,
+  before the writer's own insert response returns).
+
+  `subscribeToChanges` now mints a short-TTL "wristband" from the gateway
+  (`POST /_bool/v1/realtime/token` — where liveAccess/session are re-checked on
+  EVERY mint), presents it via `realtime.setAuth`, and joins the app's private
+  topics: the app room, plus the personal room when signed in. It re-mints at
+  ~75% of the TTL; a refused re-mint (access revoked, gateway down) silences
+  the private rooms and degrades to the legacy public row-data-free ping — so
+  does a missing wristband desk (older platform) or a refused join. Live-ness
+  degrades, never dies. One doorbell is shared by all subscribers (previously
+  every `entities.<table>.subscribe` opened its own channel).
+
+- **Re-lands the live layer reverted in `0.2.0-next.23`** — `useEntity`
+  (`bool-sdk/react`), `LiveEntityStore`, `matchesFilter`, `compareBySort`, the
+  `id`/`row` payload fields, and the globalThis client registry — now on the
+  architecture it was built for: a ding carrying `row` applies with ZERO
+  fetches; only id-only dings (RLS-on tables without `owner_id`, legacy pings)
+  keyed-fetch through the gateway.
+
+- **Coalescing is now leading-edge.** A lone change reconciles immediately
+  (the trailing window taxed every single change 50ms just in case a burst was
+  coming); bursts still collapse into one pass per window.
 ## 0.2.0-next.20
 
 - **Reverts the reload-hold behavior added in `0.2.0-next.19`.** That release

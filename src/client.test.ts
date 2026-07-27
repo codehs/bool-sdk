@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import {
   createBoolClient,
   getDefaultBoolClient,
+  hasDefaultBoolClient,
   isDeploymentSubdomain,
   BoolAiError,
   type BoolClientConfig,
@@ -414,12 +415,75 @@ describe("bool.ai battery", () => {
   });
 });
 
+// The registry has to be a singleton across module INSTANCES, not just within
+// one. Regression coverage for a real break: a generated app imported
+// `createBoolClient` from "bool-sdk" and `useEntity` from "bool-sdk/react",
+// nothing imported the bootstrap module at all, and every hook threw "No Bool
+// client exists yet" at first render.
 describe("default client registry", () => {
   test("the last-created client is the default (hot reload re-registers)", () => {
     const first = createBoolClient(CONFIG);
     expect(getDefaultBoolClient()).toBe(first);
     const second = createBoolClient(CONFIG);
     expect(getDefaultBoolClient()).toBe(second);
+  });
+
+  test("lives on a globalThis symbol, so a duplicated client.js shares it", () => {
+    // Simulates the second bundle: another copy of this module would read the
+    // same well-known symbol rather than its own module-scoped variable.
+    const client = createBoolClient(CONFIG);
+    const shared = (globalThis as any)[Symbol.for("bool-sdk.defaultClient")];
+    expect(shared).toBe(client);
+  });
+
+  test("hasDefaultBoolClient reports registration without throwing", () => {
+    createBoolClient(CONFIG);
+    expect(hasDefaultBoolClient()).toBe(true);
+  });
+
+  test("the unregistered error names the exact fix (the import to add)", () => {
+    const saved = (globalThis as any)[Symbol.for("bool-sdk.defaultClient")];
+    (globalThis as any)[Symbol.for("bool-sdk.defaultClient")] = null;
+    try {
+      expect(hasDefaultBoolClient()).toBe(false);
+      // The old message said "call createBoolClient() first", which is useless
+      // to someone whose app already calls it in a module nothing imports.
+      expect(() => getDefaultBoolClient()).toThrow(/import ".\/lib\/supabase"/);
+      expect(() => getDefaultBoolClient()).toThrow(/src\/main\.tsx/);
+    } finally {
+      (globalThis as any)[Symbol.for("bool-sdk.defaultClient")] = saved;
+    }
+  });
+});
+
+// The doorbell's lifecycle is fully covered with fake deps in realtime.test.ts;
+// here we pin the WIRING: subscribing asks the gateway's wristband desk at the
+// right URL with credentials, and tearing down while the mint is in flight
+// orphans it (no channel ever joins).
+describe("subscribeToChanges wiring (private doorbell)", () => {
+  test("POSTs the mint URL with credentials; immediate unsubscribe orphans the start", async () => {
+    let mintCalls = 0;
+    respond = (url) => {
+      if (url.includes("/_bool/v1/realtime/token")) {
+        mintCalls++;
+        return Response.json({
+          token: "t",
+          expiresIn: 900,
+          topics: { app: "bool:app_x:app", user: null },
+        });
+      }
+      return new Response("[]", { headers: { "content-type": "application/json" } });
+    };
+    const client = createBoolClient({ ...CONFIG, viewerToken: "vt-9" });
+    const off = client.subscribeToChanges(() => {});
+    off(); // torn down before the mint resolves
+    await tick();
+    expect(mintCalls).toBe(1);
+    const call = calls.find((c) => c.url.includes("/_bool/v1/realtime/token"))!;
+    expect(call.url).toBe("https://bool.test/served/my-app/_bool/v1/realtime/token");
+    expect(call.init?.method).toBe("POST");
+    expect(call.init?.credentials).toBe("include");
+    expect(headersOf(call).get("x-bool-viewer")).toBe("vt-9");
   });
 });
 

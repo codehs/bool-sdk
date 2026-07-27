@@ -7,9 +7,12 @@
 //     requires it) but is powerless: a v2 schema has no anon/authenticated
 //     grants, so a direct REST call 403s.
 //   - Realtime connects directly to Supabase (the WS can't be proxied) and
-//     subscribes to the app's PUBLIC, row-data-free Broadcast "doorbell"
-//     channel `bool:<schema>` — no token needed (the payload is just
-//     {table, op}; the data itself stays behind the gateway).
+//     joins the app's PRIVATE doorbell topics using a short-TTL token minted
+//     by the gateway (/_bool/v1/realtime/token — where liveAccess/session are
+//     re-checked on every mint). Those dings carry the changed ROW when the
+//     table's audience is nameable, so live views update in one socket hop.
+//     Falls back to the legacy public row-data-free ping when the mint desk
+//     is unavailable. See realtime.ts.
 //   - `auth` (end-user auth) routes to the gateway's users plane
 //     (/_bool/v1/users) so the app can offer its own signup/login without ever
 //     handling a credential server-side.
@@ -18,6 +21,7 @@
 // (/_bool/v1/users) in the Bool platform repo.
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { createEntitiesModule, type EntitiesModule } from "./entities.js";
+import { createDoorbell, type RealtimeMint } from "./realtime.js";
 
 /** Matches the server's append-only gateway path version. */
 const GATEWAY_API = "v1";
@@ -125,9 +129,21 @@ export type BoolAuth = {
   rotateApiKey(): Promise<{ data: { apiKey: string | null }; error: unknown }>;
 };
 
-/** A row-data-free change notification: some row in `table` saw `op`. Refetch
- * whatever you derive from that table — the ping never carries the data. */
-export type BoolChangePayload = { table?: string; op?: string };
+/** A change notification: some row in `table` saw `op`. */
+export type BoolChangePayload = {
+  table?: string;
+  op?: string;
+  /** The changed row's id (older platform triggers ping without it — the live
+   * layer then degrades to a full reload). */
+  id?: string | null;
+  /** The full row, present on PRIVATE doorbell dings for tables whose audience
+   * is nameable at write time (shared tables → the app room, owned rows → the
+   * owner's room). Absent on the legacy public ping — that channel is
+   * anon-key-reachable and must stay row-data-free — and for RLS-on tables
+   * without owner_id, where subscribers keyed-fetch through the gateway
+   * instead (RLS answers per viewer). */
+  row?: Record<string, unknown>;
+};
 
 /** A JSON Schema describing the shape `bool.ai.generate` should return. Passed
  * straight to the gateway, which validates the model's output against it. e.g.
@@ -192,20 +208,44 @@ export type BoolClient = {
 // The last-created client, used by the React layer (bool-sdk/react) so app
 // components don't have to thread the client through props. Last-created wins
 // so a hot-reloaded `src/lib/supabase.ts` re-registers its fresh client.
-let defaultClient: BoolClient | null = null;
+//
+// Held on `globalThis`, NOT in a module-scoped `let`, because the registry must
+// be a true singleton across module *instances*. An app imports
+// `createBoolClient` from "bool-sdk" and `useEntity` from "bool-sdk/react" —
+// two separate entry points, which Vite's dep optimizer pre-bundles into two
+// chunks (`bool-sdk.js`, `bool-sdk_react.js`). If client.js gets inlined into
+// both, a module-scoped variable gives each chunk its OWN registry: the app
+// registers its client in one and the hook reads `null` from the other, so
+// every hook throws even though the app did everything right. A symbol on
+// globalThis is shared by construction, whatever the bundler does with the
+// module graph.
+const REGISTRY = Symbol.for("bool-sdk.defaultClient");
+type Registry = { [REGISTRY]?: BoolClient | null };
+
+function registry(): Registry {
+  return globalThis as unknown as Registry;
+}
 
 export function getDefaultBoolClient(): BoolClient {
-  if (!defaultClient) {
+  const client = registry()[REGISTRY];
+  if (!client) {
     throw new Error(
-      "No Bool client exists yet — call createBoolClient() first. " +
-        "(Bool apps do this in src/lib/supabase.ts; import from there.)",
+      "No Bool client exists yet. Add `import \"./lib/supabase\";` to " +
+        "src/main.tsx — that module calls createBoolClient() and registers it, " +
+        "and hooks like useEntity read it from there. (A file that only imports " +
+        "from \"bool-sdk/react\" never loads it on its own.)",
     );
   }
-  return defaultClient;
+  return client;
 }
 
 export function setDefaultBoolClient(client: BoolClient): void {
-  defaultClient = client;
+  registry()[REGISTRY] = client;
+}
+
+/** Is a client registered? Lets callers branch instead of catching a throw. */
+export function hasDefaultBoolClient(): boolean {
+  return Boolean(registry()[REGISTRY]);
 }
 
 export function createBoolClient(config: BoolClientConfig): BoolClient {
@@ -590,24 +630,68 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     },
   };
 
-  // Realtime "doorbell": the app schema's grants are revoked, so Supabase
-  // `postgres_changes` never fires. Instead the server broadcasts a
-  // row-data-free ping on the PUBLIC channel "bool:" + schema whenever any
-  // row changes. Subscribe with the anon key (no token needed) and REFETCH
-  // on each ping.
+  // Realtime doorbell — the private-channel design. Change payloads (with the
+  // ROW on them for tables whose audience is nameable) arrive on PRIVATE
+  // topics; the gateway mints the short-TTL wristband that lets this socket
+  // join them (/_bool/v1/realtime/token — it re-runs liveAccess/session on
+  // every mint, so revoked access silences the private rooms within the TTL).
+  // When the desk is unavailable (older platform, 503, offline) the doorbell
+  // falls back to the legacy PUBLIC row-data-free ping. All lifecycle logic
+  // lives in realtime.ts (unit-tested with fake deps); this is just the wiring
+  // of gateway fetch + supabase-js primitives into it.
+  //
+  // NOTE on sign-in: the wristband is minted with whatever identity the
+  // CURRENT session has. A user who signs in mid-session gains their personal
+  // room at the next TTL refresh (≤15 min) or page navigation — acceptable
+  // because the app room already carries all shared-table changes.
+  const mintRealtimeToken = async (): Promise<RealtimeMint | null> => {
+    try {
+      const headers = new Headers();
+      if (viewerToken) headers.set("x-bool-viewer", viewerToken);
+      if (euSessionToken) headers.set("x-bool-eu-session", euSessionToken);
+      if (apiKey) headers.set("api_key", apiKey);
+      const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/realtime/token`, {
+        method: "POST",
+        headers,
+        credentials: "include",
+      });
+      if (!res.ok) return null;
+      return (await res.json()) as RealtimeMint;
+    } catch {
+      return null;
+    }
+  };
+
+  const doorbell = createDoorbell({
+    mint: mintRealtimeToken,
+    setAuth: async (token) => {
+      await db.realtime.setAuth(token);
+    },
+    channel: (topic, opts) => {
+      // Adapt one supabase RealtimeChannel to the doorbell's minimal shape.
+      // The channel is created lazily-configured and joined in join(), so
+      // onBroadcast registration always precedes the subscribe.
+      const ch = db.channel(topic, { config: { private: opts.private } });
+      return {
+        onBroadcast(cb) {
+          ch.on("broadcast", { event: "*" }, (msg) =>
+            cb((msg as { payload?: BoolChangePayload }).payload ?? {}),
+          );
+        },
+        join(status) {
+          ch.subscribe((state) => status(state));
+        },
+        leave() {
+          void db.removeChannel(ch);
+        },
+      };
+    },
+    legacyTopic: "bool:" + schema,
+  });
+
   const subscribeToChanges = (
     listener: (payload: BoolChangePayload) => void,
-  ): (() => void) => {
-    const channel = db
-      .channel("bool:" + schema)
-      .on("broadcast", { event: "*" }, (msg) =>
-        listener((msg as { payload?: BoolChangePayload }).payload ?? {}),
-      )
-      .subscribe();
-    return () => {
-      void db.removeChannel(channel);
-    };
-  };
+  ): (() => void) => doorbell.subscribe(listener);
 
   const client: BoolClient = {
     db,
