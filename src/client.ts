@@ -125,9 +125,19 @@ export type BoolAuth = {
   rotateApiKey(): Promise<{ data: { apiKey: string | null }; error: unknown }>;
 };
 
-/** A row-data-free change notification: some row in `table` saw `op`. Refetch
- * whatever you derive from that table — the ping never carries the data. */
-export type BoolChangePayload = { table?: string; op?: string };
+/** A row-data-free change notification: some row in `table` saw `op`.
+ *
+ * `id` names the row that changed, so a subscriber can fetch that ONE row
+ * instead of reloading the table — see `entities.<table>.subscribeRows`. It is
+ * optional because the doorbell trigger lives per-schema: an app whose schema
+ * was provisioned before id-carrying payloads still sends only `{table, op}`
+ * until that schema is next provisioned or migrated. When `id` is absent all
+ * you know is "something in this table changed".
+ *
+ * The payload never carries row CONTENT, by design — the channel is shared by
+ * everyone viewing the app, so contents would sidestep the per-user RLS that
+ * the gateway applies on the way back. */
+export type BoolChangePayload = { table?: string; op?: string; id?: string | null };
 
 /** A JSON Schema describing the shape `bool.ai.generate` should return. Passed
  * straight to the gateway, which validates the model's output against it. e.g.
@@ -184,8 +194,12 @@ export type BoolClient = {
   /** This app's private Postgres schema name. */
   schema: string;
   /** Subscribe to the app's realtime "doorbell": fires whenever any row in the
-   * app's schema changes, with a row-data-free {table, op} payload. REFETCH on
-   * each ping. Returns an unsubscribe function. */
+   * app's schema changes, with a row-data-free `{table, op, id}` payload.
+   * Returns an unsubscribe function.
+   *
+   * Low-level. Prefer `entities.<table>.subscribeRows`, which filters to one
+   * table and fetches the changed row for you — reloading the whole table on
+   * every ping is what makes rows flicker while your own writes are in flight. */
   subscribeToChanges(listener: (payload: BoolChangePayload) => void): () => void;
 };
 
@@ -590,22 +604,87 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     },
   };
 
+  // ── Realtime doorbell token ────────────────────────────────────────────────
+  // On a current Bool the doorbell channel is PRIVATE: joining it needs a
+  // short-lived JWT minted by the gateway and handed to Realtime via setAuth.
+  //
+  // A failed mint is NOT an error. An older Bool has no such route and still
+  // broadcasts on a public channel, so we fall back to subscribing with the anon
+  // key alone — exactly the previous behavior. That fallback is what lets one
+  // SDK work against both, which matters because apps pick up SDK minors on
+  // their next sandbox boot / publish, independent of when the platform deploys.
+  let rtToken: string | null = null;
+  let rtExpiresAt = 0;
+  let rtInFlight: Promise<string | null> | null = null;
+  const RT_REFRESH_MARGIN_MS = 60_000;
+
+  async function realtimeToken(): Promise<string | null> {
+    if (rtToken && Date.now() < rtExpiresAt - RT_REFRESH_MARGIN_MS) return rtToken;
+    if (rtInFlight) return rtInFlight;
+    rtInFlight = (async () => {
+      try {
+        const headers: Record<string, string> = {};
+        if (viewerToken) headers["x-bool-viewer"] = viewerToken;
+        if (euSessionToken) headers["x-bool-eu-session"] = euSessionToken;
+        if (apiKey) headers["api_key"] = apiKey;
+        const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/realtime/token`, {
+          headers,
+          credentials: "include",
+        });
+        // 404 → older Bool (no realtime plane). 503 → gateway not configured for
+        // it. 403 → this viewer can't access the app. All mean "no private
+        // channel available"; the public fallback is correct for each.
+        if (!res.ok) return null;
+        const body = (await res.json()) as { token?: string; expiresIn?: number };
+        if (!body?.token) return null;
+        rtToken = body.token;
+        rtExpiresAt = Date.now() + Math.max(60, Number(body.expiresIn) || 3600) * 1000;
+        return rtToken;
+      } catch {
+        return null; // network / CORS failure → public fallback
+      } finally {
+        rtInFlight = null;
+      }
+    })();
+    return rtInFlight;
+  }
+
   // Realtime "doorbell": the app schema's grants are revoked, so Supabase
-  // `postgres_changes` never fires. Instead the server broadcasts a
-  // row-data-free ping on the PUBLIC channel "bool:" + schema whenever any
-  // row changes. Subscribe with the anon key (no token needed) and REFETCH
-  // on each ping.
+  // `postgres_changes` never fires. Instead a trigger broadcasts a row-data-free
+  // ping on "bool:" + schema whenever any row changes. Prefer
+  // `entities.<table>.subscribeRows` over this — it fetches the changed row for
+  // you, which is what avoids the whole-list reload.
+  //
+  // Setup is async (the token mint), but the returned unsubscribe is usable
+  // immediately: unsubscribing before setup finishes cancels it, and tears down
+  // the channel if it opened in the meantime.
   const subscribeToChanges = (
     listener: (payload: BoolChangePayload) => void,
   ): (() => void) => {
-    const channel = db
-      .channel("bool:" + schema)
-      .on("broadcast", { event: "*" }, (msg) =>
-        listener((msg as { payload?: BoolChangePayload }).payload ?? {}),
-      )
-      .subscribe();
+    let channel: ReturnType<typeof db.channel> | null = null;
+    let cancelled = false;
+
+    void (async () => {
+      const token = await realtimeToken();
+      if (cancelled) return;
+      if (token) await db.realtime.setAuth(token);
+      const ch = db
+        .channel("bool:" + schema, token ? { config: { private: true } } : undefined)
+        .on("broadcast", { event: "*" }, (msg) =>
+          listener((msg as { payload?: BoolChangePayload }).payload ?? {}),
+        )
+        .subscribe();
+      if (cancelled) {
+        void db.removeChannel(ch);
+        return;
+      }
+      channel = ch;
+    })();
+
     return () => {
-      void db.removeChannel(channel);
+      cancelled = true;
+      if (channel) void db.removeChannel(channel);
+      channel = null;
     };
   };
 

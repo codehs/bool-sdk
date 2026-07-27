@@ -18,6 +18,7 @@ export {
 export {
   type EntitiesModule,
   type EntityHandler,
+  type EntityChange,
   type FilterQuery,
   type FilterValue,
   type FilterOperators,

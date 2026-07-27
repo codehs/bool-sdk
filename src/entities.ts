@@ -117,10 +117,49 @@ export interface EntityHandler<T = any> {
   deleteMany(query: FilterQuery): Promise<DeleteManyResult>;
   /** Import rows from a CSV File (parsed client-side, then bulk-created). */
   importEntities(file: File): Promise<ImportResult<T>>;
-  /** Fire `cb` whenever any row in THIS table changes (refetch on each ping —
-   * the payload carries no row data). Returns an unsubscribe function. */
+  /** Fire `cb` whenever any row in THIS table changes (the payload carries no
+   * row data). Returns an unsubscribe function.
+   *
+   * Low-level: you get a notification, not the row. Reaching for a full reload
+   * here is what makes rows flicker — a reload issued while your own inserts are
+   * still in flight comes back without them and replaces what's on screen.
+   * Prefer {@link subscribeRows}. */
   subscribe(cb: (change: BoolChangePayload) => void): () => void;
+  /**
+   * Fire `cb` for each change to this table, with the changed row already
+   * fetched. **Merge it by id** — don't rebuild the list — and rows can never
+   * vanish, because nothing replaces the collection wholesale.
+   *
+   *   useEffect(() => {
+   *     load();
+   *     return bool.entities.todos.subscribeRows(({ op, id, row }) => {
+   *       setTodos((prev) =>
+   *         op === "DELETE" ? prev.filter((t) => t.id !== id)
+   *         : row          ? [row, ...prev.filter((t) => t.id !== id)]
+   *         :               prev);
+   *     });
+   *   }, []);
+   *
+   * Costs one single-row fetch per change by another user; your OWN writes need
+   * none, since `create`/`update` already hand back the row. Returns an
+   * unsubscribe function.
+   */
+  subscribeRows(cb: (change: EntityChange<T>) => void): () => void;
 }
+
+/** One change to an entity table, with the row resolved. */
+export type EntityChange<T = any> = {
+  /** "INSERT" | "UPDATE" | "DELETE" as reported by the trigger. */
+  op: string;
+  /** The changed row's id, or null on an app whose schema predates id-carrying
+   * doorbell payloads — then all you know is "something in this table changed",
+   * and a reload is the only option. */
+  id: string | null;
+  /** The row as it now stands: null on DELETE, null when `id` is null, and null
+   * when the row isn't readable by this caller — a ping is not a promise that
+   * you're allowed to see the row, since RLS still applies on the way back. */
+  row: T | null;
+};
 
 /**
  * Dynamic map: `entities.<anyTableName>` yields a handler for that table.
@@ -481,6 +520,42 @@ function createEntityHandler(
       // The doorbell pings for the whole schema; forward only this table's.
       return subscribeToChanges((payload) => {
         if (!payload.table || payload.table === table) cb(payload);
+      });
+    },
+    subscribeRows(cb) {
+      return subscribeToChanges((payload) => {
+        if (payload.table && payload.table !== table) return;
+        const op = String(payload.op ?? "").toUpperCase();
+        const id = payload.id ?? null;
+        // No id — an older schema's doorbell. Report the change anyway rather
+        // than dropping it silently, so the caller can fall back to a reload.
+        if (!id) {
+          cb({ op, id: null, row: null });
+          return;
+        }
+        // Nothing to fetch for a delete, and fetching would 404 by definition.
+        if (op === "DELETE") {
+          cb({ op, id, row: null });
+          return;
+        }
+        // One row, not the table. A miss (deleted since the ping, or invisible
+        // under RLS) yields null instead of throwing — `get` uses .single(),
+        // which rejects when no row comes back.
+        void handler
+          .get(id)
+          .then((row) =>
+            // Only pass through something that really is one row. `get` uses
+            // .single(), which normally rejects when nothing matches — but a
+            // proxy or an older PostgREST can answer with an empty array
+            // instead, and handing that to a merge would corrupt the caller's
+            // list. Anything that isn't a plain object becomes null.
+            cb({
+              op,
+              id,
+              row: row && typeof row === "object" && !Array.isArray(row) ? row : null,
+            }),
+          )
+          .catch(() => cb({ op, id, row: null }));
       });
     },
   };
