@@ -2,6 +2,7 @@ export {
   createBoolClient,
   getDefaultBoolClient,
   setDefaultBoolClient,
+  hasDefaultBoolClient,
   type BoolClient,
   type BoolClientConfig,
   type BoolAuth,

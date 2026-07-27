@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.0-next.22
+
+- **Fixes `useEntity` throwing "No Bool client exists yet" on first render.**
+  Two independent causes, both closed:
+
+  1. **The bootstrap could go unimported.** An app's client is created in
+     `src/lib/supabase.ts`, and `useEntity` reads it from the default registry.
+     But once data access goes through the hook, nothing in app code imports
+     `@/lib/supabase` by name — so on an app without auth (the auth layer
+     side-imports it), that module never loaded and the client was never
+     created. Fixed platform-side: the scaffold's `src/main.tsx` now imports it
+     for its side effect.
+  2. **The registry wasn't a singleton across module instances.** Apps import
+     `createBoolClient` from `"bool-sdk"` and `useEntity` from
+     `"bool-sdk/react"` — two entry points, which Vite's dep optimizer
+     pre-bundles into separate chunks. With the registry in a module-scoped
+     `let`, a duplicated `client.js` gave each chunk its own copy: the app
+     registered in one, the hook read `null` from the other, and every hook
+     threw even though the app was wired correctly. The registry now lives on a
+     `Symbol.for("bool-sdk.defaultClient")` key on `globalThis`, shared by
+     construction regardless of how the bundler splits the graph.
+
+- The unregistered-client error now names the actual fix (`import
+  "./lib/supabase";` in `src/main.tsx`) instead of "call createBoolClient()
+  first", which was useless to someone whose app already calls it in a module
+  nothing imports.
+- New `hasDefaultBoolClient()` so callers can branch instead of catching a throw.
+
 ## 0.2.0-next.21
 
 - **Does what `0.2.0-next.20` concluded was the real fix: stop replacing the

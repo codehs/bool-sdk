@@ -204,20 +204,44 @@ export type BoolClient = {
 // The last-created client, used by the React layer (bool-sdk/react) so app
 // components don't have to thread the client through props. Last-created wins
 // so a hot-reloaded `src/lib/supabase.ts` re-registers its fresh client.
-let defaultClient: BoolClient | null = null;
+//
+// Held on `globalThis`, NOT in a module-scoped `let`, because the registry must
+// be a true singleton across module *instances*. An app imports
+// `createBoolClient` from "bool-sdk" and `useEntity` from "bool-sdk/react" —
+// two separate entry points, which Vite's dep optimizer pre-bundles into two
+// chunks (`bool-sdk.js`, `bool-sdk_react.js`). If client.js gets inlined into
+// both, a module-scoped variable gives each chunk its OWN registry: the app
+// registers its client in one and the hook reads `null` from the other, so
+// every hook throws even though the app did everything right. A symbol on
+// globalThis is shared by construction, whatever the bundler does with the
+// module graph.
+const REGISTRY = Symbol.for("bool-sdk.defaultClient");
+type Registry = { [REGISTRY]?: BoolClient | null };
+
+function registry(): Registry {
+  return globalThis as unknown as Registry;
+}
 
 export function getDefaultBoolClient(): BoolClient {
-  if (!defaultClient) {
+  const client = registry()[REGISTRY];
+  if (!client) {
     throw new Error(
-      "No Bool client exists yet — call createBoolClient() first. " +
-        "(Bool apps do this in src/lib/supabase.ts; import from there.)",
+      "No Bool client exists yet. Add `import \"./lib/supabase\";` to " +
+        "src/main.tsx — that module calls createBoolClient() and registers it, " +
+        "and hooks like useEntity read it from there. (A file that only imports " +
+        "from \"bool-sdk/react\" never loads it on its own.)",
     );
   }
-  return defaultClient;
+  return client;
 }
 
 export function setDefaultBoolClient(client: BoolClient): void {
-  defaultClient = client;
+  registry()[REGISTRY] = client;
+}
+
+/** Is a client registered? Lets callers branch instead of catching a throw. */
+export function hasDefaultBoolClient(): boolean {
+  return Boolean(registry()[REGISTRY]);
 }
 
 export function createBoolClient(config: BoolClientConfig): BoolClient {
