@@ -66,9 +66,12 @@ export type CliDeps = {
   log: (msg: string) => void;
   error: (msg: string) => void;
   sleep: (ms: number) => Promise<void>;
+  isTTY: boolean;
+  color: boolean;
 };
 
 function defaults(): CliDeps {
+  const isTTY = process.stdout.isTTY === true;
   return {
     fetch: (...args) => fetch(...args),
     cwd: process.cwd(),
@@ -76,7 +79,41 @@ function defaults(): CliDeps {
     log: (m) => console.log(m),
     error: (m) => console.error(m),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    isTTY,
+    color:
+      process.env.NO_COLOR === undefined &&
+      (isTTY || (process.env.FORCE_COLOR !== undefined && process.env.FORCE_COLOR !== "0")),
   };
+}
+
+const ESC = "\u001b[";
+
+function paint(deps: CliDeps, code: number, text: string): string {
+  return deps.color ? `${ESC}${code}m${text}${ESC}0m` : text;
+}
+
+const bold = (deps: CliDeps, text: string) => paint(deps, 1, text);
+const dim = (deps: CliDeps, text: string) => paint(deps, 2, text);
+const red = (deps: CliDeps, text: string) => paint(deps, 31, text);
+const green = (deps: CliDeps, text: string) => paint(deps, 32, text);
+const yellow = (deps: CliDeps, text: string) => paint(deps, 33, text);
+const cyan = (deps: CliDeps, text: string) => paint(deps, 36, text);
+
+function success(deps: CliDeps, message: string): void {
+  deps.log(`${green(deps, "✓")} ${message}`);
+}
+
+function progress(deps: CliDeps, message: string): void {
+  deps.log(`${cyan(deps, "◆")} ${message}`);
+}
+
+function warning(deps: CliDeps, message: string): void {
+  deps.log(`${yellow(deps, "⚠")} ${message}`);
+}
+
+function commandHeader(deps: CliDeps, command: string): void {
+  if (!deps.isTTY) return;
+  deps.log(`${bold(deps, cyan(deps, "bool"))} ${dim(deps, "/")} ${bold(deps, command)}\n`);
 }
 
 /** Tiny arg parser: `--key value` / `--key=value` / bare `--flag`, plus bare
@@ -281,9 +318,11 @@ async function writeConfigAndKey(
   if (keyRes.ok) {
     const { apiKey } = (await keyRes.json()) as { apiKey: string };
     writeEnvKey(deps.cwd, "BOOL_API_KEY", apiKey);
-    deps.log(`Wrote the project's admin data key to ${ENV_FILE} (gitignored — keep it secret).`);
+    success(deps, `Saved the admin data key to ${bold(deps, ENV_FILE)}`);
+    deps.log(`  ${dim(deps, "Gitignored automatically — keep this file secret.")}`);
   } else {
-    deps.log(
+    warning(
+      deps,
       `Skipped the admin data key (${keyRes.status === 404 ? "owner-only" : `HTTP ${keyRes.status}`}) — set BOOL_API_KEY yourself to read/write data locally.`,
     );
   }
@@ -302,7 +341,8 @@ async function cmdLink(
 
   const typesPath = str(flags.types) ?? DEFAULT_TYPES_PATH;
   const { config, name } = await writeConfigAndKey(projectId, apiUrl, tok, typesPath, deps);
-  deps.log(`Linked to "${name}" (${config.projectId}) — wrote ${CONFIG_FILE}.`);
+  success(deps, `Linked to ${bold(deps, `"${name}"`)} ${dim(deps, `(${config.projectId})`)}`);
+  deps.log(`  Wrote ${cyan(deps, CONFIG_FILE)}`);
 
   await pullTypes(config, tok, deps);
 
@@ -369,7 +409,7 @@ async function cmdCreate(
     "/api/projects",
     { name, template: "vite-react" },
   );
-  deps.log(`Created project "${project.name ?? name}" (${project.id}).`);
+  success(deps, `Created project ${bold(deps, `"${project.name ?? name}"`)} ${dim(deps, `(${project.id})`)}`);
 
   // 2. Confirm the project can actually be developed against BEFORE writing any
   //    files. Local dev requires the gateway runtime; a non-gateway (v1)
@@ -400,7 +440,8 @@ async function cmdCreate(
     mkdirSync(dirname(out), { recursive: true });
     writeFileSync(out, content);
   }
-  deps.log(
+  success(
+    deps,
     `Scaffolded a todo app in ${relative(deps.cwd, dir) || "."}/ (${Object.keys(files).length} files).`,
   );
 
@@ -417,7 +458,7 @@ async function cmdCreate(
     sub,
     conn,
   );
-  deps.log(`Linked ${CONFIG_FILE} to project ${project.id}.`);
+  success(deps, `Linked ${cyan(deps, CONFIG_FILE)} to project ${project.id}`);
 
   // 5. Declare the todos entity so the table exists, then refresh types.
   //    If this fails the app has no data — don't ship a broken deploy; tell the
@@ -457,7 +498,7 @@ async function pullTypes(config: BoolConfig, tok: string, deps: CliDeps): Promis
   const out = resolve(deps.cwd, config.typesPath || DEFAULT_TYPES_PATH);
   mkdirSync(dirname(out), { recursive: true });
   writeFileSync(out, body);
-  deps.log(`Wrote entity types to ${relative(deps.cwd, out)}.`);
+  success(deps, `Generated entity types at ${cyan(deps, relative(deps.cwd, out))}`);
 }
 
 async function cmdTypes(
@@ -551,8 +592,8 @@ async function cmdEntitiesPush(
       failed++;
       continue;
     }
-    deps.log(`✓ ${parsed.name}: ${body.changed ? "migrated" : "already up to date"}`);
-    for (const w of body.warnings ?? []) deps.log(`  ⚠ ${w}`);
+    success(deps, `${parsed.name}: ${body.changed ? "migrated" : "already up to date"}`);
+    for (const w of body.warnings ?? []) warning(deps, w);
   }
 
   await pullTypes(config, tok, deps);
@@ -591,7 +632,7 @@ async function cmdEntitiesPull(
     }
     mkdirSync(dirname(out), { recursive: true });
     writeFileSync(out, s.content);
-    deps.log(`✓ ${s.path}`);
+    success(deps, s.path);
   }
   await pullTypes(config, tok, deps);
   return 0;
@@ -614,9 +655,11 @@ async function cmdEntities(
     return 0;
   }
   for (const e of entities) {
-    deps.log(`${e.name} (${e.access})`);
-    for (const f of e.fields) {
-      deps.log(`  ${f.name}: ${f.type}${f.required ? " (required)" : ""}`);
+    deps.log(`${bold(deps, e.name)} ${dim(deps, `(${e.access})`)}`);
+    for (let i = 0; i < e.fields.length; i++) {
+      const f = e.fields[i]!;
+      const branch = i === e.fields.length - 1 ? "└─" : "├─";
+      deps.log(`  ${dim(deps, branch)} ${f.name}: ${cyan(deps, f.type)}${f.required ? ` ${dim(deps, "(required)")}` : ""}`);
     }
   }
   return 0;
@@ -683,7 +726,7 @@ async function cmdDeploy(
     );
   }
   const archive = createZip(entries);
-  deps.log(`Packed ${entries.length} files (${(archive.length / 1024).toFixed(1)} KB). Creating drop…`);
+  progress(deps, `Packing ${entries.length} files ${dim(deps, `(${(archive.length / 1024).toFixed(1)} KB)`)}`);
 
   const createRes = await deps.fetch(`${config.apiUrl.replace(/\/$/, "")}/api/drops`, {
     method: "POST",
@@ -710,7 +753,7 @@ async function cmdDeploy(
     body: archive.buffer as ArrayBuffer,
   });
   if (!putRes.ok) throw new CliError(`Uploading the archive failed: HTTP ${putRes.status}`);
-  deps.log("Uploaded. Bool is building in the cloud…");
+  progress(deps, "Uploaded — building in the cloud…");
 
   const deadline = Date.now() + DEPLOY_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -718,7 +761,7 @@ async function cmdDeploy(
     const status = (await statusRes.json().catch(() => null)) as DropStatus | null;
     if (!statusRes.ok || !status) throw new CliError(`Polling drop status failed: HTTP ${statusRes.status}`);
     if (status.status === "ready") {
-      deps.log(`Live at ${status.url ?? config.appUrl}`);
+      success(deps, `Live at ${bold(deps, status.url ?? config.appUrl)}`);
       return 0;
     }
     if (status.status === "failed") {
@@ -731,26 +774,41 @@ async function cmdDeploy(
   throw new CliError("Timed out waiting for the deploy — check the project on Bool.");
 }
 
-const USAGE = `bool — develop locally against a Bool project, deploy to Bool
+const LOGO = `    __                __
+   / /_  ____  ____  / /
+  / __ \u005c/ __ \u005c/ __ \u005c/ /
+ / /_/ / /_/ / /_/ / /
+/_.___/\u005c____/\u005c____/_/`;
 
-Usage:
-  bool create [name] [--path <dir>] [--deploy] [--token <pat>]
-                                           scaffold a new Bool todo app + project
-                                           (name is optional — one is generated)
-  bool link --project <id> [--api-url <url>] [--token <pat>] [--types <path>]
-  bool types [--out <path>] [--token <pat>]
-  bool entities [--token <pat>]            list the project's data models
-  bool entities pull [--token <pat>]       write schemas to ${ENTITIES_DIR}/
-  bool entities push [--dir <path>]        declare local schemas on the project
-  bool deploy [--dir <path>] [--token <pat>]
+function usage(deps: CliDeps): string {
+  const command = (value: string) => cyan(deps, value.padEnd(34));
+  return `${cyan(deps, LOGO)}
 
-Auth: pass --token or set BOOL_TOKEN (Bool → Settings → Access tokens).
-Data key: link writes BOOL_API_KEY to ${ENV_FILE} (owner only) — pass it to
-createBoolClient as \`apiKey\`.`;
+${bold(deps, "Build locally. Ship to Bool.")}
+
+${bold(deps, "Usage:")}
+  ${command("bool create [name]")} Scaffold a new app and project
+  ${command("bool link --project <id>")} Link this directory to a project
+  ${command("bool types [--out <path>]")} Refresh generated entity types
+  ${command("bool entities")} List the project's data models
+  ${command("bool entities pull")} Write schemas to ${ENTITIES_DIR}/
+  ${command("bool entities push")} Apply local schemas to the project
+  ${command("bool deploy [--dir <path>]")} Build and publish the app
+
+${bold(deps, "Options:")}
+  ${command("--token <pat>")} Personal access token ${dim(deps, "(or BOOL_TOKEN)")}
+  ${command("--api-url <url>")} Override the Bool API URL
+  ${command("--help")} Show this help
+
+${dim(deps, `Link writes the owner data key to ${ENV_FILE}; the file is gitignored automatically.`)}`;
+}
 
 export async function runCli(argv: string[], overrides?: Partial<CliDeps>): Promise<number> {
   const deps: CliDeps = { ...defaults(), ...overrides };
   const { command, positionals, flags } = parseArgs(argv);
+  if (command && !["help", "--help"].includes(command)) {
+    commandHeader(deps, command === "entities" && positionals[0] ? `entities ${positionals[0]}` : command);
+  }
   try {
     switch (command) {
       case "create":
@@ -768,7 +826,7 @@ export async function runCli(argv: string[], overrides?: Partial<CliDeps>): Prom
           case "pull":
             return await cmdEntitiesPull(flags, deps);
           default:
-            deps.error(`Unknown entities subcommand "${positionals[0]}".\n\n${USAGE}`);
+            deps.error(`${red(deps, "✗")} Unknown entities subcommand "${positionals[0]}".\n\n${usage(deps)}`);
             return 1;
         }
       case "deploy":
@@ -776,15 +834,15 @@ export async function runCli(argv: string[], overrides?: Partial<CliDeps>): Prom
       case undefined:
       case "help":
       case "--help":
-        deps.log(USAGE);
+        deps.log(usage(deps));
         return command ? 0 : 1;
       default:
-        deps.error(`Unknown command "${command}".\n\n${USAGE}`);
+        deps.error(`${red(deps, "✗")} Unknown command "${command}".\n\n${usage(deps)}`);
         return 1;
     }
   } catch (err) {
     if (err instanceof CliError) {
-      deps.error(err.message);
+      deps.error(`${red(deps, "✗")} ${err.message}`);
       return 1;
     }
     throw err;

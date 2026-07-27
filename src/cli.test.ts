@@ -453,7 +453,16 @@ describe("help / unknown", () => {
   test("no command prints usage and exits 1", async () => {
     const { deps, logs } = makeDeps(cwd, {});
     expect(await runCli([], deps)).toBe(1);
-    expect(logs.join("\n")).toContain("Usage:");
+    const output = logs.join("\n");
+    expect(output).toContain("/ /_  ____  ____  / /");
+    expect(output).toContain("Build locally. Ship to Bool.");
+    expect(output).toContain("Usage:");
+    expect(output).not.toContain("\u001b[");
+  });
+  test("styles help when color is enabled", async () => {
+    const { deps, logs } = makeDeps(cwd, {});
+    expect(await runCli(["help"], { ...deps, color: true })).toBe(0);
+    expect(logs.join("\n")).toContain("\u001b[36m");
   });
   test("unknown command errors", async () => {
     const { deps, errors } = makeDeps(cwd, {});
