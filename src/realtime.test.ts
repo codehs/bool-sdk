@@ -168,6 +168,37 @@ describe("createDoorbell: fallback & teardown", () => {
     expect(got).toHaveLength(1);
   });
 
+  // Regression: Supabase Realtime injects its own message-uuid `id` into any
+  // broadcast payload that lacks one. On the row-data-free public channel that
+  // uuid looks exactly like a row id to the live store, which would keyed-fetch
+  // a nonexistent row and silently swallow the change. Missing `id` is the
+  // signal that triggers a full reload — so the legacy path must discard it.
+  test("legacy payloads are stripped to {table, op} — no injected id survives", async () => {
+    const { h, doorbell } = makeHarness({ mints: [null] });
+    const got: BoolChangePayload[] = [];
+    doorbell.subscribe((p) => got.push(p));
+    await tick();
+    h.ding("bool:app_x", {
+      table: "todos",
+      op: "INSERT",
+      id: "a-realtime-message-uuid",
+      row: { id: "should-not-appear" },
+    } as BoolChangePayload);
+    expect(got).toEqual([{ table: "todos", op: "INSERT" }]);
+    expect(got[0]!.id).toBeUndefined();
+    expect(got[0]!.row).toBeUndefined();
+  });
+
+  test("private payloads keep id and row (only the legacy channel is stripped)", async () => {
+    const { h, doorbell } = makeHarness({ mints: [MINT] });
+    const got: BoolChangePayload[] = [];
+    doorbell.subscribe((p) => got.push(p));
+    await tick();
+    h.ding("bool:app_x:app", { table: "todos", op: "INSERT", id: "row-1", row: { id: "row-1" } });
+    expect(got[0]!.id).toBe("row-1");
+    expect(got[0]!.row).toEqual({ id: "row-1" });
+  });
+
   test("a refused private join degrades to the public ping (never a dead app)", async () => {
     const { h, doorbell } = makeHarness({ mints: [MINT] });
     doorbell.subscribe(() => {});

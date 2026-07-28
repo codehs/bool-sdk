@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.0-next.25
+
+- **Fixes live updates being silently swallowed on the public fallback channel.**
+  Supabase Realtime injects its own message-uuid `id` into any broadcast payload
+  that lacks one. The public compat channel is row-data-free by contract, so its
+  payloads have no row id — meaning subscribers received an `id` that looked
+  exactly like a row id but wasn't. The live store would keyed-fetch a
+  nonexistent row, apply nothing, and drop the change on the floor.
+
+  The doorbell now strips legacy-channel payloads to `{table, op}` rather than
+  trusting the transport's shape. Absent `id` is the signal that triggers a
+  coalesced full reload, which is the correct behavior on a channel that carries
+  no row data. Private-channel payloads are untouched — they keep `id` and `row`.
+
+  Only reachable on the fallback paths (no mint desk, revoked access, refused
+  join), which is also where it was hardest to notice.
+
 ## 0.2.0-next.24
 
 - **Private realtime: live updates now arrive with the ROW on a private
