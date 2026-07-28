@@ -68,6 +68,10 @@ export type CliDeps = {
   sleep: (ms: number) => Promise<void>;
   isTTY: boolean;
   color: boolean;
+  /** Unterminated stdout write, for the wordmark's in-place frame redraws.
+   * Separate from `log` so hermetic tests can capture whole lines without
+   * carriage-return/cursor-movement noise. */
+  write: (chunk: string) => void;
 };
 
 function defaults(): CliDeps {
@@ -83,6 +87,7 @@ function defaults(): CliDeps {
     color:
       process.env.NO_COLOR === undefined &&
       (isTTY || (process.env.FORCE_COLOR !== undefined && process.env.FORCE_COLOR !== "0")),
+    write: (chunk) => process.stdout.write(chunk),
   };
 }
 
@@ -99,6 +104,137 @@ const green = (deps: CliDeps, text: string) => paint(deps, 32, text);
 const yellow = (deps: CliDeps, text: string) => paint(deps, 33, text);
 const cyan = (deps: CliDeps, text: string) => paint(deps, 36, text);
 
+/** The four logo accents (b / o / o / l + spark), lifted from the bool
+ * logomark. Reserved for the wordmark below — per Bool's design language these
+ * are illustration, not routine UI, so nothing else in the CLI uses them. */
+const BRAND = {
+  blue: [1, 102, 253],
+  purple: [124, 54, 239],
+  teal: [0, 194, 187],
+  coral: [253, 102, 67],
+} as const satisfies Record<string, [number, number, number]>;
+type BrandColor = keyof typeof BRAND;
+
+function brand(deps: CliDeps, color: BrandColor, text: string): string {
+  if (!deps.color) return text;
+  const [r, g, b] = BRAND[color];
+  return `${ESC}38;2;${r};${g};${b}m${text}${ESC}0m`;
+}
+
+// The wordmark below is a direct trace of the logo artwork (rasterized, then
+// downsampled to quadrant block characters for 2x the horizontal resolution
+// half-blocks give you), not a generic font — same "b" bowl, same two "o"
+// rings, same "l", at 10 lines tall. WORDMARK_GLYPHS/COLORS are the letters
+// alone; SPARK_CELLS are the tri-color flairs traced separately (rendering the
+// logo with vs. without its <line> spark elements and diffing the two), so
+// they can be dropped in progressively — same trick as the web logo's hover
+// burst (see components/logo.tsx's sparkOnHover), without touching a single
+// letter pixel.
+const WORDMARK_GLYPHS = [
+  "                                          ▗▄▄▄ ",
+  "     ▗▄▟███                               ████▌",
+  "    ▝██████                               ████▌",
+  "      ▘████                     ▗▄████▄▖  ████▌",
+  "       ████▗██▄▄▖     ▗▄▄▄▄    ▟███▛▜███▙ ████▌",
+  "       ███▛▜█████▙  ▄███████▙ ▐██▛    ███▖████▌",
+  "       ███▌   ▝███▌▐██▛▘ ▝▜██▙▝███▄  ▄███ ████▌",
+  "      ▝███▙▖  ▗███▌▐██▌   ▗███ ▝███████▛▘ ████▌",
+  "       ▜█████████▛ ▝████▄▟███▘   ▝▀▀▀▀    ▜███▘",
+  "        ▝▀█████▛▘    ▀▜███▛▀▘              ▝▀  ",
+];
+// One code per glyph cell above: b/p/t/c = the four brand accents, . = blank.
+const WORDMARK_COLORS = [
+  "..........................................cccc.",
+  ".....bbbbbb...............................ccccc",
+  "....bbbbbbb...............................ccccc",
+  "......bbbbb.....................tttttttt..ccccc",
+  ".......bbbbbbbbbb.....ppppp....tttttttttt.ccccc",
+  ".......bbbbbbbbbbb..ppppppppp.tttt....ttttccccc",
+  ".......bbbb...bbbbbppppp.pppppttttt..tttt.ccccc",
+  "......bbbbbb..bbbbbpppp...pppp.tttttttttt.ccccc",
+  ".......bbbbbbbbbbb.ppppppppppp...ttttt....ccccc",
+  "........bbbbbbbbb....pppppppp..............cc..",
+];
+const WORDMARK_COLOR_KEY: Record<string, BrandColor> = {
+  b: "blue",
+  p: "purple",
+  t: "teal",
+  c: "coral",
+};
+
+type SparkCell = { row: number; col: number; ch: string; color: BrandColor };
+// `stage` 1 = drawn from the first burst frame (closest to the b, where each
+// flair actually starts); 2 = only appears once the flair is fully extended.
+const SPARK_CELLS: Array<SparkCell & { stage: 1 | 2 }> = [
+  { row: 0, col: 2, ch: "▝", color: "teal", stage: 2 },
+  { row: 0, col: 3, ch: "▙", color: "teal", stage: 2 },
+  { row: 0, col: 4, ch: "▖", color: "teal", stage: 1 },
+  { row: 1, col: 4, ch: "▀", color: "teal", stage: 1 },
+  { row: 1, col: 0, ch: "▄", color: "purple", stage: 2 },
+  { row: 1, col: 1, ch: "▖", color: "purple", stage: 1 },
+  { row: 2, col: 0, ch: "▝", color: "purple", stage: 2 },
+  { row: 2, col: 1, ch: "▀", color: "purple", stage: 2 },
+  { row: 2, col: 2, ch: "▀", color: "purple", stage: 2 },
+  { row: 2, col: 3, ch: "▘", color: "purple", stage: 1 },
+  { row: 3, col: 1, ch: "▄", color: "coral", stage: 2 },
+  { row: 3, col: 2, ch: "▄", color: "coral", stage: 2 },
+  { row: 3, col: 3, ch: "▟", color: "coral", stage: 1 },
+  { row: 4, col: 1, ch: "▘", color: "coral", stage: 1 },
+];
+
+/** Overlay spark cells onto the base letters, then paint into colored lines
+ * (run-length grouped so a same-color stretch is one escape, not one per
+ * char). Cells up to `stage` are drawn; stage 0 renders bare letters. */
+function renderWordmark(deps: CliDeps, stage: 0 | 1 | 2): string {
+  const glyphs = WORDMARK_GLYPHS.map((row) => [...row]);
+  const colors = WORDMARK_COLORS.map((row) => [...row]);
+  for (const cell of SPARK_CELLS) {
+    if (cell.stage > stage) continue;
+    glyphs[cell.row]![cell.col] = cell.ch;
+    colors[cell.row]![cell.col] = cell.color[0]!;
+  }
+  return glyphs
+    .map((row, r) => {
+      const colorRow = colors[r]!;
+      let out = "";
+      for (let i = 0; i < row.length; ) {
+        let j = i + 1;
+        while (j < row.length && colorRow[j] === colorRow[i]) j++;
+        const run = row.slice(i, j).join("");
+        const code = colorRow[i]!;
+        out += code === "." ? run : brand(deps, WORDMARK_COLOR_KEY[code]!, run);
+        i = j;
+      }
+      return out.replace(/\s+$/, "");
+    })
+    .join("\n");
+}
+
+const SPARK_FRAME_MS = 110;
+
+/** Print the wordmark. Interactively (TTY + color) the spark bursts open over
+ * three frames, redrawn in place — a nod to the web logo's hover animation.
+ * Anywhere else (piped output, NO_COLOR, tests) it's one static print of the
+ * finished mark, so scripts and assertions see plain, stable text. */
+async function printWordmark(deps: CliDeps): Promise<void> {
+  if (!deps.isTTY || !deps.color) {
+    deps.log(renderWordmark(deps, 2));
+    return;
+  }
+  const height = WORDMARK_GLYPHS.length;
+  for (const stage of [0, 1, 2] as const) {
+    const frame = renderWordmark(deps, stage)
+      .split("\n")
+      .map((line) => `${ESC}2K${line}`)
+      .join("\n");
+    // One write per frame: the cursor-up (skipped on the first frame — nothing
+    // to redraw over yet) plus the repainted lines, batched so a redraw can't
+    // tear across two writes.
+    deps.write(`${stage > 0 ? `${ESC}${height}A` : ""}${frame}\n`);
+    if (stage < 2) await deps.sleep(SPARK_FRAME_MS);
+  }
+}
+
 function success(deps: CliDeps, message: string): void {
   deps.log(`${green(deps, "✓")} ${message}`);
 }
@@ -113,7 +249,7 @@ function warning(deps: CliDeps, message: string): void {
 
 function commandHeader(deps: CliDeps, command: string): void {
   if (!deps.isTTY) return;
-  deps.log(`${bold(deps, cyan(deps, "bool"))} ${dim(deps, "/")} ${bold(deps, command)}\n`);
+  deps.log(`${bold(deps, brand(deps, "blue", "bool"))} ${dim(deps, "/")} ${bold(deps, command)}\n`);
 }
 
 /** Tiny arg parser: `--key value` / `--key=value` / bare `--flag`, plus bare
@@ -774,17 +910,9 @@ async function cmdDeploy(
   throw new CliError("Timed out waiting for the deploy — check the project on Bool.");
 }
 
-const LOGO = `    __                __
-   / /_  ____  ____  / /
-  / __ \u005c/ __ \u005c/ __ \u005c/ /
- / /_/ / /_/ / /_/ / /
-/_.___/\u005c____/\u005c____/_/`;
-
 function usage(deps: CliDeps): string {
   const command = (value: string) => cyan(deps, value.padEnd(34));
-  return `${cyan(deps, LOGO)}
-
-${bold(deps, "Build locally. Ship to Bool.")}
+  return `${bold(deps, "Build locally. Ship to Bool.")}
 
 ${bold(deps, "Usage:")}
   ${command("bool create [name]")} Scaffold a new app and project
@@ -834,6 +962,8 @@ export async function runCli(argv: string[], overrides?: Partial<CliDeps>): Prom
       case undefined:
       case "help":
       case "--help":
+        await printWordmark(deps);
+        deps.log("");
         deps.log(usage(deps));
         return command ? 0 : 1;
       default:

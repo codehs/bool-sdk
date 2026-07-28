@@ -21,12 +21,17 @@ function makeDeps(cwd: string, routes: Record<string, (init?: RequestInit) => Re
   const calls: Call[] = [];
   const logs: string[] = [];
   const errors: string[] = [];
+  const writes: string[] = [];
+  const sleeps: number[] = [];
   const deps = {
     cwd,
     env: { BOOL_TOKEN: "bool_live_test" } as Record<string, string | undefined>,
     log: (m: string) => logs.push(m),
     error: (m: string) => errors.push(m),
-    sleep: async () => {},
+    write: (m: string) => writes.push(m),
+    sleep: async (ms: number) => {
+      sleeps.push(ms);
+    },
     fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       calls.push({ url, init });
@@ -36,7 +41,7 @@ function makeDeps(cwd: string, routes: Record<string, (init?: RequestInit) => Re
       return handler(init);
     },
   };
-  return { deps, calls, logs, errors };
+  return { deps, calls, logs, errors, writes, sleeps };
 }
 
 function json(body: unknown, status = 200): Response {
@@ -454,7 +459,7 @@ describe("help / unknown", () => {
     const { deps, logs } = makeDeps(cwd, {});
     expect(await runCli([], deps)).toBe(1);
     const output = logs.join("\n");
-    expect(output).toContain("/ /_  ____  ____  / /");
+    expect(output).toContain("████▌"); // the wordmark's "l" — traced from the logo, no color codes
     expect(output).toContain("Build locally. Ship to Bool.");
     expect(output).toContain("Usage:");
     expect(output).not.toContain("\u001b[");
@@ -463,6 +468,26 @@ describe("help / unknown", () => {
     const { deps, logs } = makeDeps(cwd, {});
     expect(await runCli(["help"], { ...deps, color: true })).toBe(0);
     expect(logs.join("\n")).toContain("\u001b[36m");
+  });
+  test("color without a TTY prints the wordmark once via log, not the animated writer", async () => {
+    const { deps, logs, writes } = makeDeps(cwd, {});
+    expect(await runCli(["help"], { ...deps, color: true, isTTY: false })).toBe(0);
+    expect(logs.join("\n")).toContain("\u2588\u2588\u2588\u2588\u258c");
+    expect(writes).toEqual([]);
+  });
+  test("TTY + color bursts the spark over three redrawn frames", async () => {
+    const { deps, writes, sleeps } = makeDeps(cwd, {});
+    expect(await runCli(["help"], { ...deps, color: true, isTTY: true })).toBe(0);
+    // 3 frames written (bare letters, partial spark, full spark); the first
+    // has no cursor-up (nothing to redraw over yet), the other two do.
+    expect(writes).toHaveLength(3);
+    expect(writes[0]).not.toContain("\u001b[10A");
+    expect(writes[1]).toContain("\u001b[10A");
+    expect(writes[2]).toContain("\u001b[10A");
+    // Letters are identical across every frame — only the spark cells change.
+    const strip = (w: string) => w.replace(/\u001b\[[0-9;]*[a-zA-Z]/g, "");
+    expect(strip(writes[2]!)).toContain("\u2588\u2588\u2588\u2588\u258c");
+    expect(sleeps).toEqual([110, 110]);
   });
   test("unknown command errors", async () => {
     const { deps, errors } = makeDeps(cwd, {});
