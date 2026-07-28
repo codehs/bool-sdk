@@ -120,6 +120,65 @@ export interface EntityHandler<T = any> {
   /** Fire `cb` whenever any row in THIS table changes (refetch on each ping —
    * the payload carries no row data). Returns an unsubscribe function. */
   subscribe(cb: (change: BoolChangePayload) => void): () => void;
+  /** React hook: a LIVE view of this table — loads, stays current as anyone
+   * changes rows, and exposes optimistic mutations. The only way a screen
+   * should read table data; the promise methods above are for one-off lookups
+   * in event handlers and non-React code. Requires the React entry to have
+   * been imported once (`import "bool-sdk/react"` — Bool apps do this in
+   * src/lib/supabase.ts); throws with instructions otherwise. */
+  useQuery(opts?: EntityQueryOptions): EntityQueryResult<T>;
+}
+
+/** Options for {@link EntityHandler.useQuery} — same filter/sort language as
+ * `.filter(...)`. */
+export type EntityQueryOptions = {
+  filter?: FilterQuery;
+  /** `-col` descending, `col` ascending. Defaults to `-created_at`. */
+  sort?: SortSpec;
+  /** Max rows to keep in view (trimmed after sorting). */
+  limit?: number;
+};
+
+/** What {@link EntityHandler.useQuery} returns. (Also exported from
+ * "bool-sdk/react" as `UseEntityResult` for back-compat.) */
+export type EntityQueryResult<T = any> = {
+  /** Live rows: committed server state with in-flight optimistic writes
+   * layered on top, filtered/sorted/limited per the options. */
+  data: T[];
+  /** True until the first load settles. */
+  loading: boolean;
+  /** Latest load/mutation error (cleared by the next success). Mutations never
+   * throw — check this (or a mutation's return value) to surface failures. */
+  error: unknown;
+  /** Optimistic insert. Resolves to the committed row, or null on failure
+   * (already rolled back). */
+  create: (fields: Partial<T>) => Promise<T | null>;
+  /** Optimistic patch. Resolves to the committed row, or null on failure. */
+  update: (id: string, fields: Partial<T>) => Promise<T | null>;
+  /** Optimistic delete. Resolves false on failure (row restored). */
+  remove: (id: string) => Promise<boolean>;
+  /** Force a full reload (rarely needed — changes arrive on their own). */
+  refetch: () => Promise<void>;
+};
+
+// The React implementation of useQuery, registered by the "bool-sdk/react"
+// entry when it is imported. Core stays React-free: this module never imports
+// React, it just calls whatever the react entry installed. Underscored because
+// it is wiring, not API.
+type EntityUseQueryImpl = <T>(
+  handler: EntityHandler<T>,
+  opts?: EntityQueryOptions,
+) => EntityQueryResult<T>;
+let entityUseQueryImpl: EntityUseQueryImpl | null = null;
+/** Returns the previously registered impl so tests can restore it — module
+ * state is shared across a bun test process, so a test that nulls this out
+ * MUST put it back (see the mock-pollution note in the test suite). */
+export function __registerEntityUseQuery(
+  impl: EntityUseQueryImpl | null,
+): EntityUseQueryImpl | null {
+  const prev = entityUseQueryImpl;
+  entityUseQueryImpl = impl;
+  return prev;
 }
 
 /**
@@ -482,6 +541,16 @@ function createEntityHandler(
       return subscribeToChanges((payload) => {
         if (!payload.table || payload.table === table) cb(payload);
       });
+    },
+    useQuery(opts) {
+      if (!entityUseQueryImpl) {
+        throw new Error(
+          `bool.entities.${table}.useQuery() needs the React entry loaded once per app — ` +
+            `add \`import "bool-sdk/react";\` (Bool apps carry it in src/lib/supabase.ts). ` +
+            `Outside React, read with .list()/.filter()/.get() instead.`,
+        );
+      }
+      return entityUseQueryImpl(handler, opts);
     },
   };
   return handler;

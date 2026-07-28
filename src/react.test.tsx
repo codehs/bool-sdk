@@ -8,6 +8,7 @@ import {
   useBoolAuth,
   useEntity,
 } from "./react";
+import { __registerEntityUseQuery } from "./entities";
 
 // SSR smoke tests: effects don't run in renderToString, so the provider is in
 // its initial loading state — enough to pin the gate/hook contract without a
@@ -130,5 +131,65 @@ describe("useEntity", () => {
       return <span>{typeof t.create === "function" ? "ok" : "bad"}</span>;
     }
     expect(renderToString(<Probe />)).toContain("ok");
+  });
+});
+
+// bool.entities.<table>.useQuery() — the dot-path spelling of useEntity. Core
+// is React-free, so the method only works because importing THIS entry
+// registered the implementation; these tests pin both halves of that contract.
+describe("bool.entities.<table>.useQuery", () => {
+  test("renders the same initial live snapshot as useEntity", () => {
+    const client = createBoolClient(CONFIG);
+    function List() {
+      const todos = client.entities.todos.useQuery({ sort: "-created_at", limit: 5 });
+      return (
+        <div>
+          {todos.loading ? "loading" : "ready"}:{todos.data.length}
+        </div>
+      );
+    }
+    const html = renderToString(<List />);
+    expect(html).toContain("loading");
+    expect(html).toContain("0");
+  });
+
+  test("returns the full mutation surface (create/update/remove/refetch)", () => {
+    const client = createBoolClient(CONFIG);
+    function Probe() {
+      const t = client.entities.todos.useQuery();
+      const ok =
+        typeof t.create === "function" &&
+        typeof t.update === "function" &&
+        typeof t.remove === "function" &&
+        typeof t.refetch === "function";
+      return <span>{ok ? "ok" : "bad"}</span>;
+    }
+    expect(renderToString(<Probe />)).toContain("ok");
+  });
+
+  test("without the React entry loaded, it throws instructions naming the fix", () => {
+    // Module state is process-global (bun shares the module cache across test
+    // files), so ALWAYS restore the impl — a dangling null here would break
+    // every later useQuery test in the run, in whichever file runs next.
+    const prev = __registerEntityUseQuery(null);
+    try {
+      const client = createBoolClient(CONFIG);
+      expect(() => client.entities.todos.useQuery()).toThrow(/import "bool-sdk\/react"/);
+      expect(() => client.entities.todos.useQuery()).toThrow(/\.list\(\)/);
+    } finally {
+      __registerEntityUseQuery(prev);
+    }
+  });
+
+  test("an options literal typo is a type error, not a silent no-op", () => {
+    // Compile-time pin: excess-property checking is the AI's guardrail here.
+    const client = createBoolClient(CONFIG);
+    function Probe() {
+      // @ts-expect-error — "srot" is not an option; if this ever compiles, the
+      // guardrail is gone and this test fails typecheck.
+      const t = client.entities.todos.useQuery({ srot: "-created_at" });
+      return <span>{String(!!t)}</span>;
+    }
+    expect(typeof Probe).toBe("function");
   });
 });

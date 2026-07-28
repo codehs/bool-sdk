@@ -24,7 +24,11 @@ import {
   type EntityRow,
   type LiveQueryOptions,
 } from "./live.js";
-import type { EntityHandler } from "./entities.js";
+import {
+  __registerEntityUseQuery,
+  type EntityHandler,
+  type EntityQueryResult,
+} from "./entities.js";
 
 type AuthActionResult = { error: unknown };
 
@@ -277,26 +281,11 @@ export function useSignInForm() {
 //   todos.remove(id)
 // ---------------------------------------------------------------------------
 
-export type UseEntityResult<T extends EntityRow = EntityRow> = {
-  /** Live rows: committed server state with in-flight optimistic writes
-   * layered on top, filtered/sorted/limited per the hook options. */
-  data: T[];
-  /** True until the first load settles. */
-  loading: boolean;
-  /** Latest load/mutation error (cleared by the next success). Mutations never
-   * throw — check this (or a mutation's return value) to surface failures. */
-  error: unknown;
-  /** Optimistic insert. Resolves to the committed row, or null on failure
-   * (already rolled back). Pass an `id` to control it; one is generated
-   * otherwise. */
-  create: (fields: Partial<T>) => Promise<T | null>;
-  /** Optimistic patch. Resolves to the committed row, or null on failure. */
-  update: (id: string, fields: Partial<T>) => Promise<T | null>;
-  /** Optimistic delete. Resolves false on failure (row restored). */
-  remove: (id: string) => Promise<boolean>;
-  /** Force a full reload (rarely needed — changes arrive on their own). */
-  refetch: () => Promise<void>;
-};
+/** What the live hooks return. The canonical definition lives in core
+ * (EntityQueryResult in entities.ts) because `bool.entities.<t>.useQuery()`
+ * must be typed without importing this React entry; this alias keeps the
+ * established name for `useEntity` users. */
+export type UseEntityResult<T extends EntityRow = EntityRow> = EntityQueryResult<T>;
 
 export function useEntity<T extends EntityRow = EntityRow>(
   table: string,
@@ -307,20 +296,33 @@ export function useEntity<T extends EntityRow = EntityRow>(
   },
 ): UseEntityResult<T> {
   const bool = opts?.client ?? getDefaultBoolClient();
-  // A new table/filter/sort/limit is a different query → fresh store. JSON
-  // keying means an inline `{ filter: {...} }` object literal is fine (no
-  // useMemo required of app code).
-  const key =
-    table +
-    " " +
-    bool.schema +
-    " " +
-    JSON.stringify([opts?.filter ?? null, opts?.sort ?? null, opts?.limit ?? null]);
-  const ref = useRef<{ key: string; store: LiveEntityStore<T> } | null>(null);
-  if (ref.current === null || ref.current.key !== key) {
+  return useEntityHandler<T>(bool.entities[table] as unknown as EntityHandler<T>, opts);
+}
+
+/** The store lifecycle both entry points share: `useEntity(table)` resolves a
+ * handler from the default client and lands here; `bool.entities.<t>.useQuery()`
+ * is this function registered into core (see the __registerEntityUseQuery call
+ * below). The handler carries its own client, so no schema/client keying is
+ * needed — handler identity (the entities proxy caches one per table) plus the
+ * serialized options decide when a new store is required. */
+function useEntityHandler<T extends EntityRow = EntityRow>(
+  handler: EntityHandler<T>,
+  opts?: LiveQueryOptions,
+): UseEntityResult<T> {
+  // A new filter/sort/limit is a different query → fresh store. JSON keying
+  // means an inline `{ filter: {...} }` object literal is fine (no useMemo
+  // required of app code).
+  const key = JSON.stringify([opts?.filter ?? null, opts?.sort ?? null, opts?.limit ?? null]);
+  const ref = useRef<{
+    handler: EntityHandler<T>;
+    key: string;
+    store: LiveEntityStore<T>;
+  } | null>(null);
+  if (ref.current === null || ref.current.handler !== handler || ref.current.key !== key) {
     ref.current = {
+      handler,
       key,
-      store: new LiveEntityStore<T>(bool.entities[table] as unknown as EntityHandler<T>, {
+      store: new LiveEntityStore<T>(handler, {
         filter: opts?.filter,
         sort: opts?.sort,
         limit: opts?.limit,
@@ -349,3 +351,9 @@ export function useEntity<T extends EntityRow = EntityRow>(
     refetch: () => store.refetch(),
   };
 }
+
+// Importing "bool-sdk/react" is what turns bool.entities.<table>.useQuery()
+// on — core is React-free and only calls what we install here. Bool apps get
+// this import via src/lib/supabase.ts, so the hook Just Works everywhere the
+// data client does.
+__registerEntityUseQuery(useEntityHandler as Parameters<typeof __registerEntityUseQuery>[0]);

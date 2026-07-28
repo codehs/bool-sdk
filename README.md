@@ -34,25 +34,31 @@ tested, and upgradable independently of any one app.
   gateway (`/_bool/v1/db`). The gateway injects the real credential server-side
   and pins the app's private Postgres schema — the anon key in the bundle has
   no data grants and can't read anything directly.
-- **Live data.** `useEntity` (from `bool-sdk/react`) gives a screen rows that
-  stay current, with optimistic writes:
+- **Live data.** `bool.entities.<table>.useQuery(...)` gives a screen rows that
+  stay current, with optimistic writes — same dot-path as every other entities
+  call, typed per-table by the generated `.d.ts` files:
 
   ```tsx
-  import { useEntity } from "bool-sdk/react";
+  import { bool } from "@/lib/supabase"; // Bool apps; or your createBoolClient() client
 
-  const todos = useEntity("todos", { sort: "-created_at" });
+  const todos = bool.entities.todos.useQuery({ sort: "-created_at" });
   todos.data;                              // live rows
   await todos.create({ title });           // appears instantly, rolls back on failure
   await todos.update(id, { done: true });
   await todos.remove(id);
   ```
 
+  The hook needs the React entry imported once per app (`import "bool-sdk/react"`
+  — Bool apps carry that in `src/lib/supabase.ts`); calling it without that
+  throws an error naming the fix. `useEntity(table, opts)` from
+  `bool-sdk/react` is the same hook by its older, string-keyed name.
+
   Under it: a Postgres trigger broadcasts each change — **with the row** — on a
   **private** channel that only a short-TTL token minted by the Bool gateway can
   join, so an update reaches other viewers in one socket hop with no refetch.
   Writes and first loads still go through the gateway (that's where
   authorization and metering live). `subscribeToChanges` is the low-level
-  primitive underneath; prefer `useEntity`.
+  primitive underneath; prefer `useQuery`.
 
   "Private" here means **token-gated, not login-gated** — a public app with no
   accounts gets a token for every visitor. When an app *does* have end users,
@@ -195,13 +201,13 @@ import { BoolAuthProvider, AuthGate, useBoolAuth, useSignInForm } from "bool-sdk
 
 `createBoolClient` registers the client it returns as the default, which the
 React layer and `useEntity` pick up — pass `client={...}` only if you create
-more than one.
+more than one. (`bool.entities.<t>.useQuery()` doesn't need the registry at
+all: the handler already knows its client.)
 
 > **Keep `import "./lib/supabase"` in `src/main.tsx`.** That module calls
-> `createBoolClient`, and hooks find the client from that registration. Under
-> `useEntity` no file mentions `@/lib/supabase` by name, so the import looks
-> unused — deleting it makes every screen throw *"No Bool client exists yet"* on
-> first render.
+> `createBoolClient` (and loads the React entry that powers `.useQuery()`), so
+> deleting it makes every screen throw on first render even though no file
+> mentions `@/lib/supabase` by name.
 
 ### Live data notes
 
