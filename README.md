@@ -34,9 +34,33 @@ tested, and upgradable independently of any one app.
   gateway (`/_bool/v1/db`). The gateway injects the real credential server-side
   and pins the app's private Postgres schema — the anon key in the bundle has
   no data grants and can't read anything directly.
-- **Realtime "doorbell".** Postgres changes broadcast a row-data-free
-  `{table, op}` ping on the app's public channel; `subscribeToChanges` wraps
-  the subscription. Refetch on each ping — the ping never carries row data.
+- **Live data.** `useEntity` (from `bool-sdk/react`) gives a screen rows that
+  stay current, with optimistic writes:
+
+  ```tsx
+  import { useEntity } from "bool-sdk/react";
+
+  const todos = useEntity("todos", { sort: "-created_at" });
+  todos.data;                              // live rows
+  await todos.create({ title });           // appears instantly, rolls back on failure
+  await todos.update(id, { done: true });
+  await todos.remove(id);
+  ```
+
+  Under it: a Postgres trigger broadcasts each change — **with the row** — on a
+  **private** channel that only a short-TTL token minted by the Bool gateway can
+  join, so an update reaches other viewers in one socket hop with no refetch.
+  Writes and first loads still go through the gateway (that's where
+  authorization and metering live). `subscribeToChanges` is the low-level
+  primitive underneath; prefer `useEntity`.
+
+  "Private" here means **token-gated, not login-gated** — a public app with no
+  accounts gets a token for every visitor. When an app *does* have end users,
+  per-user rows additionally ride that user's own private channel.
+
+  If a token can't be obtained (not authorized for this app, or the gateway is
+  unreachable) the doorbell retries with backoff and reports state rather than
+  degrading silently — data still loads over HTTP, it just isn't live.
 - **End-user auth.** `client.auth` mirrors the `supabase.auth` surface
   (`signUp`, `signInWithPassword`, `signInWithOAuth`, `signOut`, `getUser`,
   `onAuthStateChange`, password reset) but talks to the Bool gateway's users
@@ -170,15 +194,46 @@ import { BoolAuthProvider, AuthGate, useBoolAuth, useSignInForm } from "bool-sdk
 ```
 
 `createBoolClient` registers the client it returns as the default, which the
-React layer picks up — pass `client={...}` to `<BoolAuthProvider>` only if you
-create more than one.
+React layer and `useEntity` pick up — pass `client={...}` only if you create
+more than one.
+
+> **Keep `import "./lib/supabase"` in `src/main.tsx`.** That module calls
+> `createBoolClient`, and hooks find the client from that registration. Under
+> `useEntity` no file mentions `@/lib/supabase` by name, so the import looks
+> unused — deleting it makes every screen throw *"No Bool client exists yet"* on
+> first render.
+
+### Live data notes
+
+- **Render `todos.data` directly.** Don't copy it into another `useState` and
+  sync them; the duplicate is what goes stale.
+- **Don't add your own optimistic state.** `create`/`update`/`remove` already
+  apply immediately and roll back on failure. They don't throw — they resolve to
+  the new row (or `true`), or `null`/`false` with the reason on `error`.
+- **High-frequency input must be batched.** Drawing strokes, drag positions,
+  sliders: buffer locally and persist **once per gesture** (pointer-up, blur,
+  debounce), e.g. one row holding a points array. A write per input event is
+  ~60 requests/second.
+- **Filters and sorts** use the same DSL as `entities`:
+  `useEntity("todos", { filter: { done: false }, sort: "title", limit: 100 })`.
+  A filtered view self-maintains — rows that stop matching leave, rows that start
+  matching arrive.
+- **`postgres_changes` does not work** on gateway-era apps (the app's schema has
+  no direct grants). `useEntity` is the way to react to changes.
 
 ## Compatibility
 
-The gateway wire paths (`/_bool/v1/db`, `/_bool/v1/users`, `/_bool/v1/ai`) are
-append-only: new server behavior ships under a new path/version segment, never
-by mutating what existing SDK versions call. Keep this SDK in sync with the
-gateway routes in the Bool platform repo (`lib/gateway/`).
+The gateway wire paths (`/_bool/v1/db`, `/_bool/v1/users`, `/_bool/v1/ai`,
+`/_bool/v1/realtime`) are append-only: new server behavior ships under a new
+path/version segment, never by mutating what existing SDK versions call. Keep
+this SDK in sync with the gateway routes in the Bool platform repo
+(`lib/gateway/`).
+
+Realtime specifically pairs with the platform's doorbell trigger and its
+`realtime.messages` policy. The platform-side architecture, the history behind
+it, and the failure modes to avoid are documented in the platform repo at
+`docs/2026-07-realtime.md` — read that before changing anything in
+`src/realtime.ts` or `src/live.ts`.
 
 ## Development
 
