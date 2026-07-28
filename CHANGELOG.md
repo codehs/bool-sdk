@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0-next.27
+
+- **`bool help` / `bool --help` / bare `bool` now print a real trace of the
+  bool logomark instead of a generic figlet font.** The wordmark is rasterized
+  from the actual logo artwork and downsampled to quadrant block characters —
+  same b bowl, same two o rings, same l — in the exact brand colors
+  (blue/purple/teal/coral) from the web logo. On a TTY, the tri-color spark
+  bursts open over three redrawn frames, the same flourish as the web logo's
+  hover animation, without moving a single letter. Piped output, `NO_COLOR`,
+  and non-interactive runs get one static print of the finished mark — no
+  animation, no escape codes beyond color.
+
+  Zero new dependencies: the art is precomputed offline from the SVG and
+  baked into `cli.ts` as data, consistent with the CLI staying
+  zero-dependency at runtime.
+
 ## 0.2.0-next.26
 
 - **Removes the public-channel fallback entirely. Every doorbell topic is now
