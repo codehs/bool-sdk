@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0-next.29
+
+- **Backports the 0.3.1 `sideEffects` fix to the canary channel.** Identical
+  one-line package.json change: `next.28` shipped `"sideEffects": false`, which
+  let bundlers delete `import "bool-sdk/react"` from production builds, so
+  `useQuery()` threw on first render in any published app. Apps still pinned to
+  the `next` tag need this; apps on `^0.3.0` should take `0.3.1` instead.
+
+  No code changes. See the 0.3.1 entry for the full diagnosis.
+
 ## 0.3.1
 
 - **Fixes every published app that uses a live view.** `0.3.0` shipped
