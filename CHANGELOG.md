@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.1
+
+- **Fixes every published app that uses a live view.** `0.3.0` shipped
+  `"sideEffects": false`, which tells bundlers no module in the package does
+  anything at import time. But `dist/react.js` exists precisely to *do*
+  something — it registers the live-query implementation into the React-free
+  core at module scope — and apps load it as a bare `import "bool-sdk/react"`
+  with no bindings used. So Vite's production build deleted that import
+  outright, and `bool.entities.<table>.useQuery()` threw *"needs the React entry
+  loaded once per app"* on first render.
+
+  Only published builds were affected. Vite dev doesn't tree-shake, so an app
+  worked in the editor preview and broke the moment it was published — the worst
+  possible shape for this bug.
+
+  Fixed by listing the entry: `"sideEffects": ["./dist/react.js"]`. The core
+  stays tree-shakeable; only the module whose job is to run is marked as such.
+  Verified by building a real Vite app against both configurations and calling
+  `useQuery` in the bundled output — `false` loses the registration, the list
+  keeps it. A test now pins the field, and rejects a listed path that isn't a
+  real export.
+
+  No code changes. If you have an app on `0.3.0`, reinstall to pick this up.
+
 ## 0.3.0
 
 **First stable release of the gateway SDK.** Everything the `0.2.0-next.*`
