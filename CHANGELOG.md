@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.3.0
+
+**First stable release of the gateway SDK.** Everything the `0.2.0-next.*`
+prereleases accumulated is now on `latest`, so `npm install bool-sdk` (no
+`@next`) gets the full surface. Bool's v2 runtime ships to everyone on this
+version; new apps depend on `^0.3.0` rather than the floating canary tag, so a
+future prerelease can no longer reach an app that didn't ask for it.
+
+What a stable install now includes:
+
+- **`bool.entities.<table>`** — the data layer that replaced hand-written
+  Supabase calls. One-shot promises (`list`, `filter`, `get`, `create`,
+  `update`, `delete`, `bulkCreate`, `bulkUpdate`, `importEntities`) plus
+  `updateMany(query, ops)` for conditional writes and `$inc` counters that are
+  atomic in SQL, so two simultaneous callers can't lose each other's work.
+- **`bool.entities.<table>.useQuery(...)`** — a live React view: loads, stays
+  current as anyone else changes rows, applies your writes optimistically, and
+  rolls them back if they fail. Merge-by-id, response ordering, and burst
+  coalescing live in the store rather than in app code, which is what stopped
+  rows popping in and out.
+- **Private realtime.** Row changes ride the socket on wristband-gated topics
+  minted per viewer by the gateway — an update reaches other viewers in one hop
+  with no refetch, and there is no channel an anon key can eavesdrop on.
+- **`bool.auth`** — the app's own end-user accounts (supabase-js-shaped:
+  `signUp`, `signInWithPassword`, `signInWithOAuth`, `getUser`, password reset),
+  with passwords hashed server-side and the session in an httpOnly cookie.
+- **`bool.ai`** — text generation and JSON-Schema-validated structured output
+  with no API key of your own; failures throw `BoolAiError` with a
+  machine-readable `code`.
+- **The `bool` CLI** — `create`, `link`, `types`, `entities push`, `deploy`, for
+  developing against a real Bool from your own machine.
+
+No API changes from `0.2.0-next.28`; this is that code, promoted. Apps already
+pinned to the `next` tag keep resolving prereleases and are unaffected.
+
+## 0.2.0-next.28
+
+- **`bool.entities.<table>.useQuery(opts?)` — the live hook moves onto the
+  entities dot-path**, the shape tRPC and InstantDB made conventional. One
+  namespace for everything table-shaped, typed per-table by the generated
+  `.d.ts` files, and an options typo (`{ srot: … }`) is now a build error via
+  excess-property checking instead of the silent no-op a mistyped table *string*
+  produced.
+
+  Core stays React-free: the handler method delegates to an implementation that
+  importing `bool-sdk/react` registers. Calling it without that import throws an
+  error naming the fix and pointing non-React callers at `.list()`.
+  `useEntity(table, opts)` still works — both spellings share one
+  implementation.
+
+  Live applies to what a *screen renders*, not to what endpoints exist: the
+  one-shot promise methods are unchanged, because event handlers, the CLI, and
+  the HTTP API all need non-live reads.
+
 ## 0.2.0-next.27
 
 - **`bool help` / `bool --help` / bare `bool` now print a real trace of the
