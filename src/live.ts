@@ -243,7 +243,24 @@ export class LiveEntityStore<T extends EntityRow = EntityRow> {
 
   async create(fields: Partial<T>): Promise<T | null> {
     const id = typeof fields.id === "string" ? fields.id : newRowId();
-    const op: PendingOp<T> = { kind: "create", id, row: { ...fields, id } };
+    // Stamp `created_at` on the OVERLAY row (not on the insert — the server
+    // owns the real value, and a client clock must never win). Without it a
+    // freshly created row has no created_at for the ~300ms the write is in
+    // flight, and the most ordinary UI there is — a timestamp on each item —
+    // crashes the whole screen: `new Date(undefined)` is an Invalid Date, and
+    // Intl.DateTimeFormat().format() THROWS on that where almost everything
+    // else would render blank. Reported from a real app on 2026-07-28.
+    //
+    // It also fixes sort placement: the default sort is `-created_at`, so an
+    // optimistic row with no timestamp sorted as if it had none rather than
+    // appearing first. The server's value replaces this on settle, exactly like
+    // the client-generated id above.
+    const optimistic = {
+      ...fields,
+      id,
+      created_at: fields.created_at ?? new Date().toISOString(),
+    } as Partial<T>;
+    const op: PendingOp<T> = { kind: "create", id, row: optimistic };
     this.pending.push(op);
     this.emit();
     try {

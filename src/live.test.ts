@@ -365,6 +365,85 @@ describe("LiveEntityStore: optimistic mutations", () => {
     stop();
   });
 
+  // Reported from a real app (2026-07-28): a reading-club tracker rendered
+  // `Intl.DateTimeFormat().format(new Date(note.created_at))` for each note.
+  // Adding a note crashed the whole screen with "RangeError: Invalid time
+  // value", because the optimistic row carried no created_at — the server fills
+  // it — and Intl THROWS on an Invalid Date where nearly everything else
+  // renders blank. "Show a timestamp on each item" is about as ordinary as UI
+  // gets, so every app doing it was one click from a crash.
+  test("an optimistic row carries created_at, so date formatting can't throw", async () => {
+    const h = makeHarness();
+    const store = new LiveEntityStore<Row>(h.handler);
+    const stop = store.start();
+    await tick();
+
+    const p = store.create({ title: "new" });
+    const optimistic = store.getSnapshot().data[0] as Row & { created_at?: unknown };
+    // Before the await — this is the window the crash happened in.
+    expect(typeof optimistic.created_at).toBe("string");
+    expect(Number.isNaN(new Date(optimistic.created_at as string).getTime())).toBe(false);
+    // The exact call that threw in the wild must now be safe.
+    expect(() =>
+      new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(
+        new Date(optimistic.created_at as string),
+      ),
+    ).not.toThrow();
+    await p;
+    stop();
+  });
+
+  test("the server's created_at wins once the write settles", async () => {
+    // The client stamp is a placeholder for the in-flight window only. Clock
+    // skew must never outlive the round trip.
+    const h = makeHarness();
+    const serverStamp = "2020-01-02T03:04:05.000Z";
+    const origCreate = h.handler.create.bind(h.handler);
+    h.handler.create = (async (v: Partial<Row>) => ({
+      ...(await origCreate(v)),
+      created_at: serverStamp,
+    })) as typeof h.handler.create;
+
+    const store = new LiveEntityStore<Row>(h.handler);
+    const stop = store.start();
+    await tick();
+    await store.create({ title: "new" });
+    expect((store.getSnapshot().data[0] as Row & { created_at?: unknown }).created_at).toBe(
+      serverStamp,
+    );
+    stop();
+  });
+
+  test("an explicitly supplied created_at is respected, not overwritten", async () => {
+    const h = makeHarness();
+    const store = new LiveEntityStore<Row>(h.handler);
+    const stop = store.start();
+    await tick();
+    const mine = "1999-12-31T00:00:00.000Z";
+    const p = store.create({ title: "new", created_at: mine } as Partial<Row>);
+    expect((store.getSnapshot().data[0] as Row & { created_at?: unknown }).created_at).toBe(mine);
+    await p;
+    stop();
+  });
+
+  test("the client stamp does NOT go to the server (it owns the real value)", async () => {
+    const h = makeHarness();
+    let sent: Partial<Row> | null = null;
+    const origCreate = h.handler.create.bind(h.handler);
+    h.handler.create = (async (v: Partial<Row>) => {
+      sent = v;
+      return origCreate(v);
+    }) as typeof h.handler.create;
+
+    const store = new LiveEntityStore<Row>(h.handler);
+    const stop = store.start();
+    await tick();
+    await store.create({ title: "new" });
+    expect(sent).not.toBeNull();
+    expect(Object.keys(sent!)).not.toContain("created_at");
+    stop();
+  });
+
   test("an optimistic row SURVIVES a full refetch that doesn't include it yet", async () => {
     const h = makeHarness([{ id: "1" }]);
     const store = new LiveEntityStore<Row>(h.handler);
