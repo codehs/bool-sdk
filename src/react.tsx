@@ -18,7 +18,8 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react";
-import { getDefaultBoolClient, type BoolClient, type BoolUser } from "./client.js";
+import { createBoolClient, getDefaultBoolClient, type BoolClient, type BoolUser } from "./client.js";
+
 import {
   LiveEntityStore,
   type EntityRow,
@@ -29,6 +30,24 @@ import {
   type EntityHandler,
   type EntityQueryResult,
 } from "./entities.js";
+
+// Re-exported on purpose, and it is load-bearing. A React app creates its client
+// by importing createBoolClient FROM HERE:
+//
+//   import { createBoolClient } from "bool-sdk/react";
+//
+// which makes arming the live hook (the __registerEntityUseQuery call at the
+// bottom of this file) a side effect of needing the thing you already need.
+//
+// The alternative — `import { createBoolClient } from "bool-sdk"` plus a bare
+// `import "bool-sdk/react"` for its side effect — is a real trap: the bare form
+// binds no names, so a bundler reads it as an unused import and deletes it from
+// production builds. That shipped in 0.3.0 and broke live views in every
+// published app while dev previews (no tree-shaking) looked perfect. The
+// `sideEffects` field in package.json now prevents that too, but this export is
+// the structural fix: a used binding cannot be tree-shaken by any bundler under
+// any configuration, so there is nothing left to get wrong.
+export { createBoolClient };
 
 type AuthActionResult = { error: unknown };
 

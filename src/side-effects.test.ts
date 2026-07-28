@@ -37,3 +37,27 @@ describe("package.json sideEffects (published-bundle contract)", () => {
     }
   });
 });
+
+// The STRUCTURAL fix, and the reason the field above is now belt-and-braces
+// rather than the only thing standing between us and broken published apps.
+//
+// A React app creates its client with
+//   import { createBoolClient } from "bool-sdk/react";
+// so loading the module that arms the live hook is a side effect of needing
+// something the app already needs. A used binding cannot be tree-shaken by any
+// bundler under any configuration — verified by building a real Vite app with
+// `"sideEffects": false` (the config that broke 0.3.0) and confirming the
+// registration still survives with this import shape.
+describe("react entry re-exports createBoolClient (the unshakeable import)", () => {
+  test("createBoolClient is importable from the React entry", async () => {
+    const react = await import("./react");
+    expect(typeof react.createBoolClient).toBe("function");
+  });
+
+  test("it is the SAME function as the core export, not a wrapper", async () => {
+    // A wrapper would drift; and the default-client registry only works if
+    // there is exactly one implementation.
+    const [core, react] = await Promise.all([import("./client"), import("./react")]);
+    expect(react.createBoolClient).toBe(core.createBoolClient);
+  });
+});
