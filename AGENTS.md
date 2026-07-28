@@ -22,3 +22,24 @@ understand ours).
   sync with the gateway routes in the Bool platform repo (`lib/gateway/`).
 - Semver discipline is load-bearing: generated apps install from a caret
   range on every sandbox boot, so a breaking change requires a major bump.
+
+## Realtime (`src/realtime.ts`, `src/live.ts`)
+
+Read the platform repo's `docs/2026-07-realtime.md` before changing either.
+It records three generations of this design, why the first two were abandoned,
+and the traps that are easy to walk back into. The short version:
+
+- Change payloads arrive on **private** channels joined with a short-TTL token
+  the gateway mints; there is **no public channel** to fall back to. Don't add
+  one "just in case" — the previous one cost double writes forever and leaked
+  row ids to anyone holding the (public) anon key.
+- A payload's `id` is only trustworthy on channels whose payload shape we
+  control: the transport injects its own message uuid when a payload lacks one,
+  and it looks exactly like a row id.
+- `LiveEntityStore` merges changes by id and never replaces the list from a
+  server snapshot. Replacing is what made rows pop in and out; two earlier
+  releases tried to shrink that race window before we removed it instead.
+- On failure, retry and report (`connecting | live | unauthorized | unavailable`)
+  rather than degrading quietly. Distinguish "refused" from "unreachable": a
+  public app admits every visitor, so a dropped request must never surface as
+  *unauthorized*.
