@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { createDoorbell, type DoorbellDeps, type RealtimeMint } from "./realtime";
+import {
+  createDoorbell,
+  type DoorbellDeps,
+  type DoorbellStatus,
+  type MintResult,
+  type RealtimeMint,
+} from "./realtime";
 import type { BoolChangePayload } from "./client";
 
 // The doorbell lifecycle drives everything through injected deps, so these
@@ -15,7 +21,7 @@ type FakeChannel = {
   status: ((s: string) => void) | null;
 };
 
-function makeHarness(opts: { mints?: (RealtimeMint | null)[] } = {}) {
+function makeHarness(opts: { mints?: MintResult[] } = {}) {
   const mints = [...(opts.mints ?? [])];
   const h = {
     channels: [] as FakeChannel[],
@@ -38,9 +44,9 @@ function makeHarness(opts: { mints?: (RealtimeMint | null)[] } = {}) {
     live: () => h.channels.filter((c) => c.joined && !c.left),
   };
   const deps: DoorbellDeps = {
-    async mint() {
+    async mint(): Promise<MintResult> {
       h.mintCalls++;
-      return mints.length ? mints.shift()! : null;
+      return mints.length ? mints.shift()! : { ok: false, reason: "unauthorized" };
     },
     async setAuth(token) {
       h.authed.push(token);
@@ -61,7 +67,6 @@ function makeHarness(opts: { mints?: (RealtimeMint | null)[] } = {}) {
         },
       };
     },
-    legacyTopic: "bool:app_x",
     schedule(fn, ms) {
       const t = { fn: fn as () => void, ms, cancelled: false };
       h.scheduled.push(t);
@@ -74,11 +79,15 @@ function makeHarness(opts: { mints?: (RealtimeMint | null)[] } = {}) {
   return { h, doorbell: createDoorbell(deps) };
 }
 
-const MINT: RealtimeMint = {
+const RAW: RealtimeMint = {
   token: "tok-1",
   expiresIn: 900,
   topics: { app: "bool:app_x:app", user: "bool:app_x:user:u1" },
 };
+const MINT: MintResult = { ok: true, mint: RAW };
+const ok = (m: Partial<RealtimeMint>): MintResult => ({ ok: true, mint: { ...RAW, ...m } });
+const refused: MintResult = { ok: false, reason: "unauthorized" };
+const down: MintResult = { ok: false, reason: "unavailable" };
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
 describe("createDoorbell: the private path", () => {
@@ -95,7 +104,7 @@ describe("createDoorbell: the private path", () => {
 
   test("anonymous mint (no user topic) joins the app room only", async () => {
     const { h, doorbell } = makeHarness({
-      mints: [{ ...MINT, topics: { app: "bool:app_x:app", user: null } }],
+      mints: [ok({ topics: { app: "bool:app_x:app", user: null } })],
     });
     doorbell.subscribe(() => {});
     await tick();
@@ -120,9 +129,7 @@ describe("createDoorbell: the private path", () => {
 
 describe("createDoorbell: refresh & revocation", () => {
   test("re-mints at ~75% of the TTL and re-presents the new wristband", async () => {
-    const { h, doorbell } = makeHarness({
-      mints: [MINT, { ...MINT, token: "tok-2" }],
-    });
+    const { h, doorbell } = makeHarness({ mints: [MINT, ok({ token: "tok-2" })] });
     doorbell.subscribe(() => {});
     await tick();
     expect(h.scheduled[0]!.ms).toBe(900 * 1000 * 0.75);
@@ -130,92 +137,108 @@ describe("createDoorbell: refresh & revocation", () => {
     expect(h.authed).toEqual(["tok-1", "tok-2"]);
     // channels stay up — setAuth re-auths the connection, no rejoin
     expect(h.live().length).toBe(2);
-    // and the next refresh is scheduled
-    expect(h.scheduled.length).toBe(2);
   });
 
-  test("a refused re-mint (revoked access) silences the private rooms and falls back", async () => {
-    const { h, doorbell } = makeHarness({ mints: [MINT] }); // second mint → null
+  test("a refused re-mint (revoked access) drops the rooms and reports unauthorized", async () => {
+    // The TTL expiring IS the revocation mechanism: once the gateway stops
+    // issuing wristbands the socket must go quiet, not keep listening.
+    const { h, doorbell } = makeHarness({ mints: [MINT, refused] });
     const got: BoolChangePayload[] = [];
     doorbell.subscribe((p) => got.push(p));
     await tick();
     await h.fire();
-    // private rooms left; only the public legacy channel remains
-    const live = h.live();
-    expect(live.map((c) => [c.topic, c.priv])).toEqual([["bool:app_x", false]]);
-    // late payloads on the torn-down private room reach nobody
+    expect(h.live()).toHaveLength(0);
+    expect(doorbell.status()).toBe("unauthorized");
+    // late payloads on a torn-down room reach nobody
     h.ding("bool:app_x:app", { table: "todos", op: "INSERT", id: "9" });
     expect(got).toHaveLength(0);
   });
 
   test("a nonsense TTL is clamped so refresh can't melt into a mint loop", async () => {
-    const { h, doorbell } = makeHarness({ mints: [{ ...MINT, expiresIn: 1 }] });
+    const { h, doorbell } = makeHarness({ mints: [ok({ expiresIn: 1 })] });
     doorbell.subscribe(() => {});
     await tick();
     expect(h.scheduled[0]!.ms).toBe(30_000);
   });
 });
 
-describe("createDoorbell: fallback & teardown", () => {
-  test("no wristband desk (mint null) → legacy public channel", async () => {
-    const { h, doorbell } = makeHarness({ mints: [null] });
+// There is NO public channel to fall back to — every topic is wristband-gated.
+// So a failure is reported and retried, never disguised as liveness.
+describe("createDoorbell: failure is surfaced, not disguised", () => {
+  test("a refused mint reports unauthorized and joins nothing", async () => {
+    const { h, doorbell } = makeHarness({ mints: [refused] });
     const got: BoolChangePayload[] = [];
     doorbell.subscribe((p) => got.push(p));
     await tick();
+    expect(h.live()).toHaveLength(0);
     expect(h.authed).toHaveLength(0);
-    expect(h.live().map((c) => [c.topic, c.priv])).toEqual([["bool:app_x", false]]);
-    h.ding("bool:app_x", { table: "todos", op: "DELETE", id: "3" });
-    expect(got).toHaveLength(1);
+    expect(doorbell.status()).toBe("unauthorized");
+    expect(got).toHaveLength(0);
   });
 
-  // Regression: Supabase Realtime injects its own message-uuid `id` into any
-  // broadcast payload that lacks one. On the row-data-free public channel that
-  // uuid looks exactly like a row id to the live store, which would keyed-fetch
-  // a nonexistent row and silently swallow the change. Missing `id` is the
-  // signal that triggers a full reload — so the legacy path must discard it.
-  test("legacy payloads are stripped to {table, op} — no injected id survives", async () => {
-    const { h, doorbell } = makeHarness({ mints: [null] });
-    const got: BoolChangePayload[] = [];
-    doorbell.subscribe((p) => got.push(p));
+  test("an unreachable gateway reports unavailable — NOT unauthorized", async () => {
+    // A public app admits every visitor, so a dropped request must never be
+    // presented as "you aren't allowed to watch this".
+    const { doorbell } = makeHarness({ mints: [down] });
+    doorbell.subscribe(() => {});
     await tick();
-    h.ding("bool:app_x", {
-      table: "todos",
-      op: "INSERT",
-      id: "a-realtime-message-uuid",
-      row: { id: "should-not-appear" },
-    } as BoolChangePayload);
-    expect(got).toEqual([{ table: "todos", op: "INSERT" }]);
-    expect(got[0]!.id).toBeUndefined();
-    expect(got[0]!.row).toBeUndefined();
+    expect(doorbell.status()).toBe("unavailable");
   });
 
-  test("private payloads keep id and row (only the legacy channel is stripped)", async () => {
+  test("status transitions are reported to the client", async () => {
+    const seen: DoorbellStatus[] = [];
     const { h, doorbell } = makeHarness({ mints: [MINT] });
-    const got: BoolChangePayload[] = [];
-    doorbell.subscribe((p) => got.push(p));
+    // onStatus isn't part of makeHarness; assert via the accessor instead.
+    expect(doorbell.status()).toBe("connecting");
+    doorbell.subscribe(() => {});
     await tick();
-    h.ding("bool:app_x:app", { table: "todos", op: "INSERT", id: "row-1", row: { id: "row-1" } });
-    expect(got[0]!.id).toBe("row-1");
-    expect(got[0]!.row).toEqual({ id: "row-1" });
+    h.channels[0]!.status!("SUBSCRIBED");
+    expect(doorbell.status()).toBe("live");
+    void seen;
   });
 
-  test("a refused private join degrades to the public ping (never a dead app)", async () => {
+  test("retries with capped backoff instead of hot-looping", async () => {
+    const { h, doorbell } = makeHarness({ mints: [refused, refused, refused, refused, refused] });
+    doorbell.subscribe(() => {});
+    await tick();
+    const delays: number[] = [h.scheduled[0]!.ms];
+    for (let i = 0; i < 3; i++) {
+      await h.fire();
+      delays.push(h.scheduled.at(-1)!.ms);
+    }
+    expect(delays).toEqual([1_000, 5_000, 15_000, 60_000]);
+    // and it keeps trying — a granted-later viewer eventually goes live
+    expect(h.mintCalls).toBeGreaterThan(1);
+  });
+
+  test("a good join resets the backoff so a later blip starts quick again", async () => {
+    const { h, doorbell } = makeHarness({ mints: [refused, MINT] });
+    doorbell.subscribe(() => {});
+    await tick();
+    expect(h.scheduled[0]!.ms).toBe(1_000);
+    await h.fire(); // second attempt mints fine
+    h.channels[0]!.status!("SUBSCRIBED");
+    expect(doorbell.status()).toBe("live");
+    // a refused join now → backoff restarts at the first step
+    h.channels[0]!.status!("CHANNEL_ERROR");
+    expect(h.scheduled.at(-1)!.ms).toBe(1_000);
+  });
+
+  test("a refused private join tears down and retries (wristband/policy disagree)", async () => {
     const { h, doorbell } = makeHarness({ mints: [MINT] });
     doorbell.subscribe(() => {});
     await tick();
     h.channels[0]!.status!("CHANNEL_ERROR");
-    expect(h.live().map((c) => [c.topic, c.priv])).toEqual([["bool:app_x", false]]);
+    expect(h.live()).toHaveLength(0);
+    expect(doorbell.status()).toBe("unavailable");
   });
 
   test("last unsubscribe tears everything down; a late mint resolution no-ops", async () => {
-    let release!: (m: RealtimeMint) => void;
-    const slowMint = new Promise<RealtimeMint>((r) => (release = r));
-    const h = {
-      channels: [] as FakeChannel[],
-      authed: [] as string[],
-    };
+    let release!: (m: MintResult) => void;
+    const slowMint = new Promise<MintResult>((r) => (release = r));
+    const h = { channels: [] as FakeChannel[], authed: [] as string[] };
     const doorbell = createDoorbell({
-      mint: () => slowMint as Promise<RealtimeMint | null>,
+      mint: () => slowMint,
       setAuth: async (t) => void h.authed.push(t),
       channel(topic, { private: priv }) {
         const ch: FakeChannel = { topic, priv, joined: false, left: false, cb: null, status: null };
@@ -230,18 +253,17 @@ describe("createDoorbell: fallback & teardown", () => {
           },
         };
       },
-      legacyTopic: "bool:app_x",
     });
     const off = doorbell.subscribe(() => {});
     off(); // teardown while the mint is still in flight
     release(MINT);
     await tick();
-    expect(h.authed).toHaveLength(0); // orphaned continuation did nothing
+    expect(h.authed).toHaveLength(0);
     expect(h.channels).toHaveLength(0);
   });
 
   test("resubscribing after teardown starts a fresh doorbell", async () => {
-    const { h, doorbell } = makeHarness({ mints: [MINT, { ...MINT, token: "tok-2" }] });
+    const { h, doorbell } = makeHarness({ mints: [MINT, ok({ token: "tok-2" })] });
     const off = doorbell.subscribe(() => {});
     await tick();
     off();

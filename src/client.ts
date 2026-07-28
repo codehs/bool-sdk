@@ -21,7 +21,7 @@
 // (/_bool/v1/users) in the Bool platform repo.
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { createEntitiesModule, type EntitiesModule } from "./entities.js";
-import { createDoorbell, type RealtimeMint } from "./realtime.js";
+import { createDoorbell, type MintResult, type RealtimeMint } from "./realtime.js";
 
 /** Matches the server's append-only gateway path version. */
 const GATEWAY_API = "v1";
@@ -644,7 +644,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
   // CURRENT session has. A user who signs in mid-session gains their personal
   // room at the next TTL refresh (≤15 min) or page navigation — acceptable
   // because the app room already carries all shared-table changes.
-  const mintRealtimeToken = async (): Promise<RealtimeMint | null> => {
+  const mintRealtimeToken = async (): Promise<MintResult> => {
     try {
       const headers = new Headers();
       if (viewerToken) headers.set("x-bool-viewer", viewerToken);
@@ -655,10 +655,14 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
         headers,
         credentials: "include",
       });
-      if (!res.ok) return null;
-      return (await res.json()) as RealtimeMint;
+      if (res.ok) return { ok: true, mint: (await res.json()) as RealtimeMint };
+      // 403 is a real verdict from the gateway: this viewer isn't allowed to
+      // watch this app. Everything else (404 no plane, 503 misconfigured, 5xx,
+      // 429) is "couldn't get one right now" — a public app must never tell a
+      // visitor they're unauthorized because of a transient failure.
+      return { ok: false, reason: res.status === 403 ? "unauthorized" : "unavailable" };
     } catch {
-      return null;
+      return { ok: false, reason: "unavailable" }; // network/offline
     }
   };
 
@@ -686,7 +690,6 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
         },
       };
     },
-    legacyTopic: "bool:" + schema,
   });
 
   const subscribeToChanges = (
