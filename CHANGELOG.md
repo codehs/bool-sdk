@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.0-next.26
+
+- **Removes the public-channel fallback entirely. Every doorbell topic is now
+  wristband-gated.** The compat path existed to keep already-deployed bundles
+  working, but it cost a second `realtime.messages` insert on every row change
+  forever, left an anon-joinable topic whose only protection was schema-name
+  obscurity, and had no retirement mechanism. Nothing real depended on it.
+
+  Consequences, all improvements:
+  - one broadcast per row change instead of two (halves write amplification)
+  - no channel an anon key can eavesdrop on — a socket with no gateway-minted
+    wristband hears nothing at all
+  - the `id`-stripping workaround from `next.25` is gone with the channel that
+    needed it
+
+- **Failure is surfaced, not disguised.** With no degraded path to slink onto,
+  the doorbell retries with capped backoff (1s → 5s → 15s → 60s, reset by a good
+  join) and reports state via `doorbell.status()` / the `onStatus` dep:
+  `connecting` | `live` | `unauthorized` | `unavailable`. HTTP reads keep working
+  throughout, so an app is never broken — just not live, visibly.
+
+- `mint()` now returns a discriminated `MintResult` so "the gateway refused you"
+  (403) is distinguishable from "I couldn't reach the gateway" (network, 404,
+  503). A public app admits every visitor, so a dropped request must never be
+  presented to them as *unauthorized*.
+
+  Public no-auth apps are the primary path and unaffected by the removal:
+  verified on dev — an anonymous visitor mints (200), joins `bool:<schema>:app`,
+  and receives full row payloads, while an anon-key eavesdropper on the old
+  public topic hears nothing.
+
 ## 0.2.0-next.25
 
 - **Fixes live updates being silently swallowed on the public fallback channel.**

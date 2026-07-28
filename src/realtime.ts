@@ -1,31 +1,31 @@
-// The private doorbell client — the SDK half of Bool's "intercom + wristband"
-// realtime design (platform: lib/bool-db.ts GATEWAY_GLOBAL_SETUP_SQL + the
+// The private doorbell client — the SDK half of Bool's realtime design
+// (platform: lib/bool-db.ts GATEWAY_GLOBAL_SETUP_SQL + the
 // /_bool/v1/realtime/token plane).
 //
-// Live updates arrive as ROW-BEARING broadcasts on PRIVATE topics that only a
-// gateway-minted token ("wristband") can join. This module owns the whole
-// lifecycle so app code (and useEntity) just gets payloads:
+// Live updates arrive as ROW-BEARING broadcasts on PRIVATE topics. Every topic
+// is private: a socket holding no gateway-minted wristband hears nothing, and
+// there is no public channel to fall back to. This module owns the lifecycle so
+// app code (and useEntity) just gets payloads:
 //   - mint the wristband from the gateway (which re-runs liveAccess/session on
 //     every mint — that's where access is actually decided),
 //   - setAuth + join the app room and, when signed in, the personal user room
-//     (the trigger picks disjoint audiences, so the two rooms never duplicate),
-//   - re-mint at ~75% of the TTL so the socket never hits token expiry; a
-//     failed re-mint (revoked access, gateway down) silences the private rooms
-//     rather than erroring the app,
-//   - fall back to the legacy PUBLIC row-data-free channel when the wristband
-//     desk is unavailable (older platform, 503) so live-ness degrades to
-//     ping+refetch instead of dying,
+//     (the trigger picks disjoint audiences, so the two never duplicate),
+//   - re-mint at ~75% of the TTL so the socket never hits token expiry,
+//   - on failure, RETRY with capped backoff and report status — never pretend.
+//     A refused mint means the viewer isn't authorized (or the gateway is
+//     unreachable); either way the honest outcome is "not live", surfaced, with
+//     HTTP reads still working. Silently limping along on a degraded path is how
+//     a broken realtime layer goes unnoticed for a week.
 //   - share ONE doorbell across every subscriber (each entities.<table>
 //     .subscribe used to open its own channel; now they ref-count this one).
 //
 // Everything effectful is injected (DoorbellDeps) so the machine is fully
-// unit-testable without sockets — same dependency-injection discipline as the
-// platform's plane handlers.
+// unit-testable without sockets.
 
 import type { BoolChangePayload } from "./client.js";
 
 /** What the wristband desk returns. Topic names are SERVER-authored so naming
- * lives in exactly one repo. */
+ * lives in exactly one place. */
 export type RealtimeMint = {
   token: string;
   /** Seconds until the token expires. */
@@ -41,16 +41,34 @@ export type DoorbellChannel = {
   leave(): void;
 };
 
+/** Why the doorbell isn't delivering, when it isn't.
+ *  - `connecting` — first mint/join in flight
+ *  - `live`       — joined; changes are arriving
+ *  - `unauthorized` — the gateway refused a wristband (not authorized for this
+ *    app, or end-user session expired). Retried, since access can be granted.
+ *  - `unavailable` — gateway unreachable, realtime misconfigured, or the join
+ *    was refused. Retried with backoff. */
+export type DoorbellStatus = "connecting" | "live" | "unauthorized" | "unavailable";
+
+/** Outcome of one mint attempt. The two failure kinds are distinguished on
+ * purpose: "the gateway says no" and "I couldn't reach the gateway" mean very
+ * different things to a viewer (and to whoever is debugging), and a public app
+ * — where every visitor is normally admitted — must never be told it's
+ * unauthorized because of a dropped request. */
+export type MintResult =
+  | { ok: true; mint: RealtimeMint }
+  | { ok: false; reason: "unauthorized" | "unavailable" };
+
 export type DoorbellDeps = {
-  /** Mint one wristband; null when the desk is unavailable (non-2xx, network,
-   * or a pre-private-doorbell platform). */
-  mint(): Promise<RealtimeMint | null>;
+  /** Mint one wristband. On failure report WHICH kind (see MintResult) — the
+   * doorbell retries either way and never silently gives up. */
+  mint(): Promise<MintResult>;
   /** Present the wristband to the realtime connection (supabase setAuth). */
   setAuth(token: string): Promise<void> | void;
-  /** Create (not join) a channel on `topic`. */
+  /** Create (not join) a private channel on `topic`. */
   channel(topic: string, opts: { private: boolean }): DoorbellChannel;
-  /** The legacy public topic (`bool:<schema>`) for the fallback path. */
-  legacyTopic: string;
+  /** Called whenever delivery state changes, so a client can surface it. */
+  onStatus?: (status: DoorbellStatus) => void;
   /** Test seam; defaults to setTimeout/clearTimeout. */
   schedule?: (fn: () => void, ms: number) => unknown;
   cancel?: (handle: unknown) => void;
@@ -60,13 +78,18 @@ export type DoorbellDeps = {
 // expiry (which would close the channels underneath us), late enough that
 // refresh traffic stays negligible.
 const REFRESH_FRACTION = 0.75;
-// A desk that answers but with a nonsense TTL shouldn't melt into a mint loop.
+// A desk that answers with a nonsense TTL shouldn't melt into a mint loop.
 const MIN_REFRESH_MS = 30_000;
+// Retry backoff after a refused/failed mint or join: quick first, then capped so
+// a long outage costs one request a minute rather than a hot loop.
+const RETRY_MS = [1_000, 5_000, 15_000, 60_000];
 
 export type Doorbell = {
   /** Register a change listener. Starts the machinery on the first listener,
    * tears it down after the last unsubscribes. Returns unsubscribe. */
   subscribe(listener: (payload: BoolChangePayload) => void): () => void;
+  /** Current delivery state — for surfacing "not live" in a UI. */
+  status(): DoorbellStatus;
 };
 
 export function createDoorbell(deps: DoorbellDeps): Doorbell {
@@ -82,86 +105,97 @@ export function createDoorbell(deps: DoorbellDeps): Doorbell {
   // teardown (or a restart) orphans in-flight work instead of racing it.
   let gen = 0;
   let channels: DoorbellChannel[] = [];
-  let refreshHandle: unknown = null;
+  let timer: unknown = null;
+  let attempt = 0;
+  let state: DoorbellStatus = "connecting";
+
+  function setStatus(next: DoorbellStatus): void {
+    if (state === next) return;
+    state = next;
+    deps.onStatus?.(next);
+  }
+
+  function clearTimer(): void {
+    if (timer !== null) {
+      cancel(timer);
+      timer = null;
+    }
+  }
 
   function teardownChannels(): void {
     for (const ch of channels) ch.leave();
     channels = [];
-    if (refreshHandle !== null) {
-      cancel(refreshHandle);
-      refreshHandle = null;
-    }
+    clearTimer();
   }
 
-  /** Strip everything except {table, op} from a legacy-channel payload.
-   *
-   * The public compat channel is row-data-free by contract — the server sends
-   * only table and op, because anyone with the (public) anon key and the schema
-   * name can join it. But Supabase Realtime INJECTS its own `id` (a message
-   * uuid) into any broadcast payload that lacks one, and that value looks
-   * exactly like a row id to the live store: it would keyed-fetch a row that
-   * doesn't exist, apply nothing, and silently swallow the change. So the
-   * doorbell discards it here rather than trusting the transport's shape —
-   * missing `id` is precisely the signal that makes the store fall back to a
-   * coalesced full reload, which is the correct behavior on this channel. */
-  function legacyPayload(p: BoolChangePayload): BoolChangePayload {
-    return { table: p.table, op: p.op };
+  /** Schedule the next attempt after a failure, with capped backoff. */
+  function retry(myGen: number, why: DoorbellStatus): void {
+    setStatus(why);
+    const ms = RETRY_MS[Math.min(attempt, RETRY_MS.length - 1)]!;
+    attempt++;
+    timer = schedule(() => {
+      if (myGen !== gen) return;
+      void start(myGen);
+    }, ms);
   }
 
-  function joinLegacy(myGen: number): void {
+  async function start(myGen: number): Promise<void> {
+    teardownChannels();
     if (myGen !== gen) return;
-    const ch = deps.channel(deps.legacyTopic, { private: false });
-    ch.onBroadcast((p) => fanout(legacyPayload(p)));
-    ch.join(() => {});
-    channels.push(ch);
-  }
 
-  async function startPrivate(myGen: number): Promise<void> {
-    const m = await deps.mint();
+    const res = await deps.mint();
     if (myGen !== gen) return;
-    if (!m) return joinLegacy(myGen);
+    // No wristband: the app is NOT live. Report which kind of "no" it was and
+    // try again — never fake liveness.
+    if (!res.ok) return retry(myGen, res.reason);
+    const m = res.mint;
 
     await deps.setAuth(m.token);
     if (myGen !== gen) return;
 
     // The app room, and the personal room when the mint carried a signed-in
-    // user. Audiences are disjoint by construction (the trigger rings an
-    // owned row's user room INSTEAD of the app room), so no dedupe is needed.
+    // user. Audiences are disjoint by construction (the trigger rings an owned
+    // row's user room INSTEAD of the app room), so no dedupe is needed.
+    let joined = 0;
     for (const topic of [m.topics.app, m.topics.user]) {
       if (!topic) continue;
       const ch = deps.channel(topic, { private: true });
       ch.onBroadcast(fanout);
-      ch.join((state) => {
-        // A refused/failed private join (policy missing on an older database,
-        // clock-skewed token) degrades to the public ping — worse latency,
-        // never a dead app. Guard on gen so late errors after teardown no-op.
-        if (state === "CHANNEL_ERROR" && myGen === gen) {
+      ch.join((s) => {
+        if (myGen !== gen) return;
+        if (s === "SUBSCRIBED") {
+          joined++;
+          attempt = 0; // a good join resets the backoff
+          setStatus("live");
+        } else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT") {
+          // A refused private join means the wristband and the policy disagree
+          // (misconfigured database, clock skew). Retry the whole handshake.
           teardownChannels();
-          joinLegacy(myGen);
+          retry(myGen, "unavailable");
         }
       });
       channels.push(ch);
     }
+    if (joined === 0 && channels.length === 0) return retry(myGen, "unavailable");
 
     scheduleRefresh(myGen, m.expiresIn);
   }
 
   function scheduleRefresh(myGen: number, expiresInSeconds: number): void {
     const ms = Math.max(expiresInSeconds * 1000 * REFRESH_FRACTION, MIN_REFRESH_MS);
-    refreshHandle = schedule(async () => {
+    timer = schedule(async () => {
       if (myGen !== gen) return;
-      const m = await deps.mint();
+      const res = await deps.mint();
       if (myGen !== gen) return;
-      if (!m) {
-        // Wristband renewal refused: access was revoked or the gateway is
-        // unreachable. Go quiet on the private rooms (the whole point of the
-        // TTL) and keep the app alive on the public ping.
+      // Renewal refused — access was revoked, or the gateway is down. The TTL
+      // expiring is the whole revocation mechanism, so drop the rooms.
+      if (!res.ok) {
         teardownChannels();
-        return joinLegacy(myGen);
+        return retry(myGen, res.reason);
       }
-      await deps.setAuth(m.token); // existing channels re-auth on the connection
+      await deps.setAuth(res.mint.token); // channels re-auth on the connection
       if (myGen !== gen) return;
-      scheduleRefresh(myGen, m.expiresIn);
+      scheduleRefresh(myGen, res.mint.expiresIn);
     }, ms);
   }
 
@@ -170,15 +204,19 @@ export function createDoorbell(deps: DoorbellDeps): Doorbell {
       listeners.add(listener);
       if (listeners.size === 1) {
         gen++;
-        void startPrivate(gen);
+        attempt = 0;
+        setStatus("connecting");
+        void start(gen);
       }
       return () => {
         if (!listeners.delete(listener)) return;
         if (listeners.size === 0) {
           gen++; // orphan any in-flight start/refresh
           teardownChannels();
+          state = "connecting";
         }
       };
     },
+    status: () => state,
   };
 }
