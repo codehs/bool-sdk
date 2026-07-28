@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.0-next.26
+
+- **Adds the email battery: `bool.email.send({ to, subject, body })`.** A deployed
+  app can now send email with no SMTP config, no provider account and no API key
+  — the gateway's email plane (`/_bool/v1/email`) renders the message, meters the
+  owner's app-credit pool (2 per send, the same pool `bool.ai` spends), and queues
+  it in a durable outbox, so a resolved `send` will keep retrying delivery
+  server-side. Requires the `bool-email` server flag.
+
+  **Recipients are restricted, by design.** Only the app's **owner** — passed as
+  the literal `to: "owner"`, resolved server-side so the address never ships in
+  the bundle — or a signed-in **end user of this app whose email is verified**.
+  An address a visitor typed into a form is refused with `recipient_not_allowed`.
+  An app that could email anyone would make Bool's sending domain a spam relay,
+  and the cost of that would land on every other app's deliverability.
+
+  There is no HTML body, no attachments and no custom `from`: every message
+  renders into one fixed Bool template. `body` is plain text (blank lines become
+  paragraphs) plus at most one https `button`.
+
+  New exports: `BoolEmailError` (`status`, `code`, `detail`), and the types
+  `BoolEmail`, `BoolEmailMessage`, `BoolEmailResult`. `{ duplicate: true }` (an
+  `idempotencyKey` matched) and `{ suppressed: true }` (the address hard-bounced
+  or reported spam) resolve normally rather than throwing.
+
+- **`BoolAiError`'s 402 code is now `out_of_app_credits`.** The platform renamed
+  the battery pool from "AI credits" to app credits ("juice" in the UI), so the
+  wire code names the shared POOL rather than one plane — the same string now
+  means the same thing for every battery. Docs/comments only; no code change.
+  Branch on `status === 402` if you need to also handle older gateways, which sent
+  `out_of_ai_credits`.
+
 ## 0.2.0-next.25
 
 - **Fixes live updates being silently swallowed on the public fallback channel.**

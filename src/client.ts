@@ -151,8 +151,13 @@ export type BoolChangePayload = {
 export type BoolAiSchema = Record<string, unknown>;
 
 /** Thrown when a bool.ai call fails. `status` is the gateway HTTP status and
- * `code` its machine-readable error (e.g. "out_of_ai_credits" on a 402,
- * "rate_limited" on a 429) so app code can branch without string-matching. */
+ * `code` its machine-readable error (e.g. "out_of_app_credits" on a 402,
+ * "rate_limited" on a 429) so app code can branch without string-matching.
+ *
+ * The 402 code names the shared app-credit POOL every battery draws on, not this
+ * plane, so the same string means the same thing for `bool.email` and whatever
+ * ships next. (Gateways predating that rename sent "out_of_ai_credits"; branch on
+ * `status === 402` if you need to cover both.) */
 export class BoolAiError extends Error {
   readonly status: number;
   readonly code: string;
@@ -180,6 +185,86 @@ export type BoolAi = {
   stream(prompt: string): AsyncIterable<string>;
 };
 
+/** Thrown when a `bool.email` call fails. Same shape as {@link BoolAiError}.
+ *
+ * The codes worth branching on:
+ *  - `recipient_not_allowed` (403) — the address is neither the app owner nor a
+ *    verified user of this app. See {@link BoolEmail} for the rule; `detail`
+ *    carries a human-readable explanation worth showing while building.
+ *  - `reply_to_not_allowed` (403) — `replyTo` may only be the owner.
+ *  - `out_of_app_credits` (402) — the owner's shared battery pool is empty.
+ *  - `rate_limited` (429) — a per-caller, per-app or per-recipient cap.
+ *  - `invalid_email` / `missing_subject` / `invalid_button` / … (400) — bad input.
+ */
+export class BoolEmailError extends Error {
+  readonly status: number;
+  readonly code: string;
+  /** The gateway's human-readable explanation, when it sent one. */
+  readonly detail: string | null;
+  constructor(code: string, status: number, detail: string | null = null) {
+    super(
+      detail
+        ? `bool.email failed: ${code} (${status}) — ${detail}`
+        : `bool.email failed: ${code} (${status})`,
+    );
+    this.name = "BoolEmailError";
+    this.code = code;
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+/** One message for {@link BoolEmail.send}. */
+export type BoolEmailMessage = {
+  /** Who to email. Either the literal `"owner"` — the person who built this app,
+   * resolved server-side so their address never ships in the bundle — or the
+   * address of a signed-in end user of this app who has verified their email.
+   * Anything else is refused with `recipient_not_allowed`. */
+  to: string;
+  subject: string;
+  /** PLAIN TEXT; blank lines become paragraphs. There is no HTML field on
+   * purpose — app-authored markup sent from a Bool-signed domain would be a
+   * ready-made phishing kit, so every message renders into one fixed template. */
+  body: string;
+  /** An optional single call to action. `url` must be https. */
+  button?: { label: string; url: string };
+  /** Where replies go. Only the owner's address, or the literal `"owner"`. */
+  replyTo?: string;
+  /** Send-once key. A repeat with the same key returns `{ id: null, duplicate:
+   * true }` instead of sending again — use it when a retry, or a double-clicked
+   * button, must not produce two emails. */
+  idempotencyKey?: string;
+};
+
+/** The result of a send. The message is queued durably: once this resolves, the
+ * platform keeps retrying delivery on its own. */
+export type BoolEmailResult = {
+  /** The queued message's id, or null when nothing new was queued. */
+  id: string | null;
+  /** True when `idempotencyKey` matched a message already queued. */
+  duplicate?: boolean;
+  /** True when the address is on the platform's do-not-mail list (it previously
+   * hard-bounced or reported spam). NOT an error — the send is dropped, because
+   * retrying it would damage deliverability for every Bool app. */
+  suppressed?: boolean;
+};
+
+/** The email battery — send email with NO SMTP setup and NO API key in the app
+ * bundle. Each call routes through the Bool gateway (/_bool/v1/email), which
+ * renders the message, meters the app owner's shared battery credits, and hands
+ * it to a durable outbox. Throws a {@link BoolEmailError} on failure.
+ *
+ * **Who you can email.** Only two kinds of recipient, enforced server-side:
+ *  1. the app's **owner** — pass `to: "owner"`;
+ *  2. a signed-in **end user of this app whose email is verified**.
+ *
+ * An address a visitor merely typed into a form is refused. That's deliberate: an
+ * app that could email anyone would make Bool's sending domain a spam relay, and
+ * the cost of that would land on every other app's mail. */
+export type BoolEmail = {
+  send(msg: BoolEmailMessage): Promise<BoolEmailResult>;
+};
+
 /** The gateway-routed supabase-js client. Loosely typed on the schema-name
  * generic because each Bool runs in its own non-"public" schema. */
 export type BoolDb = SupabaseClient<any, any, any, any, any>;
@@ -197,6 +282,10 @@ export type BoolClient = {
   /** The AI battery: `ai.generate(prompt)` / `ai.generate({prompt, schema})` /
    * `ai.stream(prompt)`. Server-side AI with no API key in the bundle. */
   ai: BoolAi;
+  /** The email battery: `email.send({ to, subject, body })`. No SMTP, no API
+   * key. Can email the app's owner (`to: "owner"`) or a verified user of the
+   * app — see {@link BoolEmail} for why nobody else. */
+  email: BoolEmail;
   /** This app's private Postgres schema name. */
   schema: string;
   /** Subscribe to the app's realtime "doorbell": fires whenever any row in the
@@ -561,9 +650,9 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     },
   };
 
-  // bool.ai battery — POST the prompt to the gateway AI plane
-  // (/_bool/v1/ai/*), which runs it against Bool's provider credential and
-  // meters one AI credit against the app owner. credentials:include + the
+  // Battery planes (bool.ai, bool.email) — POST to /_bool/v1/<battery>/*, which
+  // runs the call against Bool's own server-side credential and meters it
+  // against the app owner's shared battery pool. credentials:include + the
   // viewer/eu-session identity headers mirror the db and users planes so the
   // same live-gate identity flows (same-origin cookie deployed, viewer token
   // cross-origin in preview).
@@ -627,6 +716,55 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
       } finally {
         reader.releaseLock();
       }
+    },
+  };
+
+  // bool.email battery — POST the message to the gateway email plane
+  // (/_bool/v1/email/send), which renders it into Bool's app-mail template,
+  // meters the owner's battery credits, and queues it in a durable outbox. The
+  // plane answers 202 once the message is committed; delivery (and any retries)
+  // happen server-side after that.
+  //
+  // Fields are passed through verbatim rather than validated here: the gateway is
+  // the authority on what's allowed (recipient rule, body limits, https-only
+  // button URL), and a second copy of those rules in the client would inevitably
+  // drift from it — worse, it would reject things a newer gateway allows. What the
+  // client owes the caller is a clear error, which is what BoolEmailError carries.
+  const email: BoolEmail = {
+    async send(msg: BoolEmailMessage): Promise<BoolEmailResult> {
+      const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/email/send`, {
+        method: "POST",
+        headers: aiHeaders(),
+        credentials: "include",
+        body: JSON.stringify({
+          to: msg.to,
+          subject: msg.subject,
+          body: msg.body,
+          button: msg.button,
+          replyTo: msg.replyTo,
+          idempotencyKey: msg.idempotencyKey,
+        }),
+      });
+      let body: any = null;
+      try {
+        body = await res.json();
+      } catch (_) {}
+      if (!res.ok) {
+        throw new BoolEmailError(
+          body?.error ?? "email_failed",
+          res.status,
+          typeof body?.message === "string" ? body.message : null,
+        );
+      }
+      return {
+        id: body?.id ?? null,
+        ...(body?.duplicate ? { duplicate: true as const } : {}),
+        // A suppressed address is a 200, not a throw — it's the platform's
+        // do-not-mail list doing its job, not the app's bug to handle. Surfaced
+        // on the result for apps that want to say "we couldn't reach that
+        // address" rather than silently succeeding.
+        ...(body?.suppressed ? { suppressed: true as const } : {}),
+      };
     },
   };
 
@@ -698,6 +836,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     entities: createEntitiesModule(db, subscribeToChanges),
     auth,
     ai,
+    email,
     schema,
     subscribeToChanges,
   };

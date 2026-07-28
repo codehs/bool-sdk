@@ -5,6 +5,7 @@ import {
   hasDefaultBoolClient,
   isDeploymentSubdomain,
   BoolAiError,
+  BoolEmailError,
   type BoolClientConfig,
 } from "./client";
 
@@ -411,6 +412,127 @@ describe("bool.ai battery", () => {
       });
     const client = createBoolClient({ ...CONFIG, viewerToken: "viewer-123" });
     await client.ai.generate("hi");
+    expect(headersOf(calls[0]!).get("x-bool-viewer")).toBe("viewer-123");
+  });
+});
+
+describe("bool.email battery", () => {
+  const OK = () =>
+    new Response(JSON.stringify({ id: "email_1" }), {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+  const MSG = { to: "owner", subject: "New submission", body: "Someone wrote in." };
+
+  test("send POSTs to the email plane and returns the queued id", async () => {
+    respond = OK;
+    const client = createBoolClient(CONFIG);
+    const out = await client.email.send(MSG);
+    expect(out).toEqual({ id: "email_1" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("https://bool.test/served/my-app/_bool/v1/email/send");
+    expect(calls[0]!.init?.method).toBe("POST");
+    expect(calls[0]!.init?.credentials).toBe("include");
+  });
+
+  test("passes every field through verbatim (the gateway is the authority)", async () => {
+    respond = OK;
+    const client = createBoolClient(CONFIG);
+    await client.email.send({
+      ...MSG,
+      button: { label: "Open", url: "https://app.test/x" },
+      replyTo: "owner",
+      idempotencyKey: "order-42",
+    });
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({
+      to: "owner",
+      subject: "New submission",
+      body: "Someone wrote in.",
+      button: { label: "Open", url: "https://app.test/x" },
+      replyTo: "owner",
+      idempotencyKey: "order-42",
+    });
+  });
+
+  test("the owner sentinel is sent as-is — the address is never in the bundle", async () => {
+    // The whole point of `to: "owner"`: the client cannot know the owner's
+    // address, and resolving it here would mean shipping it to every visitor.
+    respond = OK;
+    const client = createBoolClient(CONFIG);
+    await client.email.send(MSG);
+    expect(JSON.parse(String(calls[0]!.init?.body)).to).toBe("owner");
+  });
+
+  test("throws BoolEmailError carrying status, code and the explanation", async () => {
+    respond = () =>
+      new Response(
+        JSON.stringify({
+          error: "recipient_not_allowed",
+          message: "This app may only email its owner or a verified user.",
+        }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      );
+    const client = createBoolClient(CONFIG);
+    const err = (await client.email
+      .send({ ...MSG, to: "stranger@example.com" })
+      .catch((e) => e)) as BoolEmailError;
+    expect(err).toBeInstanceOf(BoolEmailError);
+    expect(err.status).toBe(403);
+    expect(err.code).toBe("recipient_not_allowed");
+    // The gateway's explanation is what makes this actionable while building —
+    // it must reach the app author, not be swallowed.
+    expect(err.detail).toContain("owner");
+    expect(err.message).toContain("recipient_not_allowed");
+  });
+
+  test("out-of-credits names the shared pool, not this battery", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "out_of_app_credits" }), {
+        status: 402,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.email.send(MSG).catch((e) => e)) as BoolEmailError;
+    expect(err.code).toBe("out_of_app_credits");
+    expect(err.status).toBe(402);
+  });
+
+  test("a non-JSON error body still throws a typed error", async () => {
+    respond = () => new Response("<html>502</html>", { status: 502 });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.email.send(MSG).catch((e) => e)) as BoolEmailError;
+    expect(err).toBeInstanceOf(BoolEmailError);
+    expect(err.code).toBe("email_failed");
+    expect(err.detail).toBeNull();
+  });
+
+  test("a deduped send resolves as a duplicate, not an error", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ id: null, duplicate: true }), {
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    expect(await client.email.send({ ...MSG, idempotencyKey: "k" })).toEqual({
+      id: null,
+      duplicate: true,
+    });
+  });
+
+  test("a suppressed recipient resolves, and says so", async () => {
+    // The do-not-mail list doing its job is not the app's bug — throwing here
+    // would crash an app over one dead address.
+    respond = () =>
+      new Response(JSON.stringify({ id: null, suppressed: true }), {
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    expect(await client.email.send(MSG)).toEqual({ id: null, suppressed: true });
+  });
+
+  test("replays the preview viewer token as x-bool-viewer", async () => {
+    respond = OK;
+    const client = createBoolClient({ ...CONFIG, viewerToken: "viewer-123" });
+    await client.email.send(MSG);
     expect(headersOf(calls[0]!).get("x-bool-viewer")).toBe("viewer-123");
   });
 });

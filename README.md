@@ -45,8 +45,8 @@ tested, and upgradable independently of any one app.
 - **AI battery.** `client.ai` gives a deployed app server-side AI with **no API
   key in the bundle** — calls route through the gateway's AI plane
   (`/_bool/v1/ai`), which runs the prompt against Bool's provider credential and
-  meters one AI credit against the app owner. Returns results directly and throws
-  a `BoolAiError` (with `status` + `code`, e.g. `"out_of_ai_credits"`) on failure:
+  meters the app owner's app-credit pool. Returns results directly and throws
+  a `BoolAiError` (with `status` + `code`, e.g. `"out_of_app_credits"`) on failure:
   ```ts
   const text = await bool.ai.generate("Summarize this review: " + review);
 
@@ -64,6 +64,38 @@ tested, and upgradable independently of any one app.
   for await (const chunk of bool.ai.stream("Write a haiku")) setText((t) => t + chunk);
   ```
   Requires the workspace to be opted into the `bool-ai` server flag.
+- **Email battery.** `client.email` lets a deployed app send email with **no SMTP
+  config and no API key** — calls route through the gateway's email plane
+  (`/_bool/v1/email`), which renders the message, meters the same app-credit pool
+  as `bool.ai`, and queues it in a durable outbox (so a resolved `send` will keep
+  retrying delivery server-side).
+  ```ts
+  await bool.email.send({
+    to: "owner",                    // the person who built this app
+    subject: "New contact form submission",
+    body: `From: ${name}\n\n${message}`,          // plain text; blank lines = paragraphs
+    button: { label: "Open the app", url: appUrl }, // optional, https only
+    replyTo: "owner",                              // optional
+  });
+  ```
+  **Who you can email is enforced server-side**, and it's a short list: the app's
+  **owner** (pass the literal `"owner"`, so their address never ships in the
+  bundle) or a signed-in **end user of this app who has verified their address**.
+  An address a visitor merely typed into a form is refused with
+  `recipient_not_allowed`. That's deliberate — an app that could email anyone
+  would turn Bool's sending domain into a spam relay, and every other app's mail
+  would pay for it.
+
+  There is no HTML body, no attachments and no custom `from`: app-authored markup
+  sent from a Bool-signed domain would be a ready-made phishing kit, so every
+  message renders into one fixed template carrying the app's name.
+
+  Throws a `BoolEmailError` (`status`, `code`, and `detail` — the gateway's
+  human-readable explanation) on failure. Two non-failures resolve normally:
+  `{ duplicate: true }` when an `idempotencyKey` matched an existing send, and
+  `{ suppressed: true }` when the address is on the platform's do-not-mail list
+  (it previously hard-bounced or reported spam). Requires the workspace to be
+  opted into the `bool-email` server flag.
 - **React auth layer** (`bool-sdk/react`): `<BoolAuthProvider>`,
   `useBoolAuth()`, `<AuthGate>`, and the headless `useSignInForm()` state
   machine that login forms bind to.
