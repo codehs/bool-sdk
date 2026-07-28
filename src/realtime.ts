@@ -93,10 +93,25 @@ export function createDoorbell(deps: DoorbellDeps): Doorbell {
     }
   }
 
+  /** Strip everything except {table, op} from a legacy-channel payload.
+   *
+   * The public compat channel is row-data-free by contract — the server sends
+   * only table and op, because anyone with the (public) anon key and the schema
+   * name can join it. But Supabase Realtime INJECTS its own `id` (a message
+   * uuid) into any broadcast payload that lacks one, and that value looks
+   * exactly like a row id to the live store: it would keyed-fetch a row that
+   * doesn't exist, apply nothing, and silently swallow the change. So the
+   * doorbell discards it here rather than trusting the transport's shape —
+   * missing `id` is precisely the signal that makes the store fall back to a
+   * coalesced full reload, which is the correct behavior on this channel. */
+  function legacyPayload(p: BoolChangePayload): BoolChangePayload {
+    return { table: p.table, op: p.op };
+  }
+
   function joinLegacy(myGen: number): void {
     if (myGen !== gen) return;
     const ch = deps.channel(deps.legacyTopic, { private: false });
-    ch.onBroadcast(fanout);
+    ch.onBroadcast((p) => fanout(legacyPayload(p)));
     ch.join(() => {});
     channels.push(ch);
   }
