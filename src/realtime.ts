@@ -23,6 +23,7 @@
 // unit-testable without sockets.
 
 import type { BoolChangePayload } from "./client.js";
+import { onWake } from "./wake.js";
 
 /** What the wristband desk returns. Topic names are SERVER-authored so naming
  * lives in exactly one place. */
@@ -78,6 +79,9 @@ export type DoorbellDeps = {
   /** Test seam; defaults to setTimeout/clearTimeout. */
   schedule?: (fn: () => void, ms: number) => unknown;
   cancel?: (handle: unknown) => void;
+  now?: () => number;
+  /** Subscribe to tab/network wake signals; defaults to the DOM listeners. */
+  wake?: (cb: () => void) => () => void;
 };
 
 // Re-mint at 75% of the TTL: early enough that a slow mint never races token
@@ -89,6 +93,9 @@ const MIN_REFRESH_MS = 30_000;
 // Retry backoff after a refused/failed mint or join: quick first, then capped so
 // a long outage costs one request a minute rather than a hot loop.
 const RETRY_MS = [1_000, 5_000, 15_000, 60_000];
+// `focus` and `visibilitychange` fire together on tab re-selection; coalesce so
+// one wake is one reconnect. See wake.ts for why waking matters at all.
+const WAKE_COALESCE_MS = 500;
 
 export type Doorbell = {
   /** Register a change listener. Starts the machinery on the first listener,
@@ -101,6 +108,8 @@ export type Doorbell = {
 export function createDoorbell(deps: DoorbellDeps): Doorbell {
   const schedule = deps.schedule ?? ((fn, ms) => setTimeout(fn, ms));
   const cancel = deps.cancel ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
+  const now = deps.now ?? (() => Date.now());
+  const subscribeWake = deps.wake ?? onWake;
 
   const listeners = new Set<(p: BoolChangePayload) => void>();
   const fanout = (p: BoolChangePayload) => {
@@ -143,6 +152,23 @@ export function createDoorbell(deps: DoorbellDeps): Doorbell {
       if (myGen !== gen) return;
       void start(myGen);
     }, ms);
+  }
+
+  // ---- wake: come back the instant the tab/network does --------------------
+  // Identical gap to the room lane, and identically invisible: a backgrounded
+  // tab loses its socket, the drop is reported honestly, and then live entity
+  // updates stay dead for up to a minute of backoff. See wake.ts.
+  let stopWake: (() => void) | null = null;
+  let lastWakeAt = -Infinity;
+  function onWakeSignal(): void {
+    if (listeners.size === 0 || state === "live") return;
+    const t = now();
+    if (t - lastWakeAt < WAKE_COALESCE_MS) return;
+    lastWakeAt = t;
+    gen++; // orphan the pending retry and any in-flight start
+    attempt = 0;
+    setStatus("connecting");
+    void start(gen);
   }
 
   async function start(myGen: number): Promise<void> {
@@ -218,14 +244,20 @@ export function createDoorbell(deps: DoorbellDeps): Doorbell {
         gen++;
         attempt = 0;
         setStatus("connecting");
+        stopWake = subscribeWake(onWakeSignal);
         void start(gen);
       }
       return () => {
         if (!listeners.delete(listener)) return;
         if (listeners.size === 0) {
           gen++; // orphan any in-flight start/refresh
+          stopWake?.();
+          stopWake = null;
           teardownChannels();
-          state = "connecting";
+          // setStatus, not a bare assignment: writing `state` directly leaves
+          // every onStatus subscriber holding the stale value, which is how a
+          // torn-down doorbell kept reporting "live". Same bug the room lane had.
+          setStatus("connecting");
         }
       };
     },

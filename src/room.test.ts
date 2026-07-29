@@ -70,11 +70,25 @@ function makeHarness(opts?: {
   let joinCb: ((state: string) => void) | null = null;
   const sent: Array<{ event: string; payload: unknown }> = [];
   let key = "";
+  // Wake signals are injected the same way timers are, so "reconnects the
+  // instant the tab comes back" is testable without a real document.
+  const wakeCbs = new Set<() => void>();
+  let mintCalls = 0;
+
+  const baseMint =
+    opts?.mint ??
+    (async (): Promise<RoomMintResult> => ({
+      ok: true,
+      token: "t",
+      expiresIn: 900,
+      topic: "bool:app_x:room",
+    }));
 
   const deps: RoomDeps = {
-    mint:
-      opts?.mint ??
-      (async () => ({ ok: true, token: "t", expiresIn: 900, topic: "bool:app_x:room" })),
+    mint: () => {
+      mintCalls++;
+      return baseMint();
+    },
     setAuth: () => {},
     channel: (_topic, k) => {
       key = k;
@@ -118,6 +132,10 @@ function makeHarness(opts?: {
       if (i !== -1) timers.splice(i, 1);
     },
     now: () => clock,
+    wake: (cb) => {
+      wakeCbs.add(cb);
+      return () => wakeCbs.delete(cb);
+    },
   };
 
   const store = createRoomStore(deps);
@@ -127,6 +145,12 @@ function makeHarness(opts?: {
     sent,
     advance,
     selfKey: () => key,
+    mintCalls: () => mintCalls,
+    /** Simulate the tab/network coming back. */
+    wake: () => {
+      for (const cb of [...wakeCbs]) cb();
+    },
+    wakeSubs: () => wakeCbs.size,
     // Wait for the store's real handshake (mint → setAuth → channel) instead of
     // a fixed number of microtasks: the number changed when mint gained a
     // timeout race, and a hardcoded tick count silently stopped joining at all.
@@ -448,5 +472,124 @@ describe("room store: recovery (the dead-but-'live' regression)", () => {
     h.store.setMe({ cursor: { x: 2, y: 2 } });
     await h.advance(100);
     expect(h.store.status()).toBe(before);
+  });
+});
+
+describe("bool.room waking up", () => {
+  test("a wake reconnects immediately instead of waiting out the backoff", async () => {
+    // The failure this fixes, observed on a real deployed app: a backgrounded
+    // tab loses its socket, honestly reports OFFLINE, and then sits on the
+    // [1s, 5s, 15s, 60s] ladder. Coming back to a page that says "offline" for
+    // half a minute is indistinguishable from broken.
+    const h = makeHarness();
+    const release = h.store.acquire();
+    await h.join();
+    expect(h.store.status()).toBe("live");
+
+    // Burn through the early rungs so the next scheduled retry is far away.
+    for (let i = 0; i < 3; i++) {
+      h.fire("CLOSED");
+      await h.advance(20_000);
+    }
+    h.fire("CLOSED");
+    await h.advance(0);
+    expect(h.store.status()).toBe("unavailable");
+    const beforeWake = h.mintCalls();
+
+    // No clock advance at all: the reconnect must not be waiting on a timer.
+    h.wake();
+    await h.advance(0);
+    expect(h.mintCalls()).toBe(beforeWake + 1);
+    await h.join();
+    expect(h.store.status()).toBe("live");
+    release();
+  });
+
+  test("a wake while live does nothing (no churn on every tab focus)", async () => {
+    const h = makeHarness();
+    const release = h.store.acquire();
+    await h.join();
+    const before = h.mintCalls();
+    h.wake();
+    await h.advance(0);
+    expect(h.mintCalls()).toBe(before);
+    expect(h.store.status()).toBe("live");
+    release();
+  });
+
+  test("simultaneous wake signals coalesce into one reconnect", async () => {
+    // focus + visibilitychange + online all fire on the same tab re-selection.
+    const h = makeHarness();
+    const release = h.store.acquire();
+    await h.join();
+    h.fire("CLOSED");
+    await h.advance(0);
+    const before = h.mintCalls();
+    h.wake();
+    h.wake();
+    h.wake();
+    await h.advance(0);
+    expect(h.mintCalls()).toBe(before + 1);
+    release();
+  });
+
+  test("a later wake still works once the coalescing window has passed", async () => {
+    const h = makeHarness();
+    const release = h.store.acquire();
+    await h.join();
+    h.fire("CLOSED");
+    await h.advance(0);
+    h.wake();
+    await h.advance(0);
+    const after = h.mintCalls();
+    h.fire("CLOSED");
+    await h.advance(600); // past WAKE_COALESCE_MS
+    const beforeSecond = h.mintCalls();
+    h.wake();
+    await h.advance(0);
+    expect(h.mintCalls()).toBe(beforeSecond + 1);
+    expect(h.mintCalls()).toBeGreaterThan(after);
+    release();
+  });
+
+  test("wake listeners are released with the last hook (no leak, no zombie)", async () => {
+    const h = makeHarness();
+    expect(h.wakeSubs()).toBe(0);
+    const a = h.store.acquire();
+    const b = h.store.acquire();
+    await h.join();
+    expect(h.wakeSubs()).toBe(1); // ref-counted, one subscription total
+    a();
+    expect(h.wakeSubs()).toBe(1);
+    b();
+    expect(h.wakeSubs()).toBe(0);
+
+    // And a wake after full release must not resurrect anything.
+    const before = h.mintCalls();
+    h.wake();
+    await h.advance(100);
+    expect(h.mintCalls()).toBe(before);
+  });
+});
+
+describe("bool.room broadcast size limit", () => {
+  test("measures UTF-8 bytes, not UTF-16 code units", async () => {
+    // `JSON.stringify(x).length` counts code units, so a payload of multi-byte
+    // characters measured at a third of what it actually sends — waving through
+    // an over-limit message for the server to drop silently, which is the exact
+    // failure the guard exists to name.
+    const h = makeHarness();
+    const release = h.store.acquire();
+    await h.join();
+
+    // 25k emoji: 50k UTF-16 code units (under the 60k limit by the old check)
+    // but 100k UTF-8 bytes (over it).
+    const emoji = "🎉".repeat(25_000);
+    expect(JSON.stringify({ f: "x", d: emoji }).length).toBeLessThan(60_000);
+    expect(() => h.store.broadcast("party", emoji)).toThrow(/over the 60000-byte/);
+
+    // Plain ASCII of the same code-unit length is genuinely under and allowed.
+    expect(() => h.store.broadcast("party", "a".repeat(50_000))).not.toThrow();
+    release();
   });
 });

@@ -27,6 +27,8 @@
 // merged into entity state as trusted server data; the server's send policy is
 // scoped so a client cannot publish there, and this module must never try.
 
+import { onWake } from "./wake.js";
+
 export type RoomStatus = "connecting" | "live" | "unauthorized" | "unavailable";
 
 /** One other person in the room. `presence` is Partial on purpose: someone who
@@ -79,6 +81,8 @@ export type RoomDeps = {
   schedule?: (fn: () => void, ms: number) => unknown;
   cancel?: (handle: unknown) => void;
   now?: () => number;
+  /** Subscribe to tab/network wake signals; defaults to the DOM listeners. */
+  wake?: (cb: () => void) => () => void;
 };
 
 // Presence writes coalesce on a trailing edge so the FINAL position always
@@ -97,6 +101,10 @@ const MIN_REFRESH_MS = 30_000;
 // Realtime rejects large messages; failing loudly here names the actual
 // problem instead of a silent server-side drop.
 const MAX_PAYLOAD_BYTES = 60_000;
+// `focus` and `visibilitychange` fire together when a tab is re-selected, and
+// `online` can pile on. Without a window, one wake would restart the handshake
+// two or three times.
+const WAKE_COALESCE_MS = 500;
 
 // 12 distinguishable hues; index by a stable hash of the peer id so every
 // client computes the same color for the same peer.
@@ -105,6 +113,22 @@ export function colorForId(id: string): string {
   let h = 0;
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
   return `hsl(${HUES[Math.abs(h) % HUES.length]} 85% 55%)`;
+}
+
+// The wire limit is BYTES, and `String.length` counts UTF-16 code units — so a
+// string of emoji or CJK measures at roughly half to a third of what it actually
+// sends. Measuring the encoded form is the only correct check; the previous
+// `.length` version would wave through a payload well over the limit and let the
+// server drop it silently, which is the exact failure the guard exists to name.
+function byteLength(s: string): number {
+  if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(s).length;
+  // Old/exotic runtime: count UTF-8 bytes directly rather than lie.
+  let bytes = 0;
+  for (const ch of s) {
+    const cp = ch.codePointAt(0)!;
+    bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+  }
+  return bytes;
 }
 
 function newTabId(): string {
@@ -166,6 +190,7 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
   let trackTimer: unknown = null;
   let lastTrackAt = 0;
   const now = deps.now ?? (() => Date.now());
+  const subscribeWake = deps.wake ?? onWake;
 
   function pushTrack(): void {
     if (!channel) return;
@@ -241,6 +266,27 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
       if (myGen !== gen) return;
       void start(myGen);
     }, ms);
+  }
+
+  // ---- wake: come back the instant the tab/network does --------------------
+  // Waiting out the backoff after the ordinary switch-tabs-and-return case is
+  // what makes a working room look broken (see wake.ts). A wake resets the
+  // ladder and reconnects now.
+  let stopWake: (() => void) | null = null;
+  let lastWakeAt = -Infinity;
+  function onWakeSignal(): void {
+    // Nothing mounted: no connection to restore. Already live: the socket is
+    // fine, and one that is secretly dead reports its own close on wake and
+    // lands in retry() — which the NEXT wake signal, or the 1s first rung,
+    // picks up. Reconnecting a live room on every tab focus would churn.
+    if (holds === 0 || state === "live") return;
+    const t = now();
+    if (t - lastWakeAt < WAKE_COALESCE_MS) return;
+    lastWakeAt = t;
+    gen++; // orphan the pending retry and any in-flight start
+    attempt = 0;
+    setStatus("connecting");
+    void start(gen);
   }
 
   async function start(myGen: number): Promise<void> {
@@ -332,6 +378,7 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
         gen++;
         attempt = 0;
         setStatus("connecting");
+        stopWake = subscribeWake(onWakeSignal);
         void start(gen);
       }
       let released = false;
@@ -341,6 +388,8 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
         holds--;
         if (holds === 0) {
           gen++;
+          stopWake?.();
+          stopWake = null;
           teardown();
           // setStatus, never a bare assignment: a direct write leaves every
           // useSyncExternalStore subscriber holding a stale snapshot, which is
@@ -378,7 +427,7 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
     },
     broadcast(event, data) {
       const envelope = { f: self.id, d: data };
-      const size = JSON.stringify(envelope)?.length ?? 0;
+      const size = byteLength(JSON.stringify(envelope) ?? "");
       if (size > MAX_PAYLOAD_BYTES) {
         throw new Error(
           `bool.room.broadcast("${event}") payload is ${size} bytes — over the ${MAX_PAYLOAD_BYTES}-byte realtime limit. ` +

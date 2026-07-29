@@ -21,7 +21,9 @@ type FakeChannel = {
   status: ((s: string) => void) | null;
 };
 
-function makeHarness(opts: { mints?: MintResult[] } = {}) {
+function makeHarness(
+  opts: { mints?: MintResult[]; onStatus?: (s: DoorbellStatus) => void } = {},
+) {
   const mints = [...(opts.mints ?? [])];
   const h = {
     channels: [] as FakeChannel[],
@@ -42,7 +44,14 @@ function makeHarness(opts: { mints?: MintResult[] } = {}) {
       }
     },
     live: () => h.channels.filter((c) => c.joined && !c.left),
+    /** Simulate the tab/network coming back. */
+    wake: () => {
+      for (const cb of [...wakeCbs]) cb();
+    },
+    wakeSubs: () => wakeCbs.size,
+    clock: 0,
   };
+  const wakeCbs = new Set<() => void>();
   const deps: DoorbellDeps = {
     async mint(): Promise<MintResult> {
       h.mintCalls++;
@@ -74,6 +83,12 @@ function makeHarness(opts: { mints?: MintResult[] } = {}) {
     },
     cancel(handle) {
       (handle as { cancelled: boolean }).cancelled = true;
+    },
+    onStatus: opts.onStatus,
+    now: () => h.clock,
+    wake(cb) {
+      wakeCbs.add(cb);
+      return () => wakeCbs.delete(cb);
     },
   };
   return { h, doorbell: createDoorbell(deps) };
@@ -272,5 +287,84 @@ describe("createDoorbell: failure is surfaced, not disguised", () => {
     await tick();
     expect(h.authed).toEqual(["tok-1", "tok-2"]);
     expect(h.live()).toHaveLength(2);
+  });
+});
+
+describe("doorbell waking up", () => {
+  test("a wake reconnects immediately instead of waiting out the backoff", async () => {
+    // Same gap the room lane had: a backgrounded tab loses its socket, the drop
+    // is reported honestly, and then live entity updates stay dead for up to a
+    // minute of backoff on a page the user is looking at.
+    const { h, doorbell } = makeHarness({ mints: [{ ok: false, reason: "unavailable" }] });
+    const off = doorbell.subscribe(() => {});
+    await tick();
+    expect(doorbell.status()).toBe("unavailable");
+    const before = h.mintCalls;
+
+    // No timer is run: the reconnect must not depend on the retry rung.
+    h.wake();
+    await tick();
+    expect(h.mintCalls).toBe(before + 1);
+    off();
+  });
+
+  test("a wake while live does nothing", async () => {
+    const { h, doorbell } = makeHarness({ mints: [MINT] });
+    const off = doorbell.subscribe(() => {});
+    await tick();
+    h.channels[0]!.status!("SUBSCRIBED");
+    expect(doorbell.status()).toBe("live");
+    const before = h.mintCalls;
+    h.wake();
+    await tick();
+    expect(h.mintCalls).toBe(before);
+    off();
+  });
+
+  test("simultaneous wake signals coalesce into one reconnect", async () => {
+    const { h, doorbell } = makeHarness({ mints: [{ ok: false, reason: "unavailable" }] });
+    const off = doorbell.subscribe(() => {});
+    await tick();
+    const before = h.mintCalls;
+    h.wake();
+    h.wake();
+    h.wake();
+    await tick();
+    expect(h.mintCalls).toBe(before + 1);
+    off();
+  });
+
+  test("wake listeners are released with the last subscriber", async () => {
+    const { h, doorbell } = makeHarness({ mints: [{ ok: false, reason: "unavailable" }] });
+    expect(h.wakeSubs()).toBe(0);
+    const a = doorbell.subscribe(() => {});
+    const b = doorbell.subscribe(() => {});
+    await tick();
+    expect(h.wakeSubs()).toBe(1); // one shared doorbell, one subscription
+    a();
+    expect(h.wakeSubs()).toBe(1);
+    b();
+    expect(h.wakeSubs()).toBe(0);
+
+    const before = h.mintCalls;
+    h.wake();
+    await tick();
+    expect(h.mintCalls).toBe(before);
+  });
+
+  test("the last unsubscribe NOTIFIES the status reset, it does not just assign it", async () => {
+    // A bare `state = "connecting"` leaves every onStatus subscriber holding
+    // "live" for a doorbell that has been torn down — the same stale-snapshot
+    // bug the room lane had, and invisible through status() alone.
+    const seen: DoorbellStatus[] = [];
+    const { h, doorbell } = makeHarness({ mints: [MINT], onStatus: (s) => seen.push(s) });
+    const off = doorbell.subscribe(() => {});
+    await tick();
+    h.channels[0]!.status!("SUBSCRIBED");
+    expect(doorbell.status()).toBe("live");
+    seen.length = 0;
+    off();
+    expect(doorbell.status()).toBe("connecting");
+    expect(seen).toEqual(["connecting"]); // the notification, not just the field
   });
 });
