@@ -4,41 +4,43 @@
 // everything that must survive a reload; this is for everything that only
 // matters while people are here together.
 //
-// Design decisions (2026-07-29, from a three-way design review — see the
-// platform's docs/2026-07-ephemeral-broadcast.md for the full record):
-//   - Named `room`, not `live`: "live" already means the DURABLE lane
-//     everywhere in this SDK (LiveEntityStore, "Live data" in the prompt), and
-//     a name on both sides of the durable/ephemeral split is how data ends up
-//     in the wrong lane. A room is who's here right now; nobody expects a room
-//     to survive a reload.
+// This module is a PURE CONSUMER: it contains zero connection code. The
+// mint/refresh/backoff/wake/teardown machinery lives in session.ts (shared
+// with the entity doorbell), and this store registers one ChannelGroup per
+// room. Before the split, this file carried its own copy of that machine and
+// the copies drifted — see session.ts's header for the receipts.
+//
+// Design decisions that survived a week of production fires (full record:
+// the platform's docs/2026-07-ephemeral-broadcast.md §9–§10):
 //   - MEMBERSHIP rides Supabase presence (auto-clears on disconnect — no
 //     hand-rolled heartbeats, no ghost cursors), but STATE rides broadcast.
-//     Presence is a server-side CRDT built for low-frequency state, and it
-//     falls over at cursor frequency: measured on real infra, 3 movers at 40Hz
-//     had their `track()` calls stop being acknowledged within a second (5 acks
-//     per mover, then 10s timeouts), while the identical 120 msg/s over
-//     broadcast delivered 97–100% at ~10ms, sustained. Worse, treating those
-//     timeouts as channel failure caused a reconnect storm — the UI flapped
-//     between "N people here" and "live view unavailable". So: one `track({})`
-//     per join for who's-here, and `setMe` state flows as throttled full-state
-//     broadcasts on a reserved event, fire-and-forget. Full state (not deltas)
-//     makes drops harmless — the next send heals everything.
-//   - The throttle lives HERE, not in app code: a prompt rule asking the model
-//     to throttle is forgettable; a setter that throttles isn't.
+//     Presence is a server-side CRDT built for low-frequency state and it
+//     froze at 3 movers × 40Hz (track acks stopped inside a second); the
+//     identical load over broadcast delivered 97–100% at ~10ms. So: one
+//     `track({})` per join for who's-here, and `setMe` state flows as
+//     throttled FULL-state broadcasts on the reserved `~me` event,
+//     fire-and-forget — drops are healed by the next send.
+//   - The throttle lives HERE, not in app code: a prompt rule asking the
+//     model to throttle is forgettable; a setter that throttles isn't.
+//   - Inbound coalesces to one emit per ~frame with STABLE peer identities —
+//     otherwise every useOthers subscriber re-renders per message, and a
+//     memoized cursor re-renders because someone else moved.
 //   - Broadcast echoes to the SENDER locally and synchronously (never a round
-//     trip): one code path for "everyone sees the reaction, including me",
-//     with zero self-latency. The wire copy is filtered by sender id.
+//     trip): one code path for "everyone sees it, including me".
 //   - Peer colors derive from peer ids (same hash on every client), so every
 //     viewer agrees on everyone's color with nothing transmitted.
+//   - Named rooms scope the topic (`bool:<schema>:room:<id>`); the default
+//     room is the bare topic. Same wristband — the schema is the boundary.
 //
-// SECURITY: this module publishes ONLY to the dedicated room topic
-// (`bool:<schema>:room`), never to the doorbell topics. Doorbell messages are
-// merged into entity state as trusted server data; the server's send policy is
-// scoped so a client cannot publish there, and this module must never try.
+// SECURITY: this module publishes ONLY to the dedicated room topic family
+// (`bool:<schema>:room[:<id>]`), never to the doorbell topics. Doorbell
+// messages are merged into entity state as trusted server data; the server's
+// send policy is scoped so a client cannot publish there, and this module
+// must never try.
 
-import { onWake } from "./wake.js";
+import type { RealtimeSession, SessionChannel, SessionStatus } from "./session.js";
 
-export type RoomStatus = "connecting" | "live" | "unauthorized" | "unavailable";
+export type RoomStatus = SessionStatus;
 
 /** One other person in the room. `presence` is Partial on purpose: someone who
  * just joined has set nothing yet, so every field read must survive absence —
@@ -57,43 +59,6 @@ export type RoomEvent<T = unknown> = {
   data: T;
 };
 
-/** Result of one wristband mint (same desk the doorbell uses). */
-export type RoomMintResult =
-  | { ok: true; token: string; expiresIn: number; topic: string | null }
-  | { ok: false; reason: "unauthorized" | "unavailable" };
-
-/** The transport seam — everything effectful is injected so the machine and
- * store are unit-testable without sockets (same discipline as realtime.ts). */
-export type RoomChannel = {
-  /** Publish my full presence state (Supabase `track`). Reports the outcome:
-   * supabase-js RESOLVES with the string "ok" | "timed out" | "error" rather
-   * than throwing, so a `void`-ed call swallows every failure — which is how a
-   * dead channel went unnoticed while the UI still said "live". */
-  track(state: Record<string, unknown>, done?: (result: string) => void): void;
-  /** Presence changed (sync/join/leave) — `states` is keyed by presence key. */
-  onPresence(cb: (states: Record<string, Array<Record<string, unknown>>>) => void): void;
-  /** Receive one broadcast envelope. */
-  onBroadcast(cb: (msg: { event: string; payload: unknown }) => void): void;
-  /** Send one broadcast envelope. Same outcome contract as `track`. */
-  send(event: string, payload: unknown, done?: (result: string) => void): void;
-  join(status: (state: string) => void): void;
-  leave(): void;
-};
-
-export type RoomDeps = {
-  mint(): Promise<RoomMintResult>;
-  setAuth(token: string): Promise<void> | void;
-  /** Create (not join) the private room channel; `key` is this tab's presence key. */
-  channel(topic: string, key: string): RoomChannel;
-  onStatus?: (status: RoomStatus) => void;
-  /** Test seams; default to timers. */
-  schedule?: (fn: () => void, ms: number) => unknown;
-  cancel?: (handle: unknown) => void;
-  now?: () => number;
-  /** Subscribe to tab/network wake signals; defaults to the DOM listeners. */
-  wake?: (cb: () => void) => () => void;
-};
-
 // State sends coalesce on a trailing edge so the FINAL position always lands.
 // 16ms ≈ 60/s — one send per frame, the ceiling a 60fps screen can show.
 const TRACK_THROTTLE_MS = 16;
@@ -105,41 +70,38 @@ const ME_EVENT = "~me";
 // hydrates immediately instead of waiting for everyone's next move. Jittered
 // so N peers don't stampede the channel in the same tick.
 const HYDRATE_JITTER_MS = 300;
+// Inbound coalescing: a room of movers can deliver hundreds of ~me messages a
+// second; one emit per ~frame is all a screen can show anyway.
+const EMIT_COALESCE_MS = 16;
+// Realtime rejects large messages; failing loudly here names the actual
+// problem instead of a silent server-side drop.
+const MAX_PAYLOAD_BYTES = 60_000;
+
 /** Per-message fan-out is O(peers), so the whole room's wire cost grows with
  * peers². Scale the send interval so a big room degrades to slower cursors
- * instead of a saturated channel — but gently: the first version of this curve
- * (`n(n-1)` ms) throttled a 10-person room to 11Hz, and a real 9-spectator
- * demo room measured p50=96ms — most of it spent waiting in our own throttle.
- * "Laggy by design" is not a rate limit worth having. This curve budgets total
- * fan-out at ~8000 msg/s (the tenant ceiling on Bool's user-apps projects is
- * raised to 10k events/s to hold 60Hz — a fresh Supabase project defaults to
- * far less, so self-hosters hit the curve sooner, not a broken room): full
- * 60Hz through 10 people, ~37Hz at 15, ~21Hz at 20. */
+ * instead of a saturated channel. Budgeted against the raised tenant ceiling
+ * on Bool's user-apps projects (10k events/s): full 60Hz through 10 people,
+ * ~37Hz at 15, ~21Hz at 20. */
 export function throttleForPeers(othersCount: number): number {
   const n = othersCount + 1;
   const budgetMs = Math.ceil((n * (n - 1)) / 8);
   return Math.max(TRACK_THROTTLE_MS, budgetMs);
 }
-// Inbound coalescing: a room of movers can deliver hundreds of ~me messages a
-// second, and re-emitting per message turns every useOthers subscriber into a
-// per-message re-render. One emit per ~frame is all a screen can show anyway.
-const EMIT_COALESCE_MS = 16;
-// Same shape/limits as the doorbell: quick first retry, capped so an outage
-// costs one request a minute, refresh at 75% of the wristband TTL.
-const RETRY_MS = [1_000, 5_000, 15_000, 60_000];
-// A mint that never settles would wedge the machine: no channel, no status
-// change, no retry — indistinguishable from "live" to anything watching. Cap it
-// and treat a stall as an ordinary unavailable, which retries.
-const MINT_TIMEOUT_MS = 10_000;
-const REFRESH_FRACTION = 0.75;
-const MIN_REFRESH_MS = 30_000;
-// Realtime rejects large messages; failing loudly here names the actual
-// problem instead of a silent server-side drop.
-const MAX_PAYLOAD_BYTES = 60_000;
-// `focus` and `visibilitychange` fire together when a tab is re-selected, and
-// `online` can pile on. Without a window, one wake would restart the handshake
-// two or three times.
-const WAKE_COALESCE_MS = 500;
+
+/** Room ids become topic suffixes, so the charset is the policy's charset.
+ * Loud rejection beats silent normalization: a normalized id would put two
+ * "different" ids in one room. */
+export const ROOM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:_.-]{0,63}$/;
+export function validateRoomId(id: string): string {
+  if (!ROOM_ID_RE.test(id)) {
+    throw new Error(
+      `bool.room("${id}"): a room id is 1–64 characters of letters, digits, ` +
+        `":", "_", ".", or "-" (starting with a letter or digit). ` +
+        `Derive it from your own data — bool.room(\`game:\${gameId}\`).`,
+    );
+  }
+  return id;
+}
 
 // 12 distinguishable hues; index by a stable hash of the peer id so every
 // client computes the same color for the same peer.
@@ -154,13 +116,10 @@ export function colorForId(id: string): string {
 }
 
 // The wire limit is BYTES, and `String.length` counts UTF-16 code units — so a
-// string of emoji or CJK measures at roughly half to a third of what it actually
-// sends. Measuring the encoded form is the only correct check; the previous
-// `.length` version would wave through a payload well over the limit and let the
-// server drop it silently, which is the exact failure the guard exists to name.
+// string of emoji or CJK measures at roughly half to a third of what it
+// actually sends. Measuring the encoded form is the only correct check.
 function byteLength(s: string): number {
   if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(s).length;
-  // Old/exotic runtime: count UTF-8 bytes directly rather than lie.
   let bytes = 0;
   for (const ch of s) {
     const cp = ch.codePointAt(0)!;
@@ -179,8 +138,8 @@ function newTabId(): string {
 
 export type RoomStore<P = Record<string, unknown>> = {
   self: { id: string; color: string };
-  /** Ref-count the machinery: first acquire connects, last release tears down.
-   * Every React hook acquires on mount. */
+  /** Ref-count the machinery: first acquire registers with the session, last
+   * release unregisters. Every React hook acquires on mount. */
   acquire(): () => void;
   status(): RoomStatus;
   onStatus(cb: (s: RoomStatus) => void): () => void;
@@ -195,14 +154,28 @@ export type RoomStore<P = Record<string, unknown>> = {
   onEvent(cb: (event: string, e: RoomEvent) => void): () => void;
 };
 
-export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): RoomStore<P> {
+export type RoomStoreDeps = {
+  session: RealtimeSession;
+  /** null = the app-wide default room; a string scopes the topic. */
+  roomId: string | null;
+  /** Create (not join) the private room channel; `key` is this tab's presence
+   * key. The session joins it with its own guarded status callback. */
+  makeChannel(topic: string, key: string): SessionChannel;
+  /** Test seams for the throttle/coalesce timers; default to timers. */
+  schedule?: (fn: () => void, ms: number) => unknown;
+  cancel?: (handle: unknown) => void;
+  now?: () => number;
+};
+
+export function createRoomStore<P = Record<string, unknown>>(deps: RoomStoreDeps): RoomStore<P> {
   const schedule = deps.schedule ?? ((fn, ms) => setTimeout(fn, ms));
   const cancel = deps.cancel ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
+  const now = deps.now ?? (() => Date.now());
 
   const self = { id: newTabId(), color: "" };
   self.color = colorForId(self.id);
 
-  // ---- reactive bits -------------------------------------------------------
+  // ---- reactive bits --------------------------------------------------------
   let others: ReadonlyArray<RoomPeer<P>> = [];
   const othersListeners = new Set<() => void>();
   const emitOthers = () => {
@@ -214,7 +187,6 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
   function setStatus(next: RoomStatus): void {
     if (state === next) return;
     state = next;
-    deps.onStatus?.(next);
     for (const l of statusListeners) l(next);
   }
 
@@ -223,27 +195,16 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
     for (const l of eventListeners) l(event, e);
   };
 
-  // ---- my state: merge + trailing-edge throttle, published over broadcast --
-  const myState: Record<string, unknown> = {};
-  let trackTimer: unknown = null;
-  let lastTrackAt = 0;
-  const now = deps.now ?? (() => Date.now());
-  const subscribeWake = deps.wake ?? onWake;
-
-  // Peer state assembled from two lanes: presence gives MEMBERSHIP (who's
-  // connected, auto-cleared on disconnect) plus any state old-SDK peers still
-  // put in their presence meta; ~me broadcasts give current-SDK peers' state.
-  // A peer's visible presence = meta overlaid with its last ~me. Both maps are
-  // keyed by peer id; membership is authoritative — state without membership
-  // is dropped (its owner disconnected).
+  // ---- peers: membership (presence) ∪ state (~me broadcasts) ---------------
+  // Membership is authoritative — state whose owner left is dropped, which is
+  // what auto-clears a closed tab's cursor. Old-SDK peers still put state in
+  // their presence meta, so meta is overlaid under ~me state for mixed rooms.
   let memberMeta = new Map<string, Record<string, unknown>>();
   const stateById = new Map<string, Record<string, unknown>>();
 
   // Stable peer identities: a peer whose inputs didn't change keeps the SAME
   // object between rebuilds, so a memoized <Cursor peer={o}/> for a still
-  // person doesn't re-render because someone ELSE moved. Keyed by the exact
-  // references that feed the merge — a new ~me replaces the state ref, a
-  // presence diff replaces the meta ref.
+  // person doesn't re-render because someone ELSE moved.
   const peerCache = new Map<
     string,
     { meta: Record<string, unknown>; state: Record<string, unknown> | undefined; peer: RoomPeer<P> }
@@ -253,15 +214,15 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
     const next: Array<RoomPeer<P>> = [];
     for (const [id, meta] of memberMeta) {
       if (id === self.id) continue; // others NEVER includes you
-      const state = stateById.get(id);
+      const peerState = stateById.get(id);
       const cached = peerCache.get(id);
-      if (cached && cached.meta === meta && cached.state === state) {
+      if (cached && cached.meta === meta && cached.state === peerState) {
         next.push(cached.peer);
         continue;
       }
-      const presence = { ...meta, ...state };
+      const presence = { ...meta, ...peerState };
       const peer: RoomPeer<P> = { id, color: colorForId(id), presence: presence as Partial<P> };
-      peerCache.set(id, { meta, state, peer });
+      peerCache.set(id, { meta, state: peerState, peer });
       next.push(peer);
     }
     for (const id of peerCache.keys()) {
@@ -292,29 +253,23 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
     }, EMIT_COALESCE_MS - elapsed);
   }
 
+  // ---- my state: merge + trailing-edge throttle, published over broadcast --
+  const myState: Record<string, unknown> = {};
+  let channel: SessionChannel | null = null;
+  let joined = false;
+  let trackTimer: unknown = null;
+  let lastTrackAt = 0;
+
   /** Publish my full state now, fire-and-forget. Full state, not a delta:
    * drops are healed by the next send, and a late joiner needs one message,
-   * not a replay. No ack — at cursor frequency, waiting on per-message acks is
-   * what melted the presence transport. */
+   * not a replay. No ack — at cursor frequency, waiting on per-message acks
+   * is what melted the presence transport. */
   function pushMe(): void {
     if (!channel || !joined) return;
     lastTrackAt = now();
     channel.send(ME_EVENT, { f: self.id, s: { ...myState } });
   }
 
-  /** A live channel turned out not to be live. Tear it down and reconnect with
-   * backoff, reporting the honest status on the way. Guarded so several
-   * failures in one generation collapse into one restart. */
-  function unhealthy(why: string): void {
-    if (holds === 0) return; // nobody is watching; acquire() will start fresh
-    if (typeof console !== "undefined") {
-      console.warn(`bool.room: reconnecting (${why}).`);
-    }
-    gen++;
-    const myGen = gen;
-    teardown();
-    retry(myGen, "unavailable");
-  }
   function scheduleMe(): void {
     if (!channel || !joined) return; // replayed on join instead
     const throttle = throttleForPeers(others.length);
@@ -340,225 +295,110 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
     }, jitter);
   }
 
-  // ---- connection machine (gen/backoff/refresh, doorbell-style) ------------
+  function clearLocalTimers(): void {
+    for (const t of [trackTimer, hydrateTimer, emitTimer]) if (t !== null) cancel(t);
+    trackTimer = hydrateTimer = emitTimer = null;
+  }
+
+  // ---- the channel group (all connection logic lives in the session) -------
+  const group = {
+    topics(t: { room: string | null }): string[] {
+      // A platform that predates the room lane has no room topic; returning []
+      // makes the session report this group "unavailable" (retried on every
+      // reconnect, so a platform deploy turns it on without a reload).
+      if (!t.room) return [];
+      return [deps.roomId === null ? t.room : `${t.room}:${deps.roomId}`];
+    },
+    open(topic: string): SessionChannel {
+      const ch = deps.makeChannel(topic, self.id);
+      ch.onPresence((states) => {
+        const nextMeta = new Map<string, Record<string, unknown>>();
+        let sawNewMember = false;
+        for (const [key, metas] of Object.entries(states)) {
+          // Supabase keeps one meta per connection under the key; last wins.
+          const meta = metas[metas.length - 1] ?? {};
+          const { presence_ref: _ref, ...rest } = meta as Record<string, unknown>;
+          nextMeta.set(key, rest);
+          if (key !== self.id && !memberMeta.has(key)) sawNewMember = true;
+        }
+        for (const id of stateById.keys()) {
+          if (!nextMeta.has(id)) stateById.delete(id);
+        }
+        memberMeta = nextMeta;
+        rebuildOthers();
+        // Someone new arrived: re-send my state once (jittered) so they see
+        // me now instead of on my next move.
+        if (sawNewMember) scheduleHydrate();
+      });
+      ch.onBroadcast((msg) => {
+        if (msg.event === ME_EVENT) {
+          const env = (msg.payload ?? {}) as { f?: string; s?: Record<string, unknown> };
+          if (!env.f || env.f === self.id) return;
+          // State can outrun membership by a beat (broadcast delivers before
+          // the presence diff); hold it either way — rebuildOthers keys off
+          // membership, so it shows the moment the member appears.
+          stateById.set(env.f, env.s ?? {});
+          if (memberMeta.has(env.f)) rebuildOthers();
+          return;
+        }
+        const env = (msg.payload ?? {}) as { f?: string; d?: unknown };
+        if (env.f === self.id) return; // already delivered locally, synchronously
+        dispatch(msg.event, { from: env.f ?? "", data: env.d });
+      });
+      channel = ch;
+      return ch;
+    },
+    onJoin(): void {
+      joined = true;
+      // ONE membership beacon per join — presence carries who's-here, never
+      // state. At one-per-join a failure can't melt into the reconnect storm
+      // the per-move version caused; a genuinely dead channel reports its own
+      // terminal state, which the session heals.
+      channel?.track({}, (result) => {
+        if (result !== "ok" && typeof console !== "undefined") {
+          console.warn("bool.room: presence join beacon failed; peers may not see you until the next reconnect.");
+        }
+      });
+      // Join/rejoin replays my current state so a reconnect (or a late first
+      // join) never leaves me invisible.
+      pushMe();
+    },
+    onDown(): void {
+      channel = null;
+      joined = false;
+      clearLocalTimers();
+      memberMeta = new Map();
+      stateById.clear();
+      peerCache.clear();
+      if (others.length > 0) {
+        others = [];
+        // Direct, not coalesced: "the room emptied" must never be absorbed
+        // into a cancelled trailing edge.
+        emitOthers();
+      }
+    },
+    onStatus(s: SessionStatus): void {
+      setStatus(s);
+    },
+  };
+
+  // ---- public surface --------------------------------------------------------
   let holds = 0;
-  let gen = 0;
-  let channel: RoomChannel | null = null;
-  let joined = false;
-  let timer: unknown = null;
-  let attempt = 0;
-
-  function clearTimer(): void {
-    if (timer !== null) {
-      cancel(timer);
-      timer = null;
-    }
-  }
-  function teardown(): void {
-    // Null the reference BEFORE leaving. supabase's removeChannel fires the
-    // channel's own status callback with CLOSED — synchronously, from inside
-    // leave() — and the terminal-state handler tears down in response. With the
-    // old order (leave first, null after) that re-entered here while `channel`
-    // still pointed at the same channel: leave → CLOSED → teardown → leave → …
-    // a stack overflow on every real network drop. The handler's
-    // channel-identity guard is the other half of this fix.
-    const ch = channel;
-    channel = null;
-    joined = false;
-    ch?.leave();
-    clearTimer();
-    if (trackTimer !== null) {
-      cancel(trackTimer);
-      trackTimer = null;
-    }
-    if (hydrateTimer !== null) {
-      cancel(hydrateTimer);
-      hydrateTimer = null;
-    }
-    if (emitTimer !== null) {
-      cancel(emitTimer);
-      emitTimer = null;
-    }
-    memberMeta = new Map();
-    stateById.clear();
-    peerCache.clear();
-    if (others.length > 0) {
-      others = [];
-      // Direct, not coalesced: "the room emptied" must never be absorbed into
-      // a cancelled trailing edge.
-      emitOthers();
-    }
-  }
-  function retry(myGen: number, why: RoomStatus): void {
-    setStatus(why);
-    const ms = RETRY_MS[Math.min(attempt, RETRY_MS.length - 1)]!;
-    attempt++;
-    timer = schedule(() => {
-      if (myGen !== gen) return;
-      void start(myGen);
-    }, ms);
-  }
-
-  // ---- wake: come back the instant the tab/network does --------------------
-  // Waiting out the backoff after the ordinary switch-tabs-and-return case is
-  // what makes a working room look broken (see wake.ts). A wake resets the
-  // ladder and reconnects now.
-  let stopWake: (() => void) | null = null;
-  let lastWakeAt = -Infinity;
-  function onWakeSignal(): void {
-    // Nothing mounted: no connection to restore. Already live: the socket is
-    // fine, and one that is secretly dead reports its own close on wake and
-    // lands in retry() — which the NEXT wake signal, or the 1s first rung,
-    // picks up. Reconnecting a live room on every tab focus would churn.
-    if (holds === 0 || state === "live") return;
-    const t = now();
-    if (t - lastWakeAt < WAKE_COALESCE_MS) return;
-    lastWakeAt = t;
-    gen++; // orphan the pending retry and any in-flight start
-    attempt = 0;
-    setStatus("connecting");
-    void start(gen);
-  }
-
-  async function start(myGen: number): Promise<void> {
-    teardown();
-    if (myGen !== gen) return;
-
-    const res = await Promise.race([
-      deps.mint(),
-      new Promise<RoomMintResult>((resolve) =>
-        schedule(() => resolve({ ok: false, reason: "unavailable" }), MINT_TIMEOUT_MS),
-      ),
-    ]);
-    if (myGen !== gen) return;
-    if (!res.ok) return retry(myGen, res.reason);
-    // A platform that predates the room topic can't host one — honest
-    // unavailability (retried: a deploy can turn it on) rather than a limp.
-    if (!res.topic) return retry(myGen, "unavailable");
-
-    await deps.setAuth(res.token);
-    if (myGen !== gen) return;
-
-    const ch = deps.channel(res.topic, self.id);
-    ch.onPresence((states) => {
-      if (myGen !== gen) return;
-      const nextMeta = new Map<string, Record<string, unknown>>();
-      let sawNewMember = false;
-      for (const [key, metas] of Object.entries(states)) {
-        // Supabase keeps one meta per connection under the key; last wins.
-        const meta = metas[metas.length - 1] ?? {};
-        const { presence_ref: _ref, ...rest } = meta as Record<string, unknown>;
-        nextMeta.set(key, rest);
-        if (key !== self.id && !memberMeta.has(key)) sawNewMember = true;
-      }
-      // Membership is authoritative: state whose owner left is dropped, which
-      // is what auto-clears a closed tab's cursor.
-      for (const id of stateById.keys()) {
-        if (!nextMeta.has(id)) stateById.delete(id);
-      }
-      memberMeta = nextMeta;
-      rebuildOthers();
-      // Someone new arrived: re-send my state once (jittered) so they see me
-      // now instead of on my next move.
-      if (sawNewMember) scheduleHydrate();
-    });
-    ch.onBroadcast((msg) => {
-      if (myGen !== gen) return;
-      if (msg.event === ME_EVENT) {
-        const env = (msg.payload ?? {}) as { f?: string; s?: Record<string, unknown> };
-        if (!env.f || env.f === self.id) return;
-        // State can outrun membership by a beat (broadcast delivers before the
-        // presence diff); hold it either way — rebuildOthers keys off
-        // membership, so it shows the moment the member appears.
-        stateById.set(env.f, env.s ?? {});
-        if (memberMeta.has(env.f)) rebuildOthers();
-        return;
-      }
-      const env = (msg.payload ?? {}) as { f?: string; d?: unknown };
-      if (env.f === self.id) return; // already delivered locally, synchronously
-      dispatch(msg.event, { from: env.f ?? "", data: env.d });
-    });
-    // Current BEFORE join() is registered: the status callback guards on
-    // channel identity, and a callback that fired before the assignment would
-    // wrongly see itself as stale.
-    channel = ch;
-    ch.join((s) => {
-      // The identity check (not just gen) is load-bearing: teardown() nulls
-      // `channel` and then leave() makes THIS callback fire CLOSED, same tick,
-      // same gen. Without the check that re-entered the terminal branch below
-      // and recursed teardown → leave → CLOSED → teardown to a stack overflow
-      // on every real network drop.
-      if (myGen !== gen || channel !== ch) return;
-      if (s === "SUBSCRIBED") {
-        joined = true;
-        attempt = 0;
-        setStatus("live");
-        // ONE membership beacon per join — presence carries who's-here, never
-        // state (see the transport note at the top of this file). This is the
-        // only track() the store ever issues, so its failure genuinely means
-        // the channel is broken and healing is right; at one-per-join it can
-        // never melt into the reconnect storm the per-move version caused.
-        ch.track({}, (result) => {
-          if (result !== "ok" && myGen === gen) unhealthy("presence join failed");
-        });
-        // Join/rejoin replays my current state so a reconnect (or a late
-        // first join) never leaves me invisible.
-        pushMe();
-      } else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT" || s === "CLOSED") {
-        // CLOSED was previously unhandled, which meant a socket that dropped
-        // (network blip, server close, token expiry, a StrictMode teardown
-        // racing a re-subscribe) left the room permanently dead while the last
-        // reported status stayed "live". supabase-js does NOT auto-rejoin, so
-        // every terminal state must drive recovery. Verified against a real
-        // close: the status arrives as CHANNEL_ERROR "socket closed: 1005"
-        // with no follow-up SUBSCRIBED.
-        joined = false;
-        teardown();
-        retry(myGen, "unavailable");
-      }
-    });
-    scheduleRefresh(myGen, res.expiresIn);
-  }
-
-  function scheduleRefresh(myGen: number, expiresInSeconds: number): void {
-    const ms = Math.max(expiresInSeconds * 1000 * REFRESH_FRACTION, MIN_REFRESH_MS);
-    const prev = timer;
-    timer = schedule(async () => {
-      if (myGen !== gen) return;
-      const res = await deps.mint();
-      if (myGen !== gen) return;
-      if (!res.ok) return retry(myGen, res.reason);
-      await deps.setAuth(res.token);
-      if (myGen !== gen) return;
-      scheduleRefresh(myGen, res.expiresIn);
-    }, ms);
-    if (prev !== null && prev !== timer) cancel(prev);
-  }
+  let unregister: (() => void) | null = null;
 
   return {
     self,
     acquire() {
       holds++;
-      if (holds === 1) {
-        gen++;
-        attempt = 0;
-        setStatus("connecting");
-        stopWake = subscribeWake(onWakeSignal);
-        void start(gen);
-      }
+      if (holds === 1) unregister = deps.session.register(group);
       let released = false;
       return () => {
         if (released) return;
         released = true;
         holds--;
         if (holds === 0) {
-          gen++;
-          stopWake?.();
-          stopWake = null;
-          teardown();
-          // setStatus, never a bare assignment: a direct write leaves every
-          // useSyncExternalStore subscriber holding a stale snapshot, which is
-          // exactly how a torn-down room kept rendering "live" forever.
+          unregister?.();
+          unregister = null;
           setStatus("connecting");
         }
       };
@@ -659,6 +499,13 @@ export type BoolRoom = {
   useStatus(): RoomStatus;
 };
 
+/** The callable default room: `bool.room.useOthers()` is the app-wide room;
+ * `bool.room("game:4")` is a scoped one with the identical surface. Same id →
+ * same room instance (and one shared socket underneath them all). */
+export type BoolRoomApi = BoolRoom & {
+  (id: string): BoolRoom;
+};
+
 type RoomHooksImpl = {
   useOthers(store: RoomStore<Record<string, unknown>>): ReadonlyArray<RoomPeer<Record<string, unknown>>>;
   useSetMe(store: RoomStore<Record<string, unknown>>): (patch: Record<string, unknown>) => void;
@@ -719,4 +566,29 @@ export function createBoolRoom(store: RoomStore<Record<string, unknown>>): BoolR
       return requireHooks("useStatus").useStatus(store);
     },
   };
+}
+
+/** Build the callable `bool.room`: the default room's members on the function
+ * itself, scoped rooms (memoized by id) on invocation. */
+export function createBoolRoomApi(
+  defaultRoom: BoolRoom,
+  storeFor: (id: string) => RoomStore<Record<string, unknown>>,
+): BoolRoomApi {
+  const scoped = new Map<string, BoolRoom>();
+  const fn = ((id: string): BoolRoom => {
+    validateRoomId(id);
+    let room = scoped.get(id);
+    if (!room) {
+      room = createBoolRoom(storeFor(id));
+      scoped.set(id, room);
+    }
+    return room;
+  }) as BoolRoomApi;
+  fn.self = defaultRoom.self;
+  fn.useOthers = defaultRoom.useOthers;
+  fn.useSetMe = defaultRoom.useSetMe;
+  fn.broadcast = defaultRoom.broadcast;
+  fn.useEventListener = defaultRoom.useEventListener;
+  fn.useStatus = defaultRoom.useStatus;
+  return fn;
 }

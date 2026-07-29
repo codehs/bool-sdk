@@ -22,7 +22,14 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { createEntitiesModule, type EntitiesModule } from "./entities.js";
 import { createDoorbell, type MintResult, type RealtimeMint } from "./realtime.js";
-import { createBoolRoom, createRoomStore, type BoolRoom, type RoomMintResult } from "./room.js";
+import {
+  createBoolRoom,
+  createBoolRoomApi,
+  createRoomStore,
+  type BoolRoomApi,
+  type RoomStore,
+} from "./room.js";
+import { createSession, type SessionChannel } from "./session.js";
 
 /** Matches the server's append-only gateway path version. */
 const GATEWAY_API = "v1";
@@ -199,9 +206,10 @@ export type BoolClient = {
    * `ai.stream(prompt)`. Server-side AI with no API key in the bundle. */
   ai: BoolAi;
   /** The ephemeral lane: live cursors, presence, one-shot events — data that
-   * flies between the people currently in the app and is never stored. See
-   * BoolRoom for the surface; durable data stays on `entities`. */
-  room: BoolRoom;
+   * flies between the people currently in the app and is never stored.
+   * `bool.room.useOthers()` is the app-wide room; `bool.room("game:4")` is a
+   * scoped one with the identical surface. Durable data stays on `entities`. */
+  room: BoolRoomApi;
   /** This app's private Postgres schema name. */
   schema: string;
   /** Subscribe to the app's realtime "doorbell": fires whenever any row in the
@@ -678,20 +686,40 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     }
   };
 
-  const doorbell = createDoorbell({
-    mint: mintRealtimeToken,
+  // ONE session for everything realtime — the doorbell and every room share
+  // its mint, its wristband refresh, and the underlying socket. Two machines
+  // used to run here with duplicate lifecycles; both of the July-2026
+  // production fires had to be fixed twice because of it (see session.ts).
+  const session = createSession({
+    mint: async () => {
+      const res = await mintRealtimeToken();
+      if (!res.ok) return res;
+      return {
+        ok: true as const,
+        token: res.mint.token,
+        expiresIn: res.mint.expiresIn,
+        topics: {
+          app: res.mint.topics.app,
+          user: res.mint.topics.user ?? null,
+          room: res.mint.topics.room ?? null,
+        },
+      };
+    },
     setAuth: async (token) => {
       await db.realtime.setAuth(token);
     },
-    channel: (topic, opts) => {
-      // Adapt one supabase RealtimeChannel to the doorbell's minimal shape.
-      // The channel is created lazily-configured and joined in join(), so
-      // onBroadcast registration always precedes the subscribe.
-      const ch = db.channel(topic, { config: { private: opts.private } });
+  });
+
+  const doorbell = createDoorbell({
+    session,
+    makeChannel: (topic) => {
+      // The channel is created lazily-configured and joined by the session,
+      // so onBroadcast registration always precedes the subscribe.
+      const ch = db.channel(topic, { config: { private: true } });
       return {
         onBroadcast(cb) {
           ch.on("broadcast", { event: "*" }, (msg) =>
-            cb((msg as { payload?: BoolChangePayload }).payload ?? {}),
+            cb(msg as unknown as { event: string; payload: unknown }),
           );
         },
         join(status) {
@@ -708,69 +736,56 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     listener: (payload: BoolChangePayload) => void,
   ): (() => void) => doorbell.subscribe(listener);
 
-  // The room store shares the doorbell's wristband desk (same mint endpoint,
-  // same setAuth) but runs its own small lifecycle machine: a presence-only
-  // app has zero entity subscribers, so the room can't piggyback on the
-  // doorbell's ref-count. Two independent 15-minute mints per app is noise.
-  const roomStore = createRoomStore({
-    mint: async (): Promise<RoomMintResult> => {
-      const res = await mintRealtimeToken();
-      if (!res.ok) return res;
-      return {
-        ok: true,
-        token: res.mint.token,
-        expiresIn: res.mint.expiresIn,
-        topic: res.mint.topics.room ?? null,
-      };
-    },
-    setAuth: async (token) => {
-      await db.realtime.setAuth(token);
-    },
-    channel: (topic, key) => {
-      const ch = db.channel(topic, {
-        config: {
-          private: true,
-          presence: { key },
-          // No server echo: the store already delivered the sender's copy
-          // locally and synchronously; a wire echo would double-fire.
-          broadcast: { self: false, ack: false },
-        },
-      });
-      return {
-        track(state, done) {
-          // supabase-js RESOLVES with "ok" | "timed out" | "error" — it does not
-          // throw — so the result must be inspected or every failure is silent.
-          void ch.track(state).then(
-            (r) => done?.(typeof r === "string" ? r : "ok"),
-            () => done?.("error"),
-          );
-        },
-        onPresence(cb) {
-          ch.on("presence", { event: "sync" }, () => {
-            cb(ch.presenceState() as Record<string, Array<Record<string, unknown>>>);
-          });
-        },
-        onBroadcast(cb) {
-          ch.on("broadcast", { event: "*" }, (msg) =>
-            cb(msg as unknown as { event: string; payload: unknown }),
-          );
-        },
-        send(event, payload, done) {
-          void ch.send({ type: "broadcast", event, payload }).then(
-            (r) => done?.(typeof r === "string" ? r : "ok"),
-            () => done?.("error"),
-          );
-        },
-        join(status) {
-          ch.subscribe((state) => status(state));
-        },
-        leave() {
-          void db.removeChannel(ch);
-        },
-      };
-    },
-  });
-  const room = createBoolRoom(roomStore);
+  const makeRoomChannel = (topic: string, key: string): SessionChannel => {
+    const ch = db.channel(topic, {
+      config: {
+        private: true,
+        presence: { key },
+        // No server echo: the store already delivered the sender's copy
+        // locally and synchronously; a wire echo would double-fire.
+        broadcast: { self: false, ack: false },
+      },
+    });
+    return {
+      track(state, done) {
+        // supabase-js RESOLVES with "ok" | "timed out" | "error" — it does not
+        // throw — so the result must be inspected or every failure is silent.
+        void ch.track(state).then(
+          (r) => done?.(typeof r === "string" ? r : "ok"),
+          () => done?.("error"),
+        );
+      },
+      onPresence(cb) {
+        ch.on("presence", { event: "sync" }, () => {
+          cb(ch.presenceState() as Record<string, Array<Record<string, unknown>>>);
+        });
+      },
+      onBroadcast(cb) {
+        ch.on("broadcast", { event: "*" }, (msg) =>
+          cb(msg as unknown as { event: string; payload: unknown }),
+        );
+      },
+      send(event, payload, done) {
+        void ch.send({ type: "broadcast", event, payload }).then(
+          (r) => done?.(typeof r === "string" ? r : "ok"),
+          () => done?.("error"),
+        );
+      },
+      join(status) {
+        ch.subscribe((state) => status(state));
+      },
+      leave() {
+        void db.removeChannel(ch);
+      },
+    };
+  };
+
+  // The default room + memoized scoped rooms, all channel groups on the one
+  // session: `bool.room.useOthers()` is the app-wide room, `bool.room("id")`
+  // is a scoped one with the identical surface.
+  const roomStoreFor = (roomId: string | null): RoomStore<Record<string, unknown>> =>
+    createRoomStore({ session, roomId, makeChannel: makeRoomChannel });
+  const room = createBoolRoomApi(createBoolRoom(roomStoreFor(null)), (id) => roomStoreFor(id));
 
   const client: BoolClient = {
     db,

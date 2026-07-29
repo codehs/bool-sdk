@@ -3,11 +3,14 @@ import {
   colorForId,
   createRoomStore,
   throttleForPeers,
-  type RoomChannel,
-  type RoomDeps,
-  type RoomMintResult,
-  type RoomStore,
+  validateRoomId,
 } from "./room";
+import { createSession, type SessionChannel, type SessionMintResult } from "./session";
+
+type RoomMintResult =
+  | { ok: true; token: string; expiresIn: number; topic: string | null }
+  | { ok: false; reason: "unauthorized" | "unavailable" };
+type RoomChannel = SessionChannel;
 
 // A fake transport: a "wire" shared by any number of stores, so multi-peer
 // behavior (presence sync, broadcast fan-out, self-filtering) is exercised for
@@ -37,12 +40,14 @@ function makeHarness(opts?: {
   mint?: () => Promise<RoomMintResult>;
   wire?: Wire;
   /** What the fake channel reports back from track() — supabase-js resolves
-   * with a STRING, and "timed out"/"error" must drive recovery. */
+   * with a STRING, and "timed out"/"error" must never be silent. */
   trackResult?: string;
+  roomId?: string | null;
 }) {
   const wire = opts?.wire ?? makeWire();
   const trackResult = opts?.trackResult ?? "ok";
   // Deterministic virtual clock so throttle behavior is testable exactly.
+  // Session and store share it — one clock drives the whole stack.
   let clock = 0;
   const timers: Array<{ at: number; fn: () => void; id: number }> = [];
   let nextId = 1;
@@ -59,9 +64,9 @@ function makeHarness(opts?: {
       await flush();
     }
     clock = target;
-    // Always flush, even when no timer was due: the store's handshake is a
-    // chain of awaits (mint race → setAuth → channel), so a caller that only
-    // advances the clock would otherwise observe a half-settled machine.
+    // Always flush, even when no timer was due: the handshake is a chain of
+    // awaits (mint race → setAuth → channel), so a caller that only advances
+    // the clock would otherwise observe a half-settled machine.
     await flush();
   };
   const flush = async () => {
@@ -85,67 +90,91 @@ function makeHarness(opts?: {
       topic: "bool:app_x:room",
     }));
 
-  const deps: RoomDeps = {
-    mint: () => {
+  const schedule = (fn: () => void, ms: number) => {
+    const id = nextId++;
+    timers.push({ at: clock + ms, fn, id });
+    return id;
+  };
+  const cancel = (h: unknown) => {
+    const i = timers.findIndex((t) => t.id === h);
+    if (i !== -1) timers.splice(i, 1);
+  };
+  const now = () => clock;
+
+  const session = createSession({
+    mint: (): Promise<SessionMintResult> => {
       mintCalls++;
-      return baseMint();
+      return baseMint().then((r) =>
+        r.ok
+          ? {
+              ok: true as const,
+              token: r.token,
+              expiresIn: r.expiresIn,
+              topics: { app: "bool:app_x:app", user: null, room: r.topic },
+            }
+          : r,
+      );
     },
     setAuth: () => {},
-    channel: (_topic, k) => {
-      key = k;
-      const ch: RoomChannel = {
-        track(state, done) {
-          wire.presences.set(k, state);
-          wire.syncAll();
-          done?.(trackResult);
-        },
-        onPresence(cb) {
-          wire.presenceSubs.add(cb);
-        },
-        onBroadcast(cb) {
-          wire.broadcastSubs.add({ selfKey: k, cb });
-        },
-        send(event, payload, done) {
-          sent.push({ event, payload });
-          done?.("ok");
-          // deliver to every OTHER subscriber on the wire (server self:false)
-          for (const sub of wire.broadcastSubs) {
-            if (sub.selfKey !== k) sub.cb({ event, payload });
-          }
-        },
-        join(status) {
-          joinCb = status;
-        },
-        leave() {
-          wire.presences.delete(k);
-          wire.syncAll();
-        },
-      };
-      return ch;
-    },
-    schedule: (fn, ms) => {
-      const id = nextId++;
-      timers.push({ at: clock + ms, fn, id });
-      return id;
-    },
-    cancel: (h) => {
-      const i = timers.findIndex((t) => t.id === h);
-      if (i !== -1) timers.splice(i, 1);
-    },
-    now: () => clock,
+    schedule,
+    cancel,
+    now,
     wake: (cb) => {
       wakeCbs.add(cb);
       return () => wakeCbs.delete(cb);
     },
+  });
+
+  let lastTopic = "";
+  const makeChannel = (topic: string, k: string): RoomChannel => {
+    lastTopic = topic;
+    key = k;
+    const ch: RoomChannel = {
+      track(state, done) {
+        wire.presences.set(k, state);
+        wire.syncAll();
+        done?.(trackResult);
+      },
+      onPresence(cb) {
+        wire.presenceSubs.add(cb);
+      },
+      onBroadcast(cb) {
+        wire.broadcastSubs.add({ selfKey: k, cb });
+      },
+      send(event, payload, done) {
+        sent.push({ event, payload });
+        done?.("ok");
+        // deliver to every OTHER subscriber on the wire (server self:false)
+        for (const sub of wire.broadcastSubs) {
+          if (sub.selfKey !== k) sub.cb({ event, payload });
+        }
+      },
+      join(status) {
+        joinCb = status;
+      },
+      leave() {
+        wire.presences.delete(k);
+        wire.syncAll();
+      },
+    };
+    return ch;
   };
 
-  const store = createRoomStore(deps);
+  const store = createRoomStore({
+    session,
+    roomId: opts?.roomId ?? null,
+    makeChannel,
+    schedule,
+    cancel,
+    now,
+  });
   return {
     store,
     wire,
     sent,
     advance,
     selfKey: () => key,
+    lastTopic: () => lastTopic,
     mintCalls: () => mintCalls,
     /** Simulate the tab/network coming back. */
     wake: () => {
@@ -505,15 +534,23 @@ describe("room store: recovery (the dead-but-'live' regression)", () => {
     expect(h.store.status()).toBe("connecting");
   });
 
-  test("a failed presence publish reconnects instead of going quiet", async () => {
-    // supabase-js resolves "timed out" on a dead channel — no exception to
-    // catch, so this is only visible if the result is inspected.
+  test("a failed join beacon warns but does NOT tear the room down", async () => {
+    // The rate-shaping lesson, pinned in BOTH directions. The old rule —
+    // "any failed track() forces a reconnect" — looked like healing and was:
+    // under load, per-move track timeouts became a reconnect storm, the UI
+    // flapping between "N people here" and "live view unavailable". Recovery
+    // that can be triggered BY load must be rate-shaped: the beacon is
+    // once-per-join, its failure only warns, and a genuinely dead channel
+    // reports its own terminal state — which the session heals (tested in
+    // session.test.ts and the sync-CLOSED suite below).
     const h = makeHarness({ trackResult: "timed out" });
     const release = h.store.acquire();
     await h.join();
+    expect(h.store.status()).toBe("live"); // NOT torn down by the beacon result
     h.store.setMe({ cursor: { x: 1, y: 1 } });
     await h.advance(40);
-    expect(h.store.status()).toBe("unavailable"); // healing, not silently dead
+    expect(h.store.status()).toBe("live"); // setMe rides broadcast; no track at all
+    expect(h.mintCalls()).toBe(1); // and no reconnect storm
     release();
   });
 
@@ -659,21 +696,44 @@ describe("bool.room broadcast size limit", () => {
 
 describe("bool.room surviving supabase's synchronous CLOSED", () => {
   // supabase's removeChannel fires the channel's own status callback with
-  // CLOSED — synchronously, from inside leave(). Since the terminal-state
-  // handler responds to CLOSED by tearing down (which leaves), the two used to
-  // feed each other: teardown → leave → CLOSED → teardown → … a stack overflow
-  // on every real network drop. Seen in production as an endless stream of
-  // "Maximum call stack size exceeded" from a deployed cursor app.
+  // CLOSED — synchronously, from inside leave(). The pre-session machines
+  // recursed teardown → leave → CLOSED → teardown to a stack overflow on every
+  // real drop of a healthy channel (seen in production as an endless stream of
+  // "Maximum call stack size exceeded"). The guard lives in session.ts and is
+  // unit-tested there; this exercises it through the full store stack.
   function makeSyncCloseHarness() {
     let joinCb: ((s: string) => void) | null = null;
     let channelsMade = 0;
     const timers: Array<{ at: number; fn: () => void; id: number }> = [];
     let clock = 0;
     let nextId = 1;
-    const deps: RoomDeps = {
-      mint: async () => ({ ok: true, token: "t", expiresIn: 900, topic: "bool:x:room" }),
+    const schedule = (fn: () => void, ms: number) => {
+      const id = nextId++;
+      timers.push({ at: clock + ms, fn, id });
+      return id;
+    };
+    const cancel = (h: unknown) => {
+      const i = timers.findIndex((t) => t.id === h);
+      if (i !== -1) timers.splice(i, 1);
+    };
+    const now = () => clock;
+    const session = createSession({
+      mint: async () => ({
+        ok: true,
+        token: "t",
+        expiresIn: 900,
+        topics: { app: "bool:x:app", user: null, room: "bool:x:room" },
+      }),
       setAuth: () => {},
-      channel: (): RoomChannel => {
+      schedule,
+      cancel,
+      now,
+      wake: () => () => {},
+    });
+    const store = createRoomStore({
+      session,
+      roomId: null,
+      makeChannel: (): RoomChannel => {
         channelsMade++;
         return {
           track: (_s, done) => done?.("ok"),
@@ -688,19 +748,10 @@ describe("bool.room surviving supabase's synchronous CLOSED", () => {
           },
         };
       },
-      schedule: (fn, ms) => {
-        const id = nextId++;
-        timers.push({ at: clock + ms, fn, id });
-        return id;
-      },
-      cancel: (h) => {
-        const i = timers.findIndex((t) => t.id === h);
-        if (i !== -1) timers.splice(i, 1);
-      },
-      now: () => clock,
-      wake: () => () => {},
-    };
-    const store = createRoomStore(deps);
+      schedule,
+      cancel,
+      now,
+    });
     const advance = async (ms: number) => {
       const target = clock + ms;
       for (;;) {
@@ -731,6 +782,7 @@ describe("bool.room surviving supabase's synchronous CLOSED", () => {
   test("a real drop does not recurse, and the room still recovers", async () => {
     const h = makeSyncCloseHarness();
     const release = h.store.acquire();
+    await h.advance(0);
     await h.join();
     expect(h.store.status()).toBe("live");
 
@@ -749,6 +801,7 @@ describe("bool.room surviving supabase's synchronous CLOSED", () => {
   test("release() with a live channel does not recurse either", async () => {
     const h = makeSyncCloseHarness();
     const release = h.store.acquire();
+    await h.advance(0);
     await h.join();
     release(); // teardown → leave → sync CLOSED, on the unmount path
     expect(h.store.status()).toBe("connecting");
@@ -823,5 +876,32 @@ describe("bool.room render economy", () => {
     expect(throttleForPeers(9)).toBe(16); // 10 people: still 60Hz
     expect(throttleForPeers(14)).toBe(27); // 15 people ≈ 37Hz
     expect(throttleForPeers(19)).toBe(48); // 20 people ≈ 21Hz — smooth, not slideshow
+  });
+});
+
+describe("named rooms", () => {
+  test("a scoped room joins the scoped topic; the default room joins the bare one", async () => {
+    const base = makeHarness();
+    const rd = base.store.acquire();
+    await base.join();
+    expect(base.lastTopic()).toBe("bool:app_x:room");
+    rd();
+
+    const scoped = makeHarness({ roomId: "game:4" });
+    const rs = scoped.store.acquire();
+    await scoped.join();
+    expect(scoped.lastTopic()).toBe("bool:app_x:room:game:4");
+    rs();
+  });
+
+  test("room ids are validated loudly, not normalized silently", () => {
+    // Silent normalization would put two "different" ids in one room.
+    expect(validateRoomId("game:4")).toBe("game:4");
+    expect(validateRoomId("board.2-a_b")).toBe("board.2-a_b");
+    expect(() => validateRoomId("")).toThrow(/1–64 characters/);
+    expect(() => validateRoomId("has space")).toThrow(/bool\.room\("has space"\)/);
+    expect(() => validateRoomId("emoji🎉")).toThrow();
+    expect(() => validateRoomId("-starts-wrong")).toThrow();
+    expect(() => validateRoomId("x".repeat(65))).toThrow();
   });
 });
