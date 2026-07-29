@@ -22,6 +22,7 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { createEntitiesModule, type EntitiesModule } from "./entities.js";
 import { createDoorbell, type MintResult, type RealtimeMint } from "./realtime.js";
+import { createBoolRoom, createRoomStore, type BoolRoom, type RoomMintResult } from "./room.js";
 
 /** Matches the server's append-only gateway path version. */
 const GATEWAY_API = "v1";
@@ -197,6 +198,10 @@ export type BoolClient = {
   /** The AI battery: `ai.generate(prompt)` / `ai.generate({prompt, schema})` /
    * `ai.stream(prompt)`. Server-side AI with no API key in the bundle. */
   ai: BoolAi;
+  /** The ephemeral lane: live cursors, presence, one-shot events — data that
+   * flies between the people currently in the app and is never stored. See
+   * BoolRoom for the surface; durable data stays on `entities`. */
+  room: BoolRoom;
   /** This app's private Postgres schema name. */
   schema: string;
   /** Subscribe to the app's realtime "doorbell": fires whenever any row in the
@@ -330,6 +335,11 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     // Cast: Bun's `typeof fetch` demands a `preconnect` property that a plain
     // fetch-shaped function doesn't have; supabase-js only ever calls it.
     global: { fetch: proxyFetch as unknown as typeof fetch },
+    // supabase-js defaults to 10 client events/sec, which a bool.room cursor
+    // stream (~40/s after the SDK's own throttle) would trip — the limiter
+    // silently drops the excess and cursors freeze. The room store is the only
+    // high-frequency sender and it throttles itself; this cap is the backstop.
+    realtime: { params: { eventsPerSecond: 50 } },
   });
 
   const authListeners = new Set<AuthChangeListener>();
@@ -696,11 +706,68 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     listener: (payload: BoolChangePayload) => void,
   ): (() => void) => doorbell.subscribe(listener);
 
+  // The room store shares the doorbell's wristband desk (same mint endpoint,
+  // same setAuth) but runs its own small lifecycle machine: a presence-only
+  // app has zero entity subscribers, so the room can't piggyback on the
+  // doorbell's ref-count. Two independent 15-minute mints per app is noise.
+  const roomStore = createRoomStore({
+    mint: async (): Promise<RoomMintResult> => {
+      const res = await mintRealtimeToken();
+      if (!res.ok) return res;
+      return {
+        ok: true,
+        token: res.mint.token,
+        expiresIn: res.mint.expiresIn,
+        topic: res.mint.topics.room ?? null,
+      };
+    },
+    setAuth: async (token) => {
+      await db.realtime.setAuth(token);
+    },
+    channel: (topic, key) => {
+      const ch = db.channel(topic, {
+        config: {
+          private: true,
+          presence: { key },
+          // No server echo: the store already delivered the sender's copy
+          // locally and synchronously; a wire echo would double-fire.
+          broadcast: { self: false, ack: false },
+        },
+      });
+      return {
+        track(state) {
+          void ch.track(state);
+        },
+        onPresence(cb) {
+          ch.on("presence", { event: "sync" }, () => {
+            cb(ch.presenceState() as Record<string, Array<Record<string, unknown>>>);
+          });
+        },
+        onBroadcast(cb) {
+          ch.on("broadcast", { event: "*" }, (msg) =>
+            cb(msg as unknown as { event: string; payload: unknown }),
+          );
+        },
+        send(event, payload) {
+          void ch.send({ type: "broadcast", event, payload });
+        },
+        join(status) {
+          ch.subscribe((state) => status(state));
+        },
+        leave() {
+          void db.removeChannel(ch);
+        },
+      };
+    },
+  });
+  const room = createBoolRoom(roomStore);
+
   const client: BoolClient = {
     db,
     entities: createEntitiesModule(db, subscribeToChanges),
     auth,
     ai,
+    room,
     schema,
     subscribeToChanges,
   };

@@ -9,6 +9,7 @@ import {
   useEntity,
 } from "./react";
 import { __registerEntityUseQuery } from "./entities";
+import { __registerRoomHooks } from "./room";
 
 // SSR smoke tests: effects don't run in renderToString, so the provider is in
 // its initial loading state — enough to pin the gate/hook contract without a
@@ -191,5 +192,53 @@ describe("bool.entities.<table>.useQuery", () => {
       return <span>{String(!!t)}</span>;
     }
     expect(typeof Probe).toBe("function");
+  });
+});
+
+// bool.room hooks — same contract pins as useQuery: SSR-renderable initial
+// state, and a clear thrown error when the React entry isn't loaded.
+describe("bool.room hooks", () => {
+  test("useOthers/useStatus/useSetMe render on the server with honest initials", () => {
+    const client = createBoolClient(CONFIG);
+    function Probe() {
+      const others = client.room.useOthers<{ cursor: { x: number } }>();
+      const setMe = client.room.useSetMe();
+      const status = client.room.useStatus();
+      return (
+        <span>
+          {others.length}:{status}:{typeof setMe === "function" ? "fn" : "bad"}
+        </span>
+      );
+    }
+    // SSR interleaves comment markers between expressions, so assert pieces.
+    const html = renderToString(<Probe />);
+    expect(html).toContain("connecting");
+    expect(html).toContain("fn");
+    expect(html).not.toContain("bad");
+  });
+
+  test("self is available without React and colors are deterministic", () => {
+    const client = createBoolClient(CONFIG);
+    expect(client.room.self.id.length).toBeGreaterThan(6);
+    expect(client.room.self.color).toMatch(/^hsl\(/);
+  });
+
+  test("without the React entry loaded, hooks throw instructions naming the fix", () => {
+    const prev = __registerRoomHooks(null);
+    try {
+      const client = createBoolClient(CONFIG);
+      expect(() => client.room.useOthers()).toThrow(/bool-sdk\/react/);
+      expect(() => client.room.useSetMe()).toThrow(/React entry/);
+    } finally {
+      __registerRoomHooks(prev);
+    }
+  });
+
+  test("hallucinated members are type errors, not runtime undefined", () => {
+    const client = createBoolClient(CONFIG);
+    // @ts-expect-error — no useMyPresence: BoolRoom has NO index signature, so
+    // Liveblocks-reflex members fail the build instead of failing users.
+    const bad = client.room.useMyPresence;
+    expect(bad).toBeUndefined();
   });
 });

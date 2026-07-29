@@ -37,3 +37,10 @@ export {
   type LiveQueryOptions,
   type LiveSnapshot,
 } from "./live.js";
+export {
+  colorForId,
+  type BoolRoom,
+  type RoomEvent,
+  type RoomPeer,
+  type RoomStatus,
+} from "./room.js";

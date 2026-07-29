@@ -30,7 +30,13 @@ export type RealtimeMint = {
   token: string;
   /** Seconds until the token expires. */
   expiresIn: number;
-  topics: { app: string; user: string | null };
+  topics: {
+    app: string;
+    user: string | null;
+    /** The ephemeral bool.room topic. Absent on platforms that predate it —
+     * the room store then reports "unavailable" and retries. */
+    room?: string | null;
+  };
 };
 
 export type DoorbellChannel = {

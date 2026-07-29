@@ -30,6 +30,13 @@ import {
   type EntityHandler,
   type EntityQueryResult,
 } from "./entities.js";
+import {
+  __registerRoomHooks,
+  type RoomEvent,
+  type RoomPeer,
+  type RoomStatus,
+  type RoomStore,
+} from "./room.js";
 
 // Re-exported on purpose, and it is load-bearing. A React app creates its client
 // by importing createBoolClient FROM HERE:
@@ -376,3 +383,83 @@ function useEntityHandler<T extends EntityRow = EntityRow>(
 // this import via src/lib/supabase.ts, so the hook Just Works everywhere the
 // data client does.
 __registerEntityUseQuery(useEntityHandler as Parameters<typeof __registerEntityUseQuery>[0]);
+
+// ---------------------------------------------------------------------------
+// bool.room hooks. Same registration pattern as useQuery above: core is
+// React-free, importing this entry arms the hooks. Every hook ACQUIRES the
+// room machinery on mount and releases on unmount — the connection exists
+// exactly while something on screen cares about it.
+
+type AnyRoomStore = RoomStore<Record<string, unknown>>;
+
+function useRoomAcquire(store: AnyRoomStore): void {
+  // StrictMode mounts, unmounts, and remounts: acquire/release must be exactly
+  // paired, and the store's ref-count (with its generation counter) makes the
+  // double-cycle safe.
+  useEffect(() => store.acquire(), [store]);
+}
+
+function useRoomOthers(store: AnyRoomStore): ReadonlyArray<RoomPeer<Record<string, unknown>>> {
+  useRoomAcquire(store);
+  return useSyncExternalStore(
+    (cb) => store.onOthers(cb),
+    () => store.getOthers(),
+    () => store.getOthers(),
+  );
+}
+
+function useRoomSetMe(store: AnyRoomStore): (patch: Record<string, unknown>) => void {
+  useRoomAcquire(store);
+  // Track which keys THIS component wrote, and clear exactly those on unmount:
+  // a cursor must not outlive the screen that was publishing it, and two
+  // components publishing different keys must not clobber each other.
+  const keysRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const keys = keysRef.current;
+    return () => {
+      if (keys.size > 0) store.clearMe([...keys]);
+    };
+  }, [store]);
+  const [setter] = useState(() => (patch: Record<string, unknown>) => {
+    for (const k of Object.keys(patch)) keysRef.current.add(k);
+    store.setMe(patch);
+  });
+  return setter;
+}
+
+function useRoomEventListener(store: AnyRoomStore, event: string, cb: (e: RoomEvent) => void): void {
+  useRoomAcquire(store);
+  // Latest-ref: the handler closes over fresh props/state on every render,
+  // while the subscription itself is stable — no stale closures, no resubscribe
+  // churn, nothing for StrictMode to double.
+  const cbRef = useRef(cb);
+  cbRef.current = cb;
+  const eventRef = useRef(event);
+  eventRef.current = event;
+  useEffect(
+    () =>
+      store.onEvent((name, e) => {
+        if (name === eventRef.current) cbRef.current(e);
+      }),
+    [store],
+  );
+}
+
+function useRoomStatus(store: AnyRoomStore): RoomStatus {
+  useRoomAcquire(store);
+  return useSyncExternalStore(
+    (cb) => {
+      const off = store.onStatus(() => cb());
+      return () => off();
+    },
+    () => store.status(),
+    () => store.status(),
+  );
+}
+
+__registerRoomHooks({
+  useOthers: useRoomOthers,
+  useSetMe: useRoomSetMe,
+  useEventListener: useRoomEventListener,
+  useStatus: useRoomStatus,
+});
