@@ -817,11 +817,11 @@ describe("bool.room render economy", () => {
     r1(); r2(); r3();
   });
 
-  test("throttleForPeers stays at full rate through 8 people and degrades gently", () => {
-    expect(throttleForPeers(0)).toBe(25); // alone
-    expect(throttleForPeers(3)).toBe(25); // Jack + two colleagues
-    expect(throttleForPeers(7)).toBe(28); // 8 people: ~full rate
-    expect(throttleForPeers(9)).toBe(45); // 10 people ≈ 22Hz — smooth, not slideshow
-    expect(throttleForPeers(14)).toBeLessThan(120); // 15 people ≥ ~8Hz
+  test("throttleForPeers holds 60Hz through 10 people and degrades gently", () => {
+    expect(throttleForPeers(0)).toBe(16); // alone: 60Hz
+    expect(throttleForPeers(3)).toBe(16); // Jack + two colleagues: 60Hz
+    expect(throttleForPeers(9)).toBe(16); // 10 people: still 60Hz
+    expect(throttleForPeers(14)).toBe(27); // 15 people ≈ 37Hz
+    expect(throttleForPeers(19)).toBe(48); // 20 people ≈ 21Hz — smooth, not slideshow
   });
 });

@@ -339,7 +339,9 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     // stream (~40/s after the SDK's own throttle) would trip — the limiter
     // silently drops the excess and cursors freeze. The room store is the only
     // high-frequency sender and it throttles itself; this cap is the backstop.
-    realtime: { params: { eventsPerSecond: 50 } },
+    // Declared per-connection send budget. 60Hz room state + events + margin;
+    // the server-side ceiling is the tenant config, not this.
+    realtime: { params: { eventsPerSecond: 500 } },
   });
 
   const authListeners = new Set<AuthChangeListener>();

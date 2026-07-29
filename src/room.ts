@@ -95,8 +95,8 @@ export type RoomDeps = {
 };
 
 // State sends coalesce on a trailing edge so the FINAL position always lands.
-// ~25ms ≈ 40/s, far above the ~24fps where motion reads as smooth.
-const TRACK_THROTTLE_MS = 25;
+// 16ms ≈ 60/s — one send per frame, the ceiling a 60fps screen can show.
+const TRACK_THROTTLE_MS = 16;
 // The reserved broadcast event carrying a peer's full `setMe` state. App code
 // cannot use "~"-prefixed event names (broadcast() rejects them), so this can
 // never collide with a real event.
@@ -111,11 +111,13 @@ const HYDRATE_JITTER_MS = 300;
  * (`n(n-1)` ms) throttled a 10-person room to 11Hz, and a real 9-spectator
  * demo room measured p50=96ms — most of it spent waiting in our own throttle.
  * "Laggy by design" is not a rate limit worth having. This curve budgets total
- * fan-out at ~2000 msg/s (tenant ceiling 2500, measured headroom): full 40Hz
- * through 8 people, ~22Hz at 10, ~10Hz at 15. */
+ * fan-out at ~8000 msg/s (the tenant ceiling on Bool's user-apps projects is
+ * raised to 10k events/s to hold 60Hz — a fresh Supabase project defaults to
+ * far less, so self-hosters hit the curve sooner, not a broken room): full
+ * 60Hz through 10 people, ~37Hz at 15, ~21Hz at 20. */
 export function throttleForPeers(othersCount: number): number {
   const n = othersCount + 1;
-  const budgetMs = Math.ceil((n * (n - 1)) / 2);
+  const budgetMs = Math.ceil((n * (n - 1)) / 8);
   return Math.max(TRACK_THROTTLE_MS, budgetMs);
 }
 // Inbound coalescing: a room of movers can deliver hundreds of ~me messages a
