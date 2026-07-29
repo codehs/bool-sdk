@@ -107,12 +107,21 @@ const ME_EVENT = "~me";
 const HYDRATE_JITTER_MS = 300;
 /** Per-message fan-out is O(peers), so the whole room's wire cost grows with
  * peers². Scale the send interval so a big room degrades to slower cursors
- * instead of a saturated channel: full rate through ~6 people, ~n(n-1) ms
- * beyond (10 people → ~90ms ≈ 11Hz each). */
+ * instead of a saturated channel — but gently: the first version of this curve
+ * (`n(n-1)` ms) throttled a 10-person room to 11Hz, and a real 9-spectator
+ * demo room measured p50=96ms — most of it spent waiting in our own throttle.
+ * "Laggy by design" is not a rate limit worth having. This curve budgets total
+ * fan-out at ~2000 msg/s (tenant ceiling 2500, measured headroom): full 40Hz
+ * through 8 people, ~22Hz at 10, ~10Hz at 15. */
 export function throttleForPeers(othersCount: number): number {
   const n = othersCount + 1;
-  return Math.max(TRACK_THROTTLE_MS, n * (n - 1));
+  const budgetMs = Math.ceil((n * (n - 1)) / 2);
+  return Math.max(TRACK_THROTTLE_MS, budgetMs);
 }
+// Inbound coalescing: a room of movers can deliver hundreds of ~me messages a
+// second, and re-emitting per message turns every useOthers subscriber into a
+// per-message re-render. One emit per ~frame is all a screen can show anyway.
+const EMIT_COALESCE_MS = 16;
 // Same shape/limits as the doorbell: quick first retry, capped so an outage
 // costs one request a minute, refresh at 75% of the wristband TTL.
 const RETRY_MS = [1_000, 5_000, 15_000, 60_000];
@@ -228,16 +237,57 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
   let memberMeta = new Map<string, Record<string, unknown>>();
   const stateById = new Map<string, Record<string, unknown>>();
 
+  // Stable peer identities: a peer whose inputs didn't change keeps the SAME
+  // object between rebuilds, so a memoized <Cursor peer={o}/> for a still
+  // person doesn't re-render because someone ELSE moved. Keyed by the exact
+  // references that feed the merge — a new ~me replaces the state ref, a
+  // presence diff replaces the meta ref.
+  const peerCache = new Map<
+    string,
+    { meta: Record<string, unknown>; state: Record<string, unknown> | undefined; peer: RoomPeer<P> }
+  >();
+
   function rebuildOthers(): void {
     const next: Array<RoomPeer<P>> = [];
     for (const [id, meta] of memberMeta) {
       if (id === self.id) continue; // others NEVER includes you
-      const presence = { ...meta, ...stateById.get(id) };
-      next.push({ id, color: colorForId(id), presence: presence as Partial<P> });
+      const state = stateById.get(id);
+      const cached = peerCache.get(id);
+      if (cached && cached.meta === meta && cached.state === state) {
+        next.push(cached.peer);
+        continue;
+      }
+      const presence = { ...meta, ...state };
+      const peer: RoomPeer<P> = { id, color: colorForId(id), presence: presence as Partial<P> };
+      peerCache.set(id, { meta, state, peer });
+      next.push(peer);
+    }
+    for (const id of peerCache.keys()) {
+      if (!memberMeta.has(id)) peerCache.delete(id);
     }
     next.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     others = next;
-    emitOthers();
+    scheduleEmit();
+  }
+
+  // One emit per ~frame no matter how many messages landed inside it. The
+  // FIRST change in a quiet period emits immediately (a reaction should not
+  // wait 16ms); the flood behind it coalesces onto the trailing edge.
+  let emitTimer: unknown = null;
+  let lastEmitAt = -Infinity;
+  function scheduleEmit(): void {
+    const elapsed = now() - lastEmitAt;
+    if (elapsed >= EMIT_COALESCE_MS) {
+      lastEmitAt = now();
+      emitOthers();
+      return;
+    }
+    if (emitTimer !== null) return;
+    emitTimer = schedule(() => {
+      emitTimer = null;
+      lastEmitAt = now();
+      emitOthers();
+    }, EMIT_COALESCE_MS - elapsed);
   }
 
   /** Publish my full state now, fire-and-forget. Full state, not a delta:
@@ -323,10 +373,17 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
       cancel(hydrateTimer);
       hydrateTimer = null;
     }
+    if (emitTimer !== null) {
+      cancel(emitTimer);
+      emitTimer = null;
+    }
     memberMeta = new Map();
     stateById.clear();
+    peerCache.clear();
     if (others.length > 0) {
       others = [];
+      // Direct, not coalesced: "the room emptied" must never be absorbed into
+      // a cancelled trailing edge.
       emitOthers();
     }
   }

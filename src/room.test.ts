@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   colorForId,
   createRoomStore,
+  throttleForPeers,
   type RoomChannel,
   type RoomDeps,
   type RoomMintResult,
@@ -755,5 +756,72 @@ describe("bool.room surviving supabase's synchronous CLOSED", () => {
     const before = h.channelsMade();
     await h.advance(120_000);
     expect(h.channelsMade()).toBe(before);
+  });
+});
+
+describe("bool.room render economy", () => {
+  test("a flood of ~me messages coalesces to ~one emit per frame", async () => {
+    const wire = makeWire();
+    const a = makeHarness({ wire });
+    const b = makeHarness({ wire });
+    const releaseA = a.store.acquire();
+    await a.join();
+    const releaseB = b.store.acquire();
+    await b.join();
+
+    let emits = 0;
+    b.store.onOthers(() => emits++);
+    // 12 updates land within one 16ms frame (setMe throttle is bypassed by
+    // sending straight through the wire helper — we're testing B's inbound
+    // side, not A's outbound throttle)
+    for (let i = 1; i <= 12; i++) {
+      a.store.setMe({ cursor: { x: i, y: i } });
+      await a.advance(30); // A sends each one (past its own throttle)...
+      await b.advance(1); // ...B absorbs them nearly back-to-back
+    }
+    await b.advance(20); // trailing edge
+    // 12 inbound messages, spread over vastly fewer emits than messages
+    expect(emits).toBeLessThan(12);
+    expect(emits).toBeGreaterThan(0);
+    const seen = b.store.getOthers().find((o) => o.id === a.store.self.id)!
+      .presence as { cursor: { x: number } };
+    expect(seen.cursor.x).toBe(12); // the final state always lands
+    releaseA();
+    releaseB();
+  });
+
+  test("a peer that did not change keeps its object identity across rebuilds", async () => {
+    // The still person's <Cursor/> must not re-render because someone else
+    // moved: React.memo relies on the peer object being the SAME reference.
+    const wire = makeWire();
+    const still = makeHarness({ wire });
+    const mover = makeHarness({ wire });
+    const observer = makeHarness({ wire });
+    const r1 = still.store.acquire();
+    await still.join();
+    const r2 = mover.store.acquire();
+    await mover.join();
+    const r3 = observer.store.acquire();
+    await observer.join();
+
+    still.store.setMe({ name: "still" });
+    await still.advance(30);
+    await observer.advance(20);
+    const before = observer.store.getOthers().find((o) => o.id === still.store.self.id);
+
+    mover.store.setMe({ cursor: { x: 5, y: 5 } });
+    await mover.advance(30);
+    await observer.advance(20);
+    const after = observer.store.getOthers().find((o) => o.id === still.store.self.id);
+    expect(after).toBe(before); // same reference, not merely equal
+    r1(); r2(); r3();
+  });
+
+  test("throttleForPeers stays at full rate through 8 people and degrades gently", () => {
+    expect(throttleForPeers(0)).toBe(25); // alone
+    expect(throttleForPeers(3)).toBe(25); // Jack + two colleagues
+    expect(throttleForPeers(7)).toBe(28); // 8 people: ~full rate
+    expect(throttleForPeers(9)).toBe(45); // 10 people ≈ 22Hz — smooth, not slideshow
+    expect(throttleForPeers(14)).toBeLessThan(120); // 15 people ≥ ~8Hz
   });
 });
