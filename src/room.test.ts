@@ -35,8 +35,12 @@ function makeWire(): Wire {
 function makeHarness(opts?: {
   mint?: () => Promise<RoomMintResult>;
   wire?: Wire;
+  /** What the fake channel reports back from track() — supabase-js resolves
+   * with a STRING, and "timed out"/"error" must drive recovery. */
+  trackResult?: string;
 }) {
   const wire = opts?.wire ?? makeWire();
+  const trackResult = opts?.trackResult ?? "ok";
   // Deterministic virtual clock so throttle behavior is testable exactly.
   let clock = 0;
   const timers: Array<{ at: number; fn: () => void; id: number }> = [];
@@ -51,10 +55,16 @@ function makeHarness(opts?: {
       clock = due.at;
       timers.shift();
       due.fn();
-      await Promise.resolve(); // let async continuations settle
-      await Promise.resolve();
+      await flush();
     }
     clock = target;
+    // Always flush, even when no timer was due: the store's handshake is a
+    // chain of awaits (mint race → setAuth → channel), so a caller that only
+    // advances the clock would otherwise observe a half-settled machine.
+    await flush();
+  };
+  const flush = async () => {
+    for (let i = 0; i < 20; i++) await Promise.resolve();
   };
 
   let joinCb: ((state: string) => void) | null = null;
@@ -69,9 +79,10 @@ function makeHarness(opts?: {
     channel: (_topic, k) => {
       key = k;
       const ch: RoomChannel = {
-        track(state) {
+        track(state, done) {
           wire.presences.set(k, state);
           wire.syncAll();
+          done?.(trackResult);
         },
         onPresence(cb) {
           wire.presenceSubs.add(cb);
@@ -79,8 +90,9 @@ function makeHarness(opts?: {
         onBroadcast(cb) {
           wire.broadcastSubs.add({ selfKey: k, cb });
         },
-        send(event, payload) {
+        send(event, payload, done) {
           sent.push({ event, payload });
+          done?.("ok");
           // deliver to every OTHER subscriber on the wire (server self:false)
           for (const sub of wire.broadcastSubs) {
             if (sub.selfKey !== k) sub.cb({ event, payload });
@@ -115,11 +127,16 @@ function makeHarness(opts?: {
     sent,
     advance,
     selfKey: () => key,
+    // Wait for the store's real handshake (mint → setAuth → channel) instead of
+    // a fixed number of microtasks: the number changed when mint gained a
+    // timeout race, and a hardcoded tick count silently stopped joining at all.
     join: async () => {
+      for (let i = 0; i < 50 && !joinCb; i++) await Promise.resolve();
+      if (!joinCb) throw new Error("channel was never created — the store never reached join()");
+      joinCb("SUBSCRIBED");
       await Promise.resolve();
-      await Promise.resolve();
-      joinCb?.("SUBSCRIBED");
     },
+    fire: (state: string) => joinCb?.(state),
   };
 }
 
@@ -338,5 +355,98 @@ describe("room store: lifecycle + status", () => {
     await h.join();
     expect(seen).toContain("live");
     release();
+  });
+});
+
+// Regression suite for the FIRST real-world failure of bool.room, found on a
+// preview app (2026-07-29). Symptom: the app rendered "ROOM IS LIVE" with 0
+// peers forever; an external observer confirmed the tab was absent from
+// presence, and a 34-second WebSocket watch showed ZERO frames and ZERO
+// sockets. Four independent defects conspired, each individually silent:
+//
+//   1. `CLOSED` was not a handled channel state, and supabase-js does NOT
+//      auto-rejoin — a dropped socket meant permanent death. (Verified against
+//      a real close: the status arrives with no follow-up SUBSCRIBED.)
+//   2. teardown() assigned `state` directly instead of via setStatus, so every
+//      useSyncExternalStore subscriber kept a stale snapshot — which is why the
+//      badge said "live" while nothing was connected.
+//   3. track()/send() failures were swallowed: supabase-js RESOLVES with the
+//      string "timed out" / "error" rather than throwing, so `void ch.track()`
+//      discarded every failure.
+//   4. mint() had no timeout, so one hung fetch could wedge the machine with no
+//      channel, no status change and no retry.
+describe("room store: recovery (the dead-but-'live' regression)", () => {
+  test("CLOSED recovers instead of dying silently", async () => {
+    const h = makeHarness();
+    const release = h.store.acquire();
+    await h.join();
+    expect(h.store.status()).toBe("live");
+
+    h.fire("CLOSED"); // socket dropped: blip, server close, token expiry
+    await h.advance(1);
+    // Honest status, and a retry scheduled — not a permanent "live" lie.
+    expect(h.store.status()).toBe("unavailable");
+    await h.advance(1_100);
+    await h.join();
+    expect(h.store.status()).toBe("live");
+    release();
+  });
+
+  test("every terminal channel state drives recovery", async () => {
+    for (const terminal of ["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"]) {
+      const h = makeHarness();
+      const release = h.store.acquire();
+      await h.join();
+      h.fire(terminal);
+      await h.advance(1);
+      expect(h.store.status()).toBe("unavailable");
+      release();
+    }
+  });
+
+  test("status changes ALWAYS notify subscribers — a stale snapshot is the bug", async () => {
+    // useStatus() is a useSyncExternalStore over this; a direct `state = …`
+    // write leaves React rendering the old value forever.
+    const h = makeHarness();
+    const seen: string[] = [];
+    h.store.onStatus((s) => seen.push(s));
+    const release = h.store.acquire();
+    await h.join();
+    expect(seen).toContain("live");
+    release(); // last release → teardown
+    expect(seen[seen.length - 1]).toBe("connecting");
+    expect(h.store.status()).toBe("connecting");
+  });
+
+  test("a failed presence publish reconnects instead of going quiet", async () => {
+    // supabase-js resolves "timed out" on a dead channel — no exception to
+    // catch, so this is only visible if the result is inspected.
+    const h = makeHarness({ trackResult: "timed out" });
+    const release = h.store.acquire();
+    await h.join();
+    h.store.setMe({ cursor: { x: 1, y: 1 } });
+    await h.advance(40);
+    expect(h.store.status()).toBe("unavailable"); // healing, not silently dead
+    release();
+  });
+
+  test("a hung mint cannot wedge the room forever", async () => {
+    const h = makeHarness({ mint: () => new Promise(() => {}) }); // never settles
+    const release = h.store.acquire();
+    await h.advance(11_000); // past the mint timeout
+    expect(h.store.status()).toBe("unavailable");
+    release();
+  });
+
+  test("recovery is not attempted once nobody is watching", async () => {
+    // A released store must stay quiet; acquire() starts a fresh generation.
+    const h = makeHarness({ trackResult: "error" });
+    const release = h.store.acquire();
+    await h.join();
+    release();
+    const before = h.store.status();
+    h.store.setMe({ cursor: { x: 2, y: 2 } });
+    await h.advance(100);
+    expect(h.store.status()).toBe(before);
   });
 });

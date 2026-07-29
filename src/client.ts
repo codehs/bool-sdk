@@ -735,8 +735,13 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
         },
       });
       return {
-        track(state) {
-          void ch.track(state);
+        track(state, done) {
+          // supabase-js RESOLVES with "ok" | "timed out" | "error" — it does not
+          // throw — so the result must be inspected or every failure is silent.
+          void ch.track(state).then(
+            (r) => done?.(typeof r === "string" ? r : "ok"),
+            () => done?.("error"),
+          );
         },
         onPresence(cb) {
           ch.on("presence", { event: "sync" }, () => {
@@ -748,8 +753,11 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
             cb(msg as unknown as { event: string; payload: unknown }),
           );
         },
-        send(event, payload) {
-          void ch.send({ type: "broadcast", event, payload });
+        send(event, payload, done) {
+          void ch.send({ type: "broadcast", event, payload }).then(
+            (r) => done?.(typeof r === "string" ? r : "ok"),
+            () => done?.("error"),
+          );
         },
         join(status) {
           ch.subscribe((state) => status(state));

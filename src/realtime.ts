@@ -173,9 +173,15 @@ export function createDoorbell(deps: DoorbellDeps): Doorbell {
           joined++;
           attempt = 0; // a good join resets the backoff
           setStatus("live");
-        } else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT") {
+        } else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT" || s === "CLOSED") {
           // A refused private join means the wristband and the policy disagree
           // (misconfigured database, clock skew). Retry the whole handshake.
+          //
+          // CLOSED belongs here too, and its absence was a latent bug shared
+          // with the room lane: when the socket drops (network blip, server
+          // close, token expiry) supabase-js reports a terminal state and does
+          // NOT auto-rejoin, so leaving one unhandled meant live updates
+          // stopped forever while the last reported status stayed "live".
           teardownChannels();
           retry(myGen, "unavailable");
         }

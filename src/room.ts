@@ -54,14 +54,17 @@ export type RoomMintResult =
 /** The transport seam — everything effectful is injected so the machine and
  * store are unit-testable without sockets (same discipline as realtime.ts). */
 export type RoomChannel = {
-  /** Publish my full presence state (Supabase `track`). */
-  track(state: Record<string, unknown>): void;
+  /** Publish my full presence state (Supabase `track`). Reports the outcome:
+   * supabase-js RESOLVES with the string "ok" | "timed out" | "error" rather
+   * than throwing, so a `void`-ed call swallows every failure — which is how a
+   * dead channel went unnoticed while the UI still said "live". */
+  track(state: Record<string, unknown>, done?: (result: string) => void): void;
   /** Presence changed (sync/join/leave) — `states` is keyed by presence key. */
   onPresence(cb: (states: Record<string, Array<Record<string, unknown>>>) => void): void;
   /** Receive one broadcast envelope. */
   onBroadcast(cb: (msg: { event: string; payload: unknown }) => void): void;
-  /** Send one broadcast envelope. */
-  send(event: string, payload: unknown): void;
+  /** Send one broadcast envelope. Same outcome contract as `track`. */
+  send(event: string, payload: unknown, done?: (result: string) => void): void;
   join(status: (state: string) => void): void;
   leave(): void;
 };
@@ -85,6 +88,10 @@ const TRACK_THROTTLE_MS = 25;
 // Same shape/limits as the doorbell: quick first retry, capped so an outage
 // costs one request a minute, refresh at 75% of the wristband TTL.
 const RETRY_MS = [1_000, 5_000, 15_000, 60_000];
+// A mint that never settles would wedge the machine: no channel, no status
+// change, no retry — indistinguishable from "live" to anything watching. Cap it
+// and treat a stall as an ordinary unavailable, which retries.
+const MINT_TIMEOUT_MS = 10_000;
 const REFRESH_FRACTION = 0.75;
 const MIN_REFRESH_MS = 30_000;
 // Realtime rejects large messages; failing loudly here names the actual
@@ -161,8 +168,31 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
   const now = deps.now ?? (() => Date.now());
 
   function pushTrack(): void {
+    if (!channel) return;
     lastTrackAt = now();
-    channel?.track({ ...myState });
+    const myGen = gen;
+    channel.track({ ...myState }, (result) => {
+      // "timed out" / "error" means this channel is no longer usable. It is
+      // NOT an exception, so nothing surfaces unless we look — and a room that
+      // silently stops publishing while reporting "live" is the worst outcome
+      // available. Heal instead: same-generation only, so a stale channel's
+      // late reply can't restart a healthy connection.
+      if (result !== "ok" && myGen === gen) unhealthy("presence publish failed");
+    });
+  }
+
+  /** A live channel turned out not to be live. Tear it down and reconnect with
+   * backoff, reporting the honest status on the way. Guarded so several
+   * failures in one generation collapse into one restart. */
+  function unhealthy(why: string): void {
+    if (holds === 0) return; // nobody is watching; acquire() will start fresh
+    if (typeof console !== "undefined") {
+      console.warn(`bool.room: reconnecting (${why}).`);
+    }
+    gen++;
+    const myGen = gen;
+    teardown();
+    retry(myGen, "unavailable");
   }
   function scheduleTrack(): void {
     if (!channel || !joined) return; // replayed on join instead
@@ -217,7 +247,12 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
     teardown();
     if (myGen !== gen) return;
 
-    const res = await deps.mint();
+    const res = await Promise.race([
+      deps.mint(),
+      new Promise<RoomMintResult>((resolve) =>
+        schedule(() => resolve({ ok: false, reason: "unavailable" }), MINT_TIMEOUT_MS),
+      ),
+    ]);
     if (myGen !== gen) return;
     if (!res.ok) return retry(myGen, res.reason);
     // A platform that predates the room topic can't host one — honest
@@ -257,7 +292,16 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
         // Join/rejoin replays my current presence so a reconnect (or a late
         // first join) never leaves me invisible.
         pushTrack();
-      } else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT") {
+      } else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT" || s === "CLOSED") {
+        // CLOSED was previously unhandled, which meant a socket that dropped
+        // (network blip, server close, token expiry, a StrictMode teardown
+        // racing a re-subscribe) left the room permanently dead while the last
+        // reported status stayed "live". supabase-js does NOT auto-rejoin, so
+        // every terminal state must drive recovery. Verified against a real
+        // close: the status arrives as CHANNEL_ERROR "socket closed: 1005"
+        // with no follow-up SUBSCRIBED.
+        joined = false;
+        teardown();
         retry(myGen, "unavailable");
       }
     });
@@ -298,7 +342,10 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
         if (holds === 0) {
           gen++;
           teardown();
-          state = "connecting";
+          // setStatus, never a bare assignment: a direct write leaves every
+          // useSyncExternalStore subscriber holding a stale snapshot, which is
+          // exactly how a torn-down room kept rendering "live" forever.
+          setStatus("connecting");
         }
       };
     },
