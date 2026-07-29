@@ -245,9 +245,17 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
     }
   }
   function teardown(): void {
-    channel?.leave();
+    // Null the reference BEFORE leaving. supabase's removeChannel fires the
+    // channel's own status callback with CLOSED — synchronously, from inside
+    // leave() — and the terminal-state handler tears down in response. With the
+    // old order (leave first, null after) that re-entered here while `channel`
+    // still pointed at the same channel: leave → CLOSED → teardown → leave → …
+    // a stack overflow on every real network drop. The handler's
+    // channel-identity guard is the other half of this fix.
+    const ch = channel;
     channel = null;
     joined = false;
+    ch?.leave();
     clearTimer();
     if (trackTimer !== null) {
       cancel(trackTimer);
@@ -329,8 +337,17 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
       if (env.f === self.id) return; // already delivered locally, synchronously
       dispatch(msg.event, { from: env.f ?? "", data: env.d });
     });
+    // Current BEFORE join() is registered: the status callback guards on
+    // channel identity, and a callback that fired before the assignment would
+    // wrongly see itself as stale.
+    channel = ch;
     ch.join((s) => {
-      if (myGen !== gen) return;
+      // The identity check (not just gen) is load-bearing: teardown() nulls
+      // `channel` and then leave() makes THIS callback fire CLOSED, same tick,
+      // same gen. Without the check that re-entered the terminal branch below
+      // and recursed teardown → leave → CLOSED → teardown to a stack overflow
+      // on every real network drop.
+      if (myGen !== gen || channel !== ch) return;
       if (s === "SUBSCRIBED") {
         joined = true;
         attempt = 0;
@@ -351,7 +368,6 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
         retry(myGen, "unavailable");
       }
     });
-    channel = ch;
     scheduleRefresh(myGen, res.expiresIn);
   }
 

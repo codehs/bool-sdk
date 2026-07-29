@@ -593,3 +593,105 @@ describe("bool.room broadcast size limit", () => {
     release();
   });
 });
+
+describe("bool.room surviving supabase's synchronous CLOSED", () => {
+  // supabase's removeChannel fires the channel's own status callback with
+  // CLOSED — synchronously, from inside leave(). Since the terminal-state
+  // handler responds to CLOSED by tearing down (which leaves), the two used to
+  // feed each other: teardown → leave → CLOSED → teardown → … a stack overflow
+  // on every real network drop. Seen in production as an endless stream of
+  // "Maximum call stack size exceeded" from a deployed cursor app.
+  function makeSyncCloseHarness() {
+    let joinCb: ((s: string) => void) | null = null;
+    let channelsMade = 0;
+    const timers: Array<{ at: number; fn: () => void; id: number }> = [];
+    let clock = 0;
+    let nextId = 1;
+    const deps: RoomDeps = {
+      mint: async () => ({ ok: true, token: "t", expiresIn: 900, topic: "bool:x:room" }),
+      setAuth: () => {},
+      channel: (): RoomChannel => {
+        channelsMade++;
+        return {
+          track: (_s, done) => done?.("ok"),
+          onPresence: () => {},
+          onBroadcast: () => {},
+          send: () => {},
+          join: (cb) => {
+            joinCb = cb;
+          },
+          leave: () => {
+            joinCb?.("CLOSED"); // what removeChannel actually does
+          },
+        };
+      },
+      schedule: (fn, ms) => {
+        const id = nextId++;
+        timers.push({ at: clock + ms, fn, id });
+        return id;
+      },
+      cancel: (h) => {
+        const i = timers.findIndex((t) => t.id === h);
+        if (i !== -1) timers.splice(i, 1);
+      },
+      now: () => clock,
+      wake: () => () => {},
+    };
+    const store = createRoomStore(deps);
+    const advance = async (ms: number) => {
+      const target = clock + ms;
+      for (;;) {
+        timers.sort((a, b) => a.at - b.at);
+        const due = timers[0];
+        if (!due || due.at > target) break;
+        clock = due.at;
+        timers.shift();
+        due.fn();
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      }
+      clock = target;
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    };
+    return {
+      store,
+      advance,
+      fire: (s: string) => joinCb?.(s),
+      channelsMade: () => channelsMade,
+      join: async () => {
+        for (let i = 0; i < 50 && !joinCb; i++) await Promise.resolve();
+        joinCb!("SUBSCRIBED");
+        await Promise.resolve();
+      },
+    };
+  }
+
+  test("a real drop does not recurse, and the room still recovers", async () => {
+    const h = makeSyncCloseHarness();
+    const release = h.store.acquire();
+    await h.join();
+    expect(h.store.status()).toBe("live");
+
+    h.fire("CLOSED"); // pre-fix: RangeError, maximum call stack exceeded
+    expect(h.store.status()).toBe("unavailable");
+
+    // and recovery is intact: the retry rung reconnects a fresh channel
+    const before = h.channelsMade();
+    await h.advance(1_000);
+    expect(h.channelsMade()).toBe(before + 1);
+    await h.join();
+    expect(h.store.status()).toBe("live");
+    release();
+  });
+
+  test("release() with a live channel does not recurse either", async () => {
+    const h = makeSyncCloseHarness();
+    const release = h.store.acquire();
+    await h.join();
+    release(); // teardown → leave → sync CLOSED, on the unmount path
+    expect(h.store.status()).toBe("connecting");
+    // and nothing keeps retrying after teardown
+    const before = h.channelsMade();
+    await h.advance(120_000);
+    expect(h.channelsMade()).toBe(before);
+  });
+});

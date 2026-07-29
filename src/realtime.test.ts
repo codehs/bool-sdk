@@ -368,3 +368,57 @@ describe("doorbell waking up", () => {
     expect(seen).toEqual(["connecting"]); // the notification, not just the field
   });
 });
+
+describe("doorbell surviving supabase's synchronous CLOSED", () => {
+  // Same production stack overflow as the room lane: removeChannel fires the
+  // channel's status callback with CLOSED synchronously from inside leave(),
+  // and the terminal-state handler responds by tearing down (which leaves).
+  test("a real drop does not recurse, and the doorbell still retries", async () => {
+    let mintCalls = 0;
+    const joinCbs: Array<(s: string) => void> = [];
+    const scheduled: Array<{ fn: () => void; cancelled: boolean }> = [];
+    const doorbell = createDoorbell({
+      async mint(): Promise<MintResult> {
+        mintCalls++;
+        return MINT;
+      },
+      setAuth: () => {},
+      channel: () => {
+        const me = joinCbs.length;
+        return {
+          onBroadcast: () => {},
+          join(cb) {
+            joinCbs[me] = cb;
+          },
+          leave() {
+            joinCbs[me]?.("CLOSED"); // what removeChannel actually does
+          },
+        };
+      },
+      schedule: (fn) => {
+        const t = { fn: fn as () => void, cancelled: false };
+        scheduled.push(t);
+        return t;
+      },
+      cancel: (h) => {
+        (h as { cancelled: boolean }).cancelled = true;
+      },
+      wake: () => () => {},
+    });
+    const off = doorbell.subscribe(() => {});
+    await tick();
+    joinCbs[0]!("SUBSCRIBED");
+    expect(doorbell.status()).toBe("live");
+
+    joinCbs[0]!("CLOSED"); // pre-fix: RangeError, maximum call stack exceeded
+    expect(doorbell.status()).toBe("unavailable");
+
+    // recovery intact: the queued retry rung re-mints (cancelled timers,
+    // like the orphaned refresh, must not)
+    const before = mintCalls;
+    for (const t of scheduled.splice(0)) if (!t.cancelled) t.fn();
+    await tick();
+    expect(mintCalls).toBe(before + 1);
+    off();
+  });
+});

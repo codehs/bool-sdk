@@ -138,8 +138,15 @@ export function createDoorbell(deps: DoorbellDeps): Doorbell {
   }
 
   function teardownChannels(): void {
-    for (const ch of channels) ch.leave();
+    // Detach BEFORE leaving: supabase's removeChannel fires the channel's own
+    // status callback with CLOSED synchronously from inside leave(), and the
+    // terminal-state handler responds by tearing down. With the old order that
+    // recursed teardown → leave → CLOSED → teardown to a stack overflow on
+    // every real network drop — same defect as the room lane. The handler's
+    // membership guard is the other half.
+    const chs = channels;
     channels = [];
+    for (const ch of chs) ch.leave();
     clearTimer();
   }
 
@@ -193,8 +200,16 @@ export function createDoorbell(deps: DoorbellDeps): Doorbell {
       if (!topic) continue;
       const ch = deps.channel(topic, { private: true });
       ch.onBroadcast(fanout);
+      // Registered BEFORE join(): the status callback guards on membership, and
+      // a callback firing before the push would wrongly see itself as stale.
+      channels.push(ch);
       ch.join((s) => {
-        if (myGen !== gen) return;
+        // Membership (not just gen) is load-bearing: teardownChannels() empties
+        // the list and then leave() makes this very callback fire CLOSED, same
+        // tick, same gen. Without the check that re-entered the terminal branch
+        // and recursed teardown → leave → CLOSED → teardown to a stack
+        // overflow on every real network drop.
+        if (myGen !== gen || !channels.includes(ch)) return;
         if (s === "SUBSCRIBED") {
           joined++;
           attempt = 0; // a good join resets the backoff
@@ -212,7 +227,6 @@ export function createDoorbell(deps: DoorbellDeps): Doorbell {
           retry(myGen, "unavailable");
         }
       });
-      channels.push(ch);
     }
     if (joined === 0 && channels.length === 0) return retry(myGen, "unavailable");
 
