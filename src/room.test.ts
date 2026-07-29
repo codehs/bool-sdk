@@ -213,59 +213,121 @@ describe("room store: presence", () => {
     release();
   });
 
+  // These four assert at the only altitude that survived the transport change:
+  // what a PEER on the same wire observes. (They used to peek at the wire's
+  // presence map — which went blank the day setMe state moved from presence,
+  // where the server throttles cursor-frequency writes to death, to broadcast.)
   test("setMe merges patches and undefined deletes a key", async () => {
-    const h = makeHarness();
-    const release = h.store.acquire();
-    await h.join();
+    const wire = makeWire();
+    const a = makeHarness({ wire });
+    const b = makeHarness({ wire });
+    const releaseA = a.store.acquire();
+    await a.join();
+    const releaseB = b.store.acquire();
+    await b.join();
 
-    h.store.setMe({ cursor: { x: 1, y: 1 } });
-    await h.advance(30);
-    h.store.setMe({ typing: true });
-    await h.advance(30);
-    expect(h.wire.presences.get(h.selfKey())).toEqual({ cursor: { x: 1, y: 1 }, typing: true });
+    a.store.setMe({ cursor: { x: 1, y: 1 } });
+    await a.advance(30);
+    a.store.setMe({ typing: true });
+    await a.advance(30);
+    const seen = () => b.store.getOthers().find((o) => o.id === a.store.self.id)!.presence;
+    expect(seen()).toEqual({ cursor: { x: 1, y: 1 }, typing: true });
 
-    h.store.setMe({ typing: undefined });
-    await h.advance(30);
-    expect(h.wire.presences.get(h.selfKey())).toEqual({ cursor: { x: 1, y: 1 } });
-    release();
+    a.store.setMe({ typing: undefined });
+    await a.advance(30);
+    expect(seen()).toEqual({ cursor: { x: 1, y: 1 } });
+    releaseA();
+    releaseB();
   });
 
   test("setMe is trailing-edge throttled: a 60fps burst collapses but the FINAL position lands", async () => {
-    const h = makeHarness();
-    const release = h.store.acquire();
-    await h.join();
-    const trackCountAfterJoin = h.wire.presences.size; // join replays once
+    const wire = makeWire();
+    const a = makeHarness({ wire });
+    const b = makeHarness({ wire });
+    const releaseA = a.store.acquire();
+    await a.join();
+    const releaseB = b.store.acquire();
+    await b.join();
+    const sendsBefore = a.sent.filter((s) => s.event === "~me").length;
 
     // 20 moves in ~80ms (way over the 25ms throttle)
     for (let i = 1; i <= 20; i++) {
-      h.store.setMe({ cursor: { x: i, y: i } });
-      await h.advance(4);
+      a.store.setMe({ cursor: { x: i, y: i } });
+      await a.advance(4);
     }
-    await h.advance(50); // let the trailing edge fire
-    const mine = h.wire.presences.get(h.selfKey()) as { cursor: { x: number } };
-    expect(mine.cursor.x).toBe(20); // the last write always wins on the wire
-    expect(trackCountAfterJoin).toBe(1);
-    release();
+    await a.advance(50); // let the trailing edge fire
+    const sends = a.sent.filter((s) => s.event === "~me").length - sendsBefore;
+    expect(sends).toBeLessThanOrEqual(6); // ~80ms / 25ms + trailing edge
+    expect(sends).toBeGreaterThan(0);
+    const seen = b.store.getOthers().find((o) => o.id === a.store.self.id)!
+      .presence as { cursor: { x: number } };
+    expect(seen.cursor.x).toBe(20); // the last write always wins on the wire
+    releaseA();
+    releaseB();
   });
 
-  test("presence set before the join is replayed ON join (never invisible)", async () => {
-    const h = makeHarness();
-    const release = h.store.acquire();
-    h.store.setMe({ name: "jack" }); // before SUBSCRIBED
-    await h.join();
-    expect(h.wire.presences.get(h.selfKey())).toEqual({ name: "jack" });
-    release();
+  test("state set before the join is replayed ON join (never invisible)", async () => {
+    const wire = makeWire();
+    const b = makeHarness({ wire });
+    const releaseB = b.store.acquire();
+    await b.join();
+    const a = makeHarness({ wire });
+    const releaseA = a.store.acquire();
+    a.store.setMe({ name: "jack" }); // before SUBSCRIBED
+    await a.join();
+    await a.advance(5);
+    const seen = b.store.getOthers().find((o) => o.id === a.store.self.id)!.presence;
+    expect(seen).toEqual({ name: "jack" });
+    releaseA();
+    releaseB();
+  });
+
+  test("a late joiner is hydrated by the existing peers' re-send (jittered)", async () => {
+    // The reverse of the test above: A already has state, THEN B joins. B has
+    // missed A's ~me broadcasts entirely; A must re-send when it sees a new
+    // member, or B renders A as an empty ghost until A's next move.
+    const wire = makeWire();
+    const a = makeHarness({ wire });
+    const releaseA = a.store.acquire();
+    await a.join();
+    a.store.setMe({ name: "jack" });
+    await a.advance(30);
+
+    const b = makeHarness({ wire });
+    const releaseB = b.store.acquire();
+    await b.join();
+    // before A's hydration fires, B knows A only as a member
+    await a.advance(301); // past the max hydrate jitter
+    const seen = b.store.getOthers().find((o) => o.id === a.store.self.id)!.presence;
+    expect(seen).toEqual({ name: "jack" });
+    releaseA();
+    releaseB();
   });
 
   test("clearMe removes exactly the named keys (hook-unmount semantics)", async () => {
+    const wire = makeWire();
+    const a = makeHarness({ wire });
+    const b = makeHarness({ wire });
+    const releaseA = a.store.acquire();
+    await a.join();
+    const releaseB = b.store.acquire();
+    await b.join();
+    a.store.setMe({ cursor: { x: 1, y: 1 }, name: "jack" });
+    await a.advance(30);
+    a.store.clearMe(["cursor"]);
+    await a.advance(30);
+    const seen = b.store.getOthers().find((o) => o.id === a.store.self.id)!.presence;
+    expect(seen).toEqual({ name: "jack" });
+    releaseA();
+    releaseB();
+  });
+
+  test("app events can never squat the SDK's reserved wire namespace", async () => {
     const h = makeHarness();
     const release = h.store.acquire();
     await h.join();
-    h.store.setMe({ cursor: { x: 1, y: 1 }, name: "jack" });
-    await h.advance(30);
-    h.store.clearMe(["cursor"]);
-    await h.advance(30);
-    expect(h.wire.presences.get(h.selfKey())).toEqual({ name: "jack" });
+    expect(() => h.store.broadcast("~me", { fake: true })).toThrow(/reserved for the SDK/);
+    expect(() => h.store.broadcast("~anything", 1)).toThrow(/reserved/);
     release();
   });
 });

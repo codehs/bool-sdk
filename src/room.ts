@@ -11,9 +11,18 @@
 //     a name on both sides of the durable/ephemeral split is how data ends up
 //     in the wrong lane. A room is who's here right now; nobody expects a room
 //     to survive a reload.
-//   - Presence rides Supabase `track()`/presence (hydrates late joiners,
-//     auto-clears on disconnect) — NOT hand-rolled heartbeat events, which
-//     leave ghost cursors nothing can clean up.
+//   - MEMBERSHIP rides Supabase presence (auto-clears on disconnect — no
+//     hand-rolled heartbeats, no ghost cursors), but STATE rides broadcast.
+//     Presence is a server-side CRDT built for low-frequency state, and it
+//     falls over at cursor frequency: measured on real infra, 3 movers at 40Hz
+//     had their `track()` calls stop being acknowledged within a second (5 acks
+//     per mover, then 10s timeouts), while the identical 120 msg/s over
+//     broadcast delivered 97–100% at ~10ms, sustained. Worse, treating those
+//     timeouts as channel failure caused a reconnect storm — the UI flapped
+//     between "N people here" and "live view unavailable". So: one `track({})`
+//     per join for who's-here, and `setMe` state flows as throttled full-state
+//     broadcasts on a reserved event, fire-and-forget. Full state (not deltas)
+//     makes drops harmless — the next send heals everything.
 //   - The throttle lives HERE, not in app code: a prompt rule asking the model
 //     to throttle is forgettable; a setter that throttles isn't.
 //   - Broadcast echoes to the SENDER locally and synchronously (never a round
@@ -85,10 +94,25 @@ export type RoomDeps = {
   wake?: (cb: () => void) => () => void;
 };
 
-// Presence writes coalesce on a trailing edge so the FINAL position always
-// lands. ~25ms ≈ 40/s, inside Supabase's per-connection event budget while
-// still far above the ~24fps where motion reads as smooth.
+// State sends coalesce on a trailing edge so the FINAL position always lands.
+// ~25ms ≈ 40/s, far above the ~24fps where motion reads as smooth.
 const TRACK_THROTTLE_MS = 25;
+// The reserved broadcast event carrying a peer's full `setMe` state. App code
+// cannot use "~"-prefixed event names (broadcast() rejects them), so this can
+// never collide with a real event.
+const ME_EVENT = "~me";
+// When someone new joins, every peer re-sends its state once so the newcomer
+// hydrates immediately instead of waiting for everyone's next move. Jittered
+// so N peers don't stampede the channel in the same tick.
+const HYDRATE_JITTER_MS = 300;
+/** Per-message fan-out is O(peers), so the whole room's wire cost grows with
+ * peers². Scale the send interval so a big room degrades to slower cursors
+ * instead of a saturated channel: full rate through ~6 people, ~n(n-1) ms
+ * beyond (10 people → ~90ms ≈ 11Hz each). */
+export function throttleForPeers(othersCount: number): number {
+  const n = othersCount + 1;
+  return Math.max(TRACK_THROTTLE_MS, n * (n - 1));
+}
 // Same shape/limits as the doorbell: quick first retry, capped so an outage
 // costs one request a minute, refresh at 75% of the wristband TTL.
 const RETRY_MS = [1_000, 5_000, 15_000, 60_000];
@@ -109,10 +133,13 @@ const WAKE_COALESCE_MS = 500;
 // 12 distinguishable hues; index by a stable hash of the peer id so every
 // client computes the same color for the same peer.
 const HUES = [4, 32, 56, 96, 152, 176, 200, 224, 256, 284, 312, 340];
-export function colorForId(id: string): string {
+function hashOf(id: string): number {
   let h = 0;
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
-  return `hsl(${HUES[Math.abs(h) % HUES.length]} 85% 55%)`;
+  return h;
+}
+export function colorForId(id: string): string {
+  return `hsl(${HUES[Math.abs(hashOf(id)) % HUES.length]} 85% 55%)`;
 }
 
 // The wire limit is BYTES, and `String.length` counts UTF-16 code units — so a
@@ -185,25 +212,42 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
     for (const l of eventListeners) l(event, e);
   };
 
-  // ---- my presence: merge + trailing-edge throttle -------------------------
+  // ---- my state: merge + trailing-edge throttle, published over broadcast --
   const myState: Record<string, unknown> = {};
   let trackTimer: unknown = null;
   let lastTrackAt = 0;
   const now = deps.now ?? (() => Date.now());
   const subscribeWake = deps.wake ?? onWake;
 
-  function pushTrack(): void {
-    if (!channel) return;
+  // Peer state assembled from two lanes: presence gives MEMBERSHIP (who's
+  // connected, auto-cleared on disconnect) plus any state old-SDK peers still
+  // put in their presence meta; ~me broadcasts give current-SDK peers' state.
+  // A peer's visible presence = meta overlaid with its last ~me. Both maps are
+  // keyed by peer id; membership is authoritative — state without membership
+  // is dropped (its owner disconnected).
+  let memberMeta = new Map<string, Record<string, unknown>>();
+  const stateById = new Map<string, Record<string, unknown>>();
+
+  function rebuildOthers(): void {
+    const next: Array<RoomPeer<P>> = [];
+    for (const [id, meta] of memberMeta) {
+      if (id === self.id) continue; // others NEVER includes you
+      const presence = { ...meta, ...stateById.get(id) };
+      next.push({ id, color: colorForId(id), presence: presence as Partial<P> });
+    }
+    next.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    others = next;
+    emitOthers();
+  }
+
+  /** Publish my full state now, fire-and-forget. Full state, not a delta:
+   * drops are healed by the next send, and a late joiner needs one message,
+   * not a replay. No ack — at cursor frequency, waiting on per-message acks is
+   * what melted the presence transport. */
+  function pushMe(): void {
+    if (!channel || !joined) return;
     lastTrackAt = now();
-    const myGen = gen;
-    channel.track({ ...myState }, (result) => {
-      // "timed out" / "error" means this channel is no longer usable. It is
-      // NOT an exception, so nothing surfaces unless we look — and a room that
-      // silently stops publishing while reporting "live" is the worst outcome
-      // available. Heal instead: same-generation only, so a stale channel's
-      // late reply can't restart a healthy connection.
-      if (result !== "ok" && myGen === gen) unhealthy("presence publish failed");
-    });
+    channel.send(ME_EVENT, { f: self.id, s: { ...myState } });
   }
 
   /** A live channel turned out not to be live. Tear it down and reconnect with
@@ -219,15 +263,29 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
     teardown();
     retry(myGen, "unavailable");
   }
-  function scheduleTrack(): void {
+  function scheduleMe(): void {
     if (!channel || !joined) return; // replayed on join instead
+    const throttle = throttleForPeers(others.length);
     const elapsed = now() - lastTrackAt;
-    if (elapsed >= TRACK_THROTTLE_MS) return pushTrack();
+    if (elapsed >= throttle) return pushMe();
     if (trackTimer !== null) return; // trailing edge already armed
     trackTimer = schedule(() => {
       trackTimer = null;
-      pushTrack();
-    }, TRACK_THROTTLE_MS - elapsed);
+      pushMe();
+    }, throttle - elapsed);
+  }
+
+  // One pending hydration re-send, jittered off the peer-id hash so N peers
+  // answering the same join don't stampede the channel in one tick.
+  let hydrateTimer: unknown = null;
+  function scheduleHydrate(): void {
+    if (hydrateTimer !== null) return;
+    if (Object.keys(myState).length === 0) return; // nothing to tell them
+    const jitter = 1 + (Math.abs(hashOf(self.id)) % HYDRATE_JITTER_MS);
+    hydrateTimer = schedule(() => {
+      hydrateTimer = null;
+      pushMe();
+    }, jitter);
   }
 
   // ---- connection machine (gen/backoff/refresh, doorbell-style) ------------
@@ -261,6 +319,12 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
       cancel(trackTimer);
       trackTimer = null;
     }
+    if (hydrateTimer !== null) {
+      cancel(hydrateTimer);
+      hydrateTimer = null;
+    }
+    memberMeta = new Map();
+    stateById.clear();
     if (others.length > 0) {
       others = [];
       emitOthers();
@@ -319,20 +383,38 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
     const ch = deps.channel(res.topic, self.id);
     ch.onPresence((states) => {
       if (myGen !== gen) return;
-      const next: Array<RoomPeer<P>> = [];
+      const nextMeta = new Map<string, Record<string, unknown>>();
+      let sawNewMember = false;
       for (const [key, metas] of Object.entries(states)) {
-        if (key === self.id) continue; // others NEVER includes you
         // Supabase keeps one meta per connection under the key; last wins.
         const meta = metas[metas.length - 1] ?? {};
-        const { presence_ref: _ref, ...presence } = meta as Record<string, unknown>;
-        next.push({ id: key, color: colorForId(key), presence: presence as Partial<P> });
+        const { presence_ref: _ref, ...rest } = meta as Record<string, unknown>;
+        nextMeta.set(key, rest);
+        if (key !== self.id && !memberMeta.has(key)) sawNewMember = true;
       }
-      next.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-      others = next;
-      emitOthers();
+      // Membership is authoritative: state whose owner left is dropped, which
+      // is what auto-clears a closed tab's cursor.
+      for (const id of stateById.keys()) {
+        if (!nextMeta.has(id)) stateById.delete(id);
+      }
+      memberMeta = nextMeta;
+      rebuildOthers();
+      // Someone new arrived: re-send my state once (jittered) so they see me
+      // now instead of on my next move.
+      if (sawNewMember) scheduleHydrate();
     });
     ch.onBroadcast((msg) => {
       if (myGen !== gen) return;
+      if (msg.event === ME_EVENT) {
+        const env = (msg.payload ?? {}) as { f?: string; s?: Record<string, unknown> };
+        if (!env.f || env.f === self.id) return;
+        // State can outrun membership by a beat (broadcast delivers before the
+        // presence diff); hold it either way — rebuildOthers keys off
+        // membership, so it shows the moment the member appears.
+        stateById.set(env.f, env.s ?? {});
+        if (memberMeta.has(env.f)) rebuildOthers();
+        return;
+      }
       const env = (msg.payload ?? {}) as { f?: string; d?: unknown };
       if (env.f === self.id) return; // already delivered locally, synchronously
       dispatch(msg.event, { from: env.f ?? "", data: env.d });
@@ -352,9 +434,17 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
         joined = true;
         attempt = 0;
         setStatus("live");
-        // Join/rejoin replays my current presence so a reconnect (or a late
+        // ONE membership beacon per join — presence carries who's-here, never
+        // state (see the transport note at the top of this file). This is the
+        // only track() the store ever issues, so its failure genuinely means
+        // the channel is broken and healing is right; at one-per-join it can
+        // never melt into the reconnect storm the per-move version caused.
+        ch.track({}, (result) => {
+          if (result !== "ok" && myGen === gen) unhealthy("presence join failed");
+        });
+        // Join/rejoin replays my current state so a reconnect (or a late
         // first join) never leaves me invisible.
-        pushTrack();
+        pushMe();
       } else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT" || s === "CLOSED") {
         // CLOSED was previously unhandled, which meant a socket that dropped
         // (network blip, server close, token expiry, a StrictMode teardown
@@ -429,7 +519,7 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
         if (v === undefined) delete myState[k];
         else myState[k] = v;
       }
-      scheduleTrack();
+      scheduleMe();
     },
     clearMe(keys) {
       let changed = false;
@@ -439,9 +529,16 @@ export function createRoomStore<P = Record<string, unknown>>(deps: RoomDeps): Ro
           changed = true;
         }
       }
-      if (changed) scheduleTrack();
+      if (changed) scheduleMe();
     },
     broadcast(event, data) {
+      if (event.startsWith("~")) {
+        // "~" names the SDK's own wire events (~me carries setMe state). A
+        // user event on that namespace would be read back as peer state.
+        throw new Error(
+          `bool.room.broadcast("${event}"): event names starting with "~" are reserved for the SDK. Pick another name.`,
+        );
+      }
       const envelope = { f: self.id, d: data };
       const size = byteLength(JSON.stringify(envelope) ?? "");
       if (size > MAX_PAYLOAD_BYTES) {
