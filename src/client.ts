@@ -180,6 +180,66 @@ export type BoolAi = {
   stream(prompt: string): AsyncIterable<string>;
 };
 
+/** Thrown when a `fetch` call could not be made at all — the secret isn't set,
+ * the URL isn't allowed for that secret, the app is out of credits. A response
+ * FROM the third party, including a 4xx or 5xx, is not an error here: it comes
+ * back as a normal `Response` for you to check, exactly like `fetch`. */
+export class BoolFetchError extends Error {
+  /** Machine-readable reason. Common values: `secret_not_set` (the app's owner
+   * hasn't provided that key yet), `unknown_secret`, `host_not_allowed`,
+   * `rate_limited`, `out_of_app_credits`. */
+  readonly code: string;
+  readonly status: number;
+  /** The secret names the failure refers to, when the reason names any. */
+  readonly secrets: string[];
+  constructor(code: string, status: number, secrets: string[] = []) {
+    super(`bool.fetch failed: ${code} (${status})`);
+    this.name = "BoolFetchError";
+    this.code = code;
+    this.status = status;
+    this.secrets = secrets;
+  }
+}
+
+/** The subset of `RequestInit` a proxied call supports. Streaming request bodies,
+ * `FormData`, `AbortSignal` and the rest of `fetch`'s surface aren't forwarded:
+ * the call is described to the gateway as data, not opened from the browser. */
+export type BoolFetchInit = {
+  method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  headers?: Record<string, string> | Headers;
+  /** A string body, as with `fetch`. `JSON.stringify` your object. */
+  body?: string;
+};
+
+/** Call a third-party API that needs one of this app's stored API keys, without
+ * the key ever entering the app bundle.
+ *
+ * Write `{{SECRET_NAME}}` anywhere the key belongs — in the URL, in a header
+ * value, or inside the body — and the gateway substitutes the real value
+ * server-side before making the request:
+ *
+ * ```ts
+ * const res = await bool.fetch(
+ *   "https://api.example.com/v1/things?key={{EXAMPLE_API_KEY}}",
+ * );
+ * if (!res.ok) return;
+ * const data = await res.json();
+ * ```
+ *
+ * Takes the same arguments as `fetch` and resolves to a real `Response` carrying
+ * the third party's status, headers and body, so `res.ok` / `res.status` /
+ * `res.json()` mean what they always mean. It THROWS a {@link BoolFetchError}
+ * only when the request was never made — mirroring how `fetch` throws on a
+ * network failure rather than on a 404.
+ *
+ * Each key may only be sent to the one host its owner registered it for, so call
+ * the API host the key actually belongs to.
+ */
+export type BoolFetch = (
+  input: string | URL,
+  init?: BoolFetchInit,
+) => Promise<Response>;
+
 /** The gateway-routed supabase-js client. Loosely typed on the schema-name
  * generic because each Bool runs in its own non-"public" schema. */
 export type BoolDb = SupabaseClient<any, any, any, any, any>;
@@ -197,6 +257,10 @@ export type BoolClient = {
   /** The AI battery: `ai.generate(prompt)` / `ai.generate({prompt, schema})` /
    * `ai.stream(prompt)`. Server-side AI with no API key in the bundle. */
   ai: BoolAi;
+  /** Call a third-party API using one of this app's stored keys, with
+   * `{{SECRET_NAME}}` substituted server-side: `fetch(url, init)`. Same
+   * arguments and same `Response` as the global `fetch`. */
+  fetch: BoolFetch;
   /** This app's private Postgres schema name. */
   schema: string;
   /** Subscribe to the app's realtime "doorbell": fires whenever any row in the
@@ -567,7 +631,9 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
   // viewer/eu-session identity headers mirror the db and users planes so the
   // same live-gate identity flows (same-origin cookie deployed, viewer token
   // cross-origin in preview).
-  function aiHeaders(): Record<string, string> {
+  // Identity envelope shared by every battery plane: the preview viewer token,
+  // the end-user session, and the local-development API key when present.
+  function batteryHeaders(): Record<string, string> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (viewerToken) headers["x-bool-viewer"] = viewerToken;
     if (euSessionToken) headers["x-bool-eu-session"] = euSessionToken;
@@ -584,7 +650,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
         typeof promptOrOpts === "string" ? { prompt: promptOrOpts } : promptOrOpts;
       const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/ai/generate`, {
         method: "POST",
-        headers: aiHeaders(),
+        headers: batteryHeaders(),
         credentials: "include",
         body: JSON.stringify({ prompt: opts.prompt, schema: opts.schema }),
       });
@@ -600,7 +666,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     async *stream(prompt: string): AsyncIterable<string> {
       const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/ai/stream`, {
         method: "POST",
-        headers: aiHeaders(),
+        headers: batteryHeaders(),
         credentials: "include",
         body: JSON.stringify({ prompt }),
       });
@@ -692,6 +758,65 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     },
   });
 
+  // The fetch battery. The gateway holds the app's API keys and substitutes
+  // {{SECRET_NAME}} into the outbound request, so a key is never in the bundle.
+  //
+  // Note this is NOT a relative call: the editor preview runs on a different
+  // origin from the gateway, so it resolves through GATEWAY like every other
+  // plane. A relative URL would reach the gateway only once the app is published.
+  const boolFetch: BoolFetch = async (input, init = {}) => {
+    // Headers may arrive as a Headers instance or a plain object; the call is
+    // described to the gateway as JSON, so normalize to a record either way.
+    const headers: Record<string, string> = {};
+    if (typeof Headers !== "undefined" && init.headers instanceof Headers) {
+      init.headers.forEach((v, k) => {
+        headers[k] = v;
+      });
+    } else if (init.headers) {
+      Object.assign(headers, init.headers as Record<string, string>);
+    }
+
+    const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/fetch`, {
+      method: "POST",
+      headers: batteryHeaders(),
+      credentials: "include",
+      body: JSON.stringify({
+        url: String(input),
+        method: init.method,
+        headers: Object.keys(headers).length ? headers : undefined,
+        body: init.body,
+      }),
+    });
+
+    let payload: any = null;
+    try {
+      payload = await res.json();
+    } catch (_) {}
+
+    // A failure here means the request never left the server, so there is no
+    // third-party response to hand back — throw instead of inventing one.
+    if (!res.ok) {
+      throw new BoolFetchError(
+        payload?.error ?? "fetch_failed",
+        res.status,
+        Array.isArray(payload?.secrets) ? payload.secrets : [],
+      );
+    }
+
+    // Rebuild the third party's own response, so res.ok / res.status /
+    // res.json() describe the API that was called and not this transport.
+    // 204/205/304 carry no body by spec — passing one to the Response
+    // constructor throws, which would turn a successful DELETE into an error.
+    const status: number = payload?.status ?? 200;
+    const body =
+      typeof payload?.body === "string" ? payload.body : JSON.stringify(payload?.body);
+    const bodyless = status === 204 || status === 205 || status === 304;
+    return new Response(bodyless ? null : body, {
+      status,
+      headers: (payload?.headers as Record<string, string>) ?? {},
+    });
+  };
+
   const subscribeToChanges = (
     listener: (payload: BoolChangePayload) => void,
   ): (() => void) => doorbell.subscribe(listener);
@@ -701,6 +826,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     entities: createEntitiesModule(db, subscribeToChanges),
     auth,
     ai,
+    fetch: boolFetch,
     schema,
     subscribeToChanges,
   };
