@@ -5,6 +5,7 @@ import {
   hasDefaultBoolClient,
   isDeploymentSubdomain,
   BoolAiError,
+  BoolFetchError,
   type BoolClientConfig,
 } from "./client";
 
@@ -420,6 +421,142 @@ describe("bool.ai battery", () => {
 // `createBoolClient` from "bool-sdk" and `useEntity` from "bool-sdk/react",
 // nothing imported the bootstrap module at all, and every hook threw "No Bool
 // client exists yet" at first render.
+describe("bool.fetch battery", () => {
+  // The gateway answers with the third party's response described as data:
+  // { status, headers, body }. bool.fetch turns that back into a Response.
+  const planeOk = (payload: unknown) =>
+    new Response(JSON.stringify(payload), {
+      headers: { "content-type": "application/json" },
+    });
+
+  test("POSTs the call to the fetch plane, describing it as data", async () => {
+    respond = () => planeOk({ status: 200, headers: {}, body: { ok: true } });
+    const client = createBoolClient(CONFIG);
+    await client.fetch("https://api.example.com/v1/things?key={{EXAMPLE_KEY}}");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("https://bool.test/served/my-app/_bool/v1/fetch");
+    expect(calls[0]!.init?.method).toBe("POST");
+    // credentials:include so the identity cookie rides along when same-origin.
+    expect(calls[0]!.init?.credentials).toBe("include");
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({
+      url: "https://api.example.com/v1/things?key={{EXAMPLE_KEY}}",
+    });
+  });
+
+  test("forwards method, headers and body", async () => {
+    respond = () => planeOk({ status: 201, headers: {}, body: {} });
+    const client = createBoolClient(CONFIG);
+    await client.fetch("https://api.example.com/v1/charges", {
+      method: "POST",
+      headers: { authorization: "Bearer {{EXAMPLE_KEY}}" },
+      body: '{"amount":500}',
+    });
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({
+      url: "https://api.example.com/v1/charges",
+      method: "POST",
+      headers: { authorization: "Bearer {{EXAMPLE_KEY}}" },
+      body: '{"amount":500}',
+    });
+  });
+
+  test("accepts a Headers instance and a URL", async () => {
+    respond = () => planeOk({ status: 200, headers: {}, body: {} });
+    const client = createBoolClient(CONFIG);
+    await client.fetch(new URL("https://api.example.com/v1/things"), {
+      headers: new Headers({ "x-api-key": "{{EXAMPLE_KEY}}" }),
+    });
+    const sent = JSON.parse(String(calls[0]!.init?.body));
+    expect(sent.url).toBe("https://api.example.com/v1/things");
+    expect(sent.headers).toEqual({ "x-api-key": "{{EXAMPLE_KEY}}" });
+  });
+
+  test("resolves to the THIRD PARTY's response, not the plane's", async () => {
+    // The whole point of the Response shape: res.ok and res.status describe the
+    // API that was called. A 401 from them is data, not an exception.
+    respond = () =>
+      planeOk({
+        status: 401,
+        headers: { "content-type": "application/json" },
+        body: { message: "bad key" },
+      });
+    const client = createBoolClient(CONFIG);
+    const res = await client.fetch("https://api.example.com/v1/things");
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ message: "bad key" });
+  });
+
+  test("parses a JSON body and passes a text body through", async () => {
+    respond = () =>
+      planeOk({ status: 200, headers: { "content-type": "application/json" }, body: { t: 1 } });
+    const client = createBoolClient(CONFIG);
+    expect(await (await client.fetch("https://api.example.com/x")).json()).toEqual({ t: 1 });
+
+    respond = () =>
+      planeOk({ status: 200, headers: { "content-type": "text/plain" }, body: "plain" });
+    expect(await (await client.fetch("https://api.example.com/x")).text()).toBe("plain");
+  });
+
+  test("a 204 comes back without a body instead of throwing", async () => {
+    // Response rejects a body on a null-body status, so a successful DELETE would
+    // otherwise surface as an error.
+    respond = () => planeOk({ status: 204, headers: {}, body: "" });
+    const client = createBoolClient(CONFIG);
+    const res = await client.fetch("https://api.example.com/v1/things/1", {
+      method: "DELETE",
+    });
+    expect(res.status).toBe(204);
+    expect(res.ok).toBe(true);
+  });
+
+  test("throws BoolFetchError when the call was never made", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "secret_not_set", secrets: ["EXAMPLE_KEY"] }), {
+        status: 409,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    let caught: unknown;
+    try {
+      await client.fetch("https://api.example.com/x?key={{EXAMPLE_KEY}}");
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(BoolFetchError);
+    const err = caught as BoolFetchError;
+    expect(err.code).toBe("secret_not_set");
+    expect(err.status).toBe(409);
+    // The names let an app say WHICH key its owner still has to provide.
+    expect(err.secrets).toEqual(["EXAMPLE_KEY"]);
+  });
+
+  test("throws with a fallback code when the failure carries no JSON", async () => {
+    respond = () => new Response("upstream exploded", { status: 502 });
+    const client = createBoolClient(CONFIG);
+    await expect(client.fetch("https://api.example.com/x")).rejects.toBeInstanceOf(
+      BoolFetchError,
+    );
+  });
+
+  test("sends the preview identity headers, like every other battery", async () => {
+    respond = () => planeOk({ status: 200, headers: {}, body: {} });
+    const client = createBoolClient({ ...CONFIG, viewerToken: "vt-123" });
+    await client.fetch("https://api.example.com/x");
+    const headers = calls[0]!.init?.headers as Record<string, string>;
+    expect(headers["x-bool-viewer"]).toBe("vt-123");
+    expect(headers["content-type"]).toBe("application/json");
+  });
+
+  test("goes through the gateway, never a relative URL", async () => {
+    // A relative call would reach the gateway only on the deployed origin; the
+    // editor preview runs cross-origin, where it would hit the dev server.
+    respond = () => planeOk({ status: 200, headers: {}, body: {} });
+    const client = createBoolClient(CONFIG);
+    await client.fetch("https://api.example.com/x");
+    expect(calls[0]!.url.startsWith("https://bool.test/served/my-app/")).toBe(true);
+  });
+});
+
 describe("default client registry", () => {
   test("the last-created client is the default (hot reload re-registers)", () => {
     const first = createBoolClient(CONFIG);

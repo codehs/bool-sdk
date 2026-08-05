@@ -94,6 +94,32 @@ tested, and upgradable independently of any one app.
   for await (const chunk of bool.ai.stream("Write a haiku")) setText((t) => t + chunk);
   ```
   Requires the workspace to be opted into the `bool-ai` server flag.
+- **Fetch battery.** `client.fetch` calls a third-party API using a key the app's
+  owner stored with Bool, **without the key entering the bundle**. Write
+  `{{SECRET_NAME}}` wherever the key belongs — the URL, a header value, the body
+  — and the gateway's fetch plane (`/_bool/v1/fetch`) substitutes the real value
+  server-side. Same arguments as the global `fetch`, and it resolves to a real
+  `Response` carrying the third party's status, headers and body:
+  ```ts
+  const res = await bool.fetch(
+    "https://api.example.com/v1/things?key={{EXAMPLE_API_KEY}}",
+  );
+  if (!res.ok) return;              // the API's status, exactly like fetch
+  const data = await res.json();
+
+  await bool.fetch("https://api.example.com/v1/things", {
+    method: "POST",
+    headers: { Authorization: "Bearer {{EXAMPLE_API_KEY}}" },
+    body: JSON.stringify({ name }),
+  });
+  ```
+  A response from the API — including a 4xx — is data, not an error. It throws a
+  `BoolFetchError` only when the request was never made, mirroring how `fetch`
+  throws on a network failure rather than on a 404: `code` is `secret_not_set`
+  (the owner hasn't provided that key yet), `unknown_secret`, `host_not_allowed`,
+  `rate_limited` or `out_of_app_credits`, and `secrets` names the keys involved
+  so an app can say which one is missing. Each key may only be sent to the one
+  host its owner registered it for, so call the host the key belongs to.
 - **React auth layer** (`bool-sdk/react`): `<BoolAuthProvider>`,
   `useBoolAuth()`, `<AuthGate>`, and the headless `useSignInForm()` state
   machine that login forms bind to.

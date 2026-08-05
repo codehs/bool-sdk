@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.0
+
+- **New: the fetch battery — `client.fetch`.** Call a third-party API with a key
+  the app's owner stored with Bool, without the key ever entering the app bundle.
+  Write `{{SECRET_NAME}}` wherever the key belongs (the URL, a header value, the
+  body) and the gateway substitutes the real value server-side.
+
+  ```ts
+  const res = await bool.fetch(
+    "https://api.example.com/v1/things?key={{EXAMPLE_API_KEY}}",
+  );
+  if (!res.ok) return;
+  const data = await res.json();
+  ```
+
+  It takes the same arguments as the global `fetch` and resolves to a real
+  `Response` carrying the third party's status, headers and body, so `res.ok`,
+  `res.status` and `res.json()` mean what they always mean. That shape is the
+  point: the only new thing to learn is the placeholder.
+
+  A response from the API is never an error, including a 4xx. `BoolFetchError` is
+  thrown only when the request was never made — `secret_not_set`,
+  `unknown_secret`, `host_not_allowed`, `rate_limited`, `out_of_app_credits` —
+  mirroring how `fetch` throws on a network failure but not on a 404. The error
+  carries `secrets`, the key names involved, so an app can tell its user which
+  key is still missing.
+
+  A stored key may only be sent to the one host its owner registered it for; a
+  call that would send it anywhere else is refused before the request leaves the
+  server.
+
+  A minor release: purely additive, so existing apps on `^0.3.x` are unaffected
+  until they reinstall. Requires a gateway with the fetch plane enabled for the
+  workspace.
+
 ## 0.3.1
 
 - **Fixes every published app that uses a live view.** `0.3.0` shipped
