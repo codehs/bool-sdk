@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0
+## 0.5.0
 
 Types every error the AI plane can return, and normalizes the one field whose
 wire shape isn't consistent.
