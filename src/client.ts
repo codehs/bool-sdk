@@ -241,15 +241,30 @@ export const BOOL_AI_WIRE_ERROR_CODES = [
  * {@link BOOL_AI_WIRE_ERROR_CODES} for what each one means. */
 export type BoolAiWireErrorCode = (typeof BOOL_AI_WIRE_ERROR_CODES)[number];
 
-/** `BoolAiError.code`: a wire code, `"unknown_error"` when the SDK couldn't read
- * one, or any other string.
+/** Codes this SDK raises itself. They never appear in a response body, because
+ * each names a failure that happens where no body is available to carry one:
+ *
+ * - `unknown_error` — the response had no readable JSON code (a plain-text
+ *   preamble answer, or a body that wasn't JSON at all).
+ * - `stream_interrupted` — the stream began (headers said 200) and then the
+ *   connection or the provider broke partway through. Chunks yielded before
+ *   that point were real and stay yielded; there is no status to map, because
+ *   the status was already sent and it was a success.
+ *
+ * Kept out of {@link BOOL_AI_WIRE_ERROR_CODES} deliberately: that array is
+ * pinned against the gateway's own codes, and mixing locally-raised ones in
+ * would make it lie about what the wire can produce. */
+export type BoolAiLocalErrorCode = "unknown_error" | "stream_interrupted";
+
+/** `BoolAiError.code`: a wire code, one of the SDK's own
+ * {@link BoolAiLocalErrorCode}s, or any other string.
  *
  * The trailing `string` keeps this union OPEN on purpose. The gateway ships
  * independently of this package, so an app pinned to an older SDK can receive a
  * code added after it was published; a closed union would make that a type
  * error at the `default` arm instead of the runtime case it actually is. Every
  * known code still autocompletes and is still checked when you spell it. */
-export type BoolAiErrorCode = BoolAiWireErrorCode | "unknown_error" | (string & {});
+export type BoolAiErrorCode = BoolAiWireErrorCode | BoolAiLocalErrorCode | (string & {});
 
 /** Narrow a code to the closed set of known wire codes.
  *
@@ -284,7 +299,11 @@ export function isBoolAiWireErrorCode(code: string): code is BoolAiWireErrorCode
  * lifts at a known time; `rate_limited` is short-term pacing). Two statuses can
  * also carry the same code — `not_found` arrives as JSON here, but the shared
  * plane preamble answers some 404s and 403s in plain text, which the SDK cannot
- * read a code out of at all (those surface as `unknown_error`). */
+ * read a code out of at all (those surface as `unknown_error`).
+ *
+ * `status` can even be a success: a stream that breaks partway through throws
+ * `stream_interrupted` carrying the 200 the gateway already sent. See
+ * {@link BoolAiLocalErrorCode}. */
 export class BoolAiError extends Error {
   readonly status: number;
   readonly code: BoolAiErrorCode;
@@ -292,8 +311,13 @@ export class BoolAiError extends Error {
    * absent on codes that carry no retry hint. Always an absolute Date, whether
    * the gateway expressed it as an instant or as a relative delay. */
   readonly retryAfter?: Date;
-  constructor(code: BoolAiErrorCode, status: number, retryAfter?: Date) {
-    super(`bool.ai failed: ${code} (${status})`);
+  constructor(
+    code: BoolAiErrorCode,
+    status: number,
+    retryAfter?: Date,
+    options?: { cause?: unknown },
+  ) {
+    super(`bool.ai failed: ${code} (${status})`, options);
     this.name = "BoolAiError";
     this.code = code;
     this.status = status;
@@ -759,11 +783,25 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
       }
       // The gateway streams raw text deltas (text/plain). Decode and yield each
       // chunk as it arrives.
+      //
+      // Past this point the status is spent: the gateway committed to 200 the
+      // moment it sent headers, so a provider that dies mid-generation can only
+      // break the body. That surfaces here as a rejected read, with no body and
+      // no status to map — hence a locally-raised `stream_interrupted` rather
+      // than the status-keyed path above. Everything already yielded was real
+      // output; a caller that has been appending chunks to a UI should treat
+      // this as "the response stopped early", not "the response failed".
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       try {
         while (true) {
-          const { done, value } = await reader.read();
+          let done: boolean;
+          let value: Uint8Array | undefined;
+          try {
+            ({ done, value } = await reader.read());
+          } catch (cause) {
+            throw new BoolAiError("stream_interrupted", res.status, undefined, { cause });
+          }
           if (done) break;
           const chunk = decoder.decode(value, { stream: true });
           if (chunk) yield chunk;

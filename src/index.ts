@@ -11,6 +11,7 @@ export {
   BoolAiError,
   type BoolAiErrorCode,
   type BoolAiWireErrorCode,
+  type BoolAiLocalErrorCode,
   BOOL_AI_WIRE_ERROR_CODES,
   isBoolAiWireErrorCode,
   type BoolUser,

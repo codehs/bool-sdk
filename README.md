@@ -114,6 +114,13 @@ tested, and upgradable independently of any one app.
   absent otherwise. The wire has two forms for it (an instant, or a delay in
   seconds); the SDK normalizes both so app code only handles one.
 
+  `stream` throws the same error type, but a stream can also fail *after* it
+  starts: the gateway has already sent its 200 by then, so a provider that dies
+  mid-generation can only break the body. That arrives as
+  `code === "stream_interrupted"` with `status` still `200` (and the underlying
+  failure on `cause`). Chunks yielded before the break were real output — treat
+  it as "the response stopped early", not "the response failed".
+
   `BoolAiErrorCode` is an open union, so a code added to the gateway after your
   SDK was published still typechecks. To get an exhaustiveness-checked `switch`,
   narrow with `isBoolAiWireErrorCode()` first — `BOOL_AI_WIRE_ERROR_CODES` is

@@ -9,8 +9,8 @@ wire shape isn't consistent.
   plane returns as JSON — `out_of_app_credits`, `app_credit_daily_cap`,
   `rate_limited`, `payload_too_large`, `missing_prompt`, `invalid_json`,
   `method_not_allowed`, `not_found`, `ai_unavailable`, `ai_failed` — each
-  documented with the status it arrives on. `BoolAiErrorCode` adds
-  `"unknown_error"` and stays an open union: the gateway ships independently of
+  documented with the status it arrives on. `BoolAiErrorCode` adds the SDK's own
+  `BoolAiLocalErrorCode`s and stays an open union: the gateway ships independently of
   this package, so an app on an older SDK can meet a code published after it,
   and that's a runtime case to handle rather than a compile error.
 
@@ -43,6 +43,22 @@ wire shape isn't consistent.
   transient provider blip; retrying a 404 forever was the result. Apps that
   branch on `ai_failed` to drive a retry should keep doing exactly that — it
   still arrives on a genuine 502, and now only then.
+
+- **`stream` has its own error path.** A stream can fail after it starts, and
+  that failure can never be status-mapped: the gateway commits to 200 when it
+  sends headers, so a provider that dies mid-generation can only break the body.
+  Previously the reader's rejection escaped as whatever the runtime threw — a
+  plain `TypeError`, outside `BoolAiError` entirely, so a `catch` written against
+  the AI surface couldn't classify it. It now throws
+  `code === "stream_interrupted"` with `status` 200 and the original failure on
+  `cause`. Chunks yielded before the break were real output and stay yielded, so
+  this means "the response stopped early", not "the response failed".
+
+  `stream_interrupted` and `unknown_error` are grouped as
+  `BoolAiLocalErrorCode` — codes the SDK raises where no response body exists to
+  carry one. They're deliberately absent from `BOOL_AI_WIRE_ERROR_CODES`, which
+  is pinned against the gateway's own codes and would otherwise misreport what
+  the wire can produce.
 
 - Renamed to match the gateway: the 402 code is `out_of_app_credits` (was
   `out_of_ai_credits`). The code names the credit pool rather than this plane,

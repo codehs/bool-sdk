@@ -629,6 +629,65 @@ describe("bool.ai battery", () => {
     expect((err as BoolAiError).code).toBe("rate_limited");
   });
 
+  // A mid-stream provider failure can't be status-mapped: the gateway already
+  // sent 200 and only the body can break afterwards.
+  function brokenStreamAfter(chunks: string[], cause: Error): Response {
+    const encoder = new TextEncoder();
+    let sent = 0;
+    return new Response(
+      new ReadableStream({
+        // Enqueue one chunk per read, then error. Erroring a stream discards
+        // anything still queued, so the chunks have to be handed over one at a
+        // time for this to model a reader that saw output and then broke.
+        pull(controller) {
+          if (sent < chunks.length) controller.enqueue(encoder.encode(chunks[sent++]!));
+          else controller.error(cause);
+        },
+      }),
+      { status: 200 },
+    );
+  }
+
+  test("a stream that breaks mid-body throws stream_interrupted, not the raw read error", async () => {
+    respond = () => brokenStreamAfter(["Once upon "], new Error("provider hung up"));
+    const client = createBoolClient(CONFIG);
+    const seen: string[] = [];
+    let err: unknown;
+    try {
+      for await (const chunk of client.ai.stream("a story")) seen.push(chunk);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(BoolAiError);
+    expect((err as BoolAiError).code).toBe("stream_interrupted");
+    // The status is the one the gateway committed to before it broke — which is
+    // exactly why callers must branch on `code` here and not on `status`.
+    expect((err as BoolAiError).status).toBe(200);
+    expect((err as BoolAiError).retryAfter).toBeUndefined();
+    // Chunks delivered before the break were real output and stay delivered.
+    expect(seen).toEqual(["Once upon "]);
+  });
+
+  test("stream_interrupted keeps the underlying failure as `cause`", async () => {
+    const underlying = new Error("provider hung up");
+    respond = () => brokenStreamAfter([], underlying);
+    const client = createBoolClient(CONFIG);
+    const err = (await (async () => {
+      try {
+        for await (const _ of client.ai.stream("go")) void _;
+      } catch (e) {
+        return e;
+      }
+    })()) as BoolAiError;
+    expect(err.cause).toBe(underlying);
+  });
+
+  test("stream_interrupted is not a wire code", () => {
+    // It's raised locally, so the array pinned against the gateway must not
+    // claim the gateway can send it.
+    expect(isBoolAiWireErrorCode("stream_interrupted")).toBe(false);
+  });
+
   test("replays the preview viewer token as x-bool-viewer", async () => {
     respond = () =>
       new Response(JSON.stringify({ text: "ok" }), {
