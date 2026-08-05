@@ -219,18 +219,27 @@ function readCode(body: unknown): BoolAiErrorCode {
  *   runtime, an unknown AI sub-route, or the battery not being available to
  *   this workspace all collapse to it. Don't render it as "your app is gone".
  * - `ai_unavailable` (503) — no model configured; the call cost nothing.
- * - `ai_failed` (502) — the provider request failed; the credit is refunded. */
-export type BoolAiWireErrorCode =
-  | "out_of_app_credits"
-  | "app_credit_daily_cap"
-  | "rate_limited"
-  | "payload_too_large"
-  | "missing_prompt"
-  | "invalid_json"
-  | "method_not_allowed"
-  | "not_found"
-  | "ai_unavailable"
-  | "ai_failed";
+ * - `ai_failed` (502) — the provider request failed; the credit is refunded.
+ *
+ * This array is the single source of the list — {@link BoolAiWireErrorCode} is
+ * derived from it, so the type and the runtime check can't drift apart when a
+ * code is added. */
+export const BOOL_AI_WIRE_ERROR_CODES = [
+  "out_of_app_credits",
+  "app_credit_daily_cap",
+  "rate_limited",
+  "payload_too_large",
+  "missing_prompt",
+  "invalid_json",
+  "method_not_allowed",
+  "not_found",
+  "ai_unavailable",
+  "ai_failed",
+] as const;
+
+/** Every machine-readable error the AI plane returns as JSON. See
+ * {@link BOOL_AI_WIRE_ERROR_CODES} for what each one means. */
+export type BoolAiWireErrorCode = (typeof BOOL_AI_WIRE_ERROR_CODES)[number];
 
 /** `BoolAiError.code`: a wire code, `"unknown_error"` when the SDK couldn't read
  * one, or any other string.
@@ -241,6 +250,31 @@ export type BoolAiWireErrorCode =
  * error at the `default` arm instead of the runtime case it actually is. Every
  * known code still autocompletes and is still checked when you spell it. */
 export type BoolAiErrorCode = BoolAiWireErrorCode | "unknown_error" | (string & {});
+
+/** Narrow a code to the closed set of known wire codes.
+ *
+ * `BoolAiErrorCode` is open, which is what lets a newer gateway's code reach an
+ * older app without a type error — but it also means comparing against it never
+ * catches a typo, since any string is assignable. Narrow first and the compiler
+ * starts helping: inside the guard a `switch` over
+ * {@link BoolAiWireErrorCode} is checked for exhaustiveness (with a
+ * `never`-typed default), and a misspelled case is an error rather than an arm
+ * that silently never runs.
+ *
+ * ```ts
+ * if (isBoolAiWireErrorCode(err.code)) {
+ *   switch (err.code) {
+ *     case "app_credit_daily_cap": return waitUntil(err.retryAfter);
+ *     // …every other code, or the compiler complains
+ *   }
+ * } else {
+ *   // unknown_error, or a code newer than this SDK — degrade generically
+ * }
+ * ```
+ */
+export function isBoolAiWireErrorCode(code: string): code is BoolAiWireErrorCode {
+  return (BOOL_AI_WIRE_ERROR_CODES as readonly string[]).includes(code);
+}
 
 /** Thrown when a bool.ai call fails. `status` is the gateway HTTP status and
  * `code` its machine-readable error — see {@link BoolAiWireErrorCode}.

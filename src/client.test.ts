@@ -5,6 +5,9 @@ import {
   hasDefaultBoolClient,
   isDeploymentSubdomain,
   BoolAiError,
+  BOOL_AI_WIRE_ERROR_CODES,
+  isBoolAiWireErrorCode,
+  type BoolAiWireErrorCode,
   type BoolClientConfig,
 } from "./client";
 
@@ -423,6 +426,69 @@ describe("bool.ai battery", () => {
     const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
     expect(err.code).toBe("rate_limited");
     expect(err.retryAfter).toBeUndefined();
+  });
+
+  test("isBoolAiWireErrorCode accepts every known code and rejects others", () => {
+    for (const code of BOOL_AI_WIRE_ERROR_CODES) {
+      expect(isBoolAiWireErrorCode(code)).toBe(true);
+    }
+    expect(isBoolAiWireErrorCode("unknown_error")).toBe(false);
+    expect(isBoolAiWireErrorCode("some_future_code")).toBe(false);
+    expect(isBoolAiWireErrorCode("")).toBe(false);
+    // A near-miss: the kind of typo the closed union exists to catch.
+    expect(isBoolAiWireErrorCode("out_of_app_credit")).toBe(false);
+  });
+
+  // Pins the list against the gateway's ai-route.ts. If a code is added there,
+  // this is the test that should fail and send someone to update the array.
+  test("the wire code list matches the AI plane, exactly", () => {
+    expect([...BOOL_AI_WIRE_ERROR_CODES].sort()).toEqual([
+      "ai_failed",
+      "ai_unavailable",
+      "app_credit_daily_cap",
+      "invalid_json",
+      "method_not_allowed",
+      "missing_prompt",
+      "not_found",
+      "out_of_app_credits",
+      "payload_too_large",
+      "rate_limited",
+    ]);
+  });
+
+  test("a thrown error's code narrows to the closed union", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "app_credit_daily_cap" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    if (!isBoolAiWireErrorCode(err.code)) throw new Error("expected a known code");
+    // Inside the guard the compiler sees the closed union, so this switch is
+    // exhaustiveness-checked — the `never` default is the assertion.
+    const label: string = ((code: BoolAiWireErrorCode): string => {
+      switch (code) {
+        case "app_credit_daily_cap":
+          return "daily cap";
+        case "out_of_app_credits":
+          return "out of credits";
+        case "rate_limited":
+        case "payload_too_large":
+        case "missing_prompt":
+        case "invalid_json":
+        case "method_not_allowed":
+        case "not_found":
+        case "ai_unavailable":
+        case "ai_failed":
+          return "other";
+        default: {
+          const exhaustive: never = code;
+          return exhaustive;
+        }
+      }
+    })(err.code);
+    expect(label).toBe("daily cap");
   });
 
   // The gateway sends `retryAfter: null` (not an absent key) for a credit code

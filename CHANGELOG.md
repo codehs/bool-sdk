@@ -14,6 +14,13 @@ wire shape isn't consistent.
   this package, so an app on an older SDK can meet a code published after it,
   and that's a runtime case to handle rather than a compile error.
 
+  Because that union is open, comparing against it can't catch a typo — any
+  string is assignable. `isBoolAiWireErrorCode()` narrows to the closed set, and
+  inside that guard a `switch` is exhaustiveness-checked and a misspelled case is
+  an error rather than an arm that silently never runs.
+  `BOOL_AI_WIRE_ERROR_CODES` exposes the same list at runtime and is the single
+  source both the type and the guard derive from, so they can't drift.
+
 - **Branch on `code`, not on `status`.** 429 is now two different conditions:
   `rate_limited` (per-caller pacing) and `app_credit_daily_cap` (this app has
   spent its share of the owner's credits for the day, while the pool itself

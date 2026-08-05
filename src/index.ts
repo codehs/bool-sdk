@@ -11,6 +11,8 @@ export {
   BoolAiError,
   type BoolAiErrorCode,
   type BoolAiWireErrorCode,
+  BOOL_AI_WIRE_ERROR_CODES,
+  isBoolAiWireErrorCode,
   type BoolUser,
   type BoolChangePayload,
   type AuthEvent,

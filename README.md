@@ -114,6 +114,11 @@ tested, and upgradable independently of any one app.
   absent otherwise. The wire has two forms for it (an instant, or a delay in
   seconds); the SDK normalizes both so app code only handles one.
 
+  `BoolAiErrorCode` is an open union, so a code added to the gateway after your
+  SDK was published still typechecks. To get an exhaustiveness-checked `switch`,
+  narrow with `isBoolAiWireErrorCode()` first — `BOOL_AI_WIRE_ERROR_CODES` is
+  the same list at runtime, if you'd rather iterate it than spell the cases.
+
   Requires the workspace to be opted into the `bool-ai` server flag.
 - **React auth layer** (`bool-sdk/react`): `<BoolAuthProvider>`,
   `useBoolAuth()`, `<AuthGate>`, and the headless `useSignInForm()` state
