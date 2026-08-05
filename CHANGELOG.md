@@ -1,38 +1,5 @@
 # Changelog
 
-## 0.4.0
-
-**Ephemeral presence and events.** `bool.room` is a new SDK entry for low-latency,
-connection-aware features like live cursors, typing indicators, and in-app chat.
-Unlike the durable data layer (`bool.entities.*`), which persists rows and
-broadcasts changes when they land, `bool.room` is **ephemeral** — state exists
-only while a peer is connected, and messages publish to whoever's watching
-*right now*. Room clients get presence (a list of connected peers and their
-per-peer state), and broadcast (send events to the room, received by all
-watching peers in ~50ms). Under the hood, every room peer connects to its own
-Broadcast channel scoped to the room, minted with a 1-hour token from the Bool
-gateway. A peer announcing presence populates the room member list; removing
-itself tears down its channel. No schema, no authorization (a public or
-private app can have rooms), no persistence — just fast.
-
-- `bool.room.watch(roomId)` opens a room and streams members + events as they
-  happen. Its returned `Unsubscriber` closes the room on this peer.
-- `bool.room.broadcast(roomId, type, payload)` sends an event to everyone watching.
-- `bool.room.setPresence(roomId, presenceData)` announces yourself; `null` removes you.
-- A `Client` option `roomOrigin` picks which Bool gateway to use for room tokens (default:
-  where data routes). `roomOrigin: "https://gateway.bool.com"` routes rooms to prod even
-  from a dev app.
-
-Performance: The realtime layer rebuilt on one `Session` per client rather than
-one per table subscription, so a screen with many live views no longer floods the
-socket. Room bandwidth is 5–10× lower than a broadcast channel on every data change.
-Presence is frame-coalesced and throttled to 60Hz, so three simultaneous cursor
-moves render as one network frame.
-
-Breaking changes: **`subscribeToChanges` is no longer exported from the core.**
-(It's still called by `useQuery`.) `useQueryStream` (the test spy for realtime)
-is now `subscribeToChangesForTest`.
-
 ## 0.3.1
 
 - **Fixes every published app that uses a live view.** `0.3.0` shipped
