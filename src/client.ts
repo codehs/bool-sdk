@@ -150,17 +150,120 @@ export type BoolChangePayload = {
  * `{ type: "object", properties: { sentiment: { type: "string" } }, required: ["sentiment"] }`. */
 export type BoolAiSchema = Record<string, unknown>;
 
+/** Normalize the gateway's `retryAfter` to a Date, or undefined when the field
+ * is absent or unparseable.
+ *
+ * The field has two wire forms depending on which code carries it: an ISO-8601
+ * instant (an absolute moment the limit lifts) or a number of SECONDS from now
+ * (a relative delay). Both mean "not before this point", so both normalize to
+ * the absolute form — a Date is the shape app code can act on directly
+ * (compare, subtract, feed a timer) without knowing which code it came from.
+ *
+ * A digits-only STRING is read as seconds, not as a date. That case is not on
+ * the wire today, but `new Date("45")` is not an error in JavaScript — it
+ * yields the year 2045 — so a gateway that ever JSON-encodes the seconds form
+ * as a string would otherwise produce a plausible Date two decades out instead
+ * of a visible failure.
+ *
+ * The field may also be an explicit `null` — a credit code whose period has no
+ * known end sends the key with no value rather than omitting it. `null` and
+ * absent mean the same thing here: no hint, so no Date.
+ *
+ * There is no `Retry-After` HTTP header on any of these responses, so the body
+ * is the only source. */
+function parseRetryAfter(raw: unknown, now: number = Date.now()): Date | undefined {
+  // The relative (seconds) form: a number, or a digits-only string.
+  let seconds: number | undefined;
+  if (typeof raw === "number") seconds = raw;
+  else if (typeof raw === "string" && /^\d+$/.test(raw.trim())) seconds = Number(raw.trim());
+  if (seconds !== undefined) {
+    if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+    return new Date(now + seconds * 1000);
+  }
+  // The absolute (ISO-8601 instant) form.
+  if (typeof raw !== "string") return undefined;
+  const at = new Date(raw);
+  return Number.isNaN(at.getTime()) ? undefined : at;
+}
+
+/** The code from an error body, or `"unknown_error"` when there isn't one.
+ *
+ * Deliberately NOT defaulting to `ai_failed`: that is a real code with a
+ * specific meaning (502, the provider request failed, credit refunded), and
+ * apps reasonably retry it. Reusing it as the catch-all made every
+ * unreadable-body failure — including the plain-text 403/404 the shared plane
+ * preamble returns, which has no JSON to read — look like a transient provider
+ * blip worth retrying. `unknown_error` says only what's true: the call failed
+ * and the SDK could not name why. */
+function readCode(body: unknown): BoolAiErrorCode {
+  const code = (body as { error?: unknown } | null | undefined)?.error;
+  return typeof code === "string" && code ? code : "unknown_error";
+}
+
+/** Every machine-readable error the AI plane returns as JSON, with the status it
+ * arrives on. Listed so app code can `switch` on a code and have the compiler
+ * check the arms.
+ *
+ * - `out_of_app_credits` (402) — the owner's shared credit pool is empty.
+ * - `app_credit_daily_cap` (429) — the pool has credits, but this app has spent
+ *   its share for the day. Distinct from the above so an app can tell them
+ *   apart; carries `retryAfter`.
+ * - `rate_limited` (429) — per-caller pacing; carries `retryAfter`.
+ * - `payload_too_large` (413) — the request body exceeded the cap. Reachable in
+ *   normal use: a prompt built from an accumulated transcript grows without
+ *   bound, and the cap is on BYTES, so multi-byte text hits it sooner than its
+ *   character count suggests.
+ * - `missing_prompt` / `invalid_json` (400) — malformed request.
+ * - `method_not_allowed` (405) — wrong HTTP method.
+ * - `not_found` (404) — ambiguous by design: no such app, an app on an older
+ *   runtime, an unknown AI sub-route, or the battery not being available to
+ *   this workspace all collapse to it. Don't render it as "your app is gone".
+ * - `ai_unavailable` (503) — no model configured; the call cost nothing.
+ * - `ai_failed` (502) — the provider request failed; the credit is refunded. */
+export type BoolAiWireErrorCode =
+  | "out_of_app_credits"
+  | "app_credit_daily_cap"
+  | "rate_limited"
+  | "payload_too_large"
+  | "missing_prompt"
+  | "invalid_json"
+  | "method_not_allowed"
+  | "not_found"
+  | "ai_unavailable"
+  | "ai_failed";
+
+/** `BoolAiError.code`: a wire code, `"unknown_error"` when the SDK couldn't read
+ * one, or any other string.
+ *
+ * The trailing `string` keeps this union OPEN on purpose. The gateway ships
+ * independently of this package, so an app pinned to an older SDK can receive a
+ * code added after it was published; a closed union would make that a type
+ * error at the `default` arm instead of the runtime case it actually is. Every
+ * known code still autocompletes and is still checked when you spell it. */
+export type BoolAiErrorCode = BoolAiWireErrorCode | "unknown_error" | (string & {});
+
 /** Thrown when a bool.ai call fails. `status` is the gateway HTTP status and
- * `code` its machine-readable error (e.g. "out_of_ai_credits" on a 402,
- * "rate_limited" on a 429) so app code can branch without string-matching. */
+ * `code` its machine-readable error — see {@link BoolAiWireErrorCode}.
+ *
+ * Branch on `code`, never on `status`: one status can carry more than one code,
+ * and the two 429s mean different things (`app_credit_daily_cap` is a cap that
+ * lifts at a known time; `rate_limited` is short-term pacing). Two statuses can
+ * also carry the same code — `not_found` arrives as JSON here, but the shared
+ * plane preamble answers some 404s and 403s in plain text, which the SDK cannot
+ * read a code out of at all (those surface as `unknown_error`). */
 export class BoolAiError extends Error {
   readonly status: number;
-  readonly code: string;
-  constructor(code: string, status: number) {
+  readonly code: BoolAiErrorCode;
+  /** The earliest moment this call is worth retrying, when the gateway said so;
+   * absent on codes that carry no retry hint. Always an absolute Date, whether
+   * the gateway expressed it as an instant or as a relative delay. */
+  readonly retryAfter?: Date;
+  constructor(code: BoolAiErrorCode, status: number, retryAfter?: Date) {
     super(`bool.ai failed: ${code} (${status})`);
     this.name = "BoolAiError";
     this.code = code;
     this.status = status;
+    this.retryAfter = retryAfter;
   }
 }
 
@@ -592,7 +695,12 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
       try {
         body = await res.json();
       } catch (_) {}
-      if (!res.ok) throw new BoolAiError(body?.error ?? "ai_failed", res.status);
+      if (!res.ok)
+        throw new BoolAiError(
+          readCode(body),
+          res.status,
+          parseRetryAfter(body?.retryAfter),
+        );
       // Structured → { object }; plain → { text }. Return the inner value.
       return opts.schema ? body?.object : body?.text;
     }) as BoolAi["generate"],
@@ -609,7 +717,11 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
         try {
           body = await res.json();
         } catch (_) {}
-        throw new BoolAiError(body?.error ?? "ai_failed", res.status);
+        throw new BoolAiError(
+          readCode(body),
+          res.status,
+          parseRetryAfter(body?.retryAfter),
+        );
       }
       // The gateway streams raw text deltas (text/plain). Decode and yield each
       // chunk as it arrives.

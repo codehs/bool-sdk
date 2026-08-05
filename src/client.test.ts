@@ -370,7 +370,7 @@ describe("bool.ai battery", () => {
 
   test("generate throws BoolAiError carrying status + code on failure", async () => {
     respond = () =>
-      new Response(JSON.stringify({ error: "out_of_ai_credits" }), {
+      new Response(JSON.stringify({ error: "out_of_app_credits" }), {
         status: 402,
         headers: { "content-type": "application/json" },
       });
@@ -378,7 +378,166 @@ describe("bool.ai battery", () => {
     const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
     expect(err).toBeInstanceOf(BoolAiError);
     expect(err.status).toBe(402);
-    expect(err.code).toBe("out_of_ai_credits");
+    expect(err.code).toBe("out_of_app_credits");
+  });
+
+  test("app_credit_daily_cap surfaces as a 429 with retryAfter as a Date", async () => {
+    respond = () =>
+      new Response(
+        JSON.stringify({ error: "app_credit_daily_cap", retryAfter: "2026-08-06T00:00:00.000Z" }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      );
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.code).toBe("app_credit_daily_cap");
+    expect(err.status).toBe(429);
+    expect(err.retryAfter).toBeInstanceOf(Date);
+    expect(err.retryAfter?.toISOString()).toBe("2026-08-06T00:00:00.000Z");
+  });
+
+  test("app_credit_daily_cap on stream carries retryAfter too", async () => {
+    respond = () =>
+      new Response(
+        JSON.stringify({ error: "app_credit_daily_cap", retryAfter: "2026-08-06T00:00:00.000Z" }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      );
+    const client = createBoolClient(CONFIG);
+    const err = await (async () => {
+      try {
+        for await (const _ of client.ai.stream("hi")) void _;
+      } catch (e) {
+        return e as BoolAiError;
+      }
+    })();
+    expect(err?.code).toBe("app_credit_daily_cap");
+    expect(err?.retryAfter?.toISOString()).toBe("2026-08-06T00:00:00.000Z");
+  });
+
+  test("a code with no retryAfter leaves the field undefined", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.code).toBe("rate_limited");
+    expect(err.retryAfter).toBeUndefined();
+  });
+
+  // The gateway sends `retryAfter: null` (not an absent key) for a credit code
+  // whose period has no known end.
+  test("an explicit null retryAfter is treated as no hint", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "out_of_app_credits", retryAfter: null }), {
+        status: 402,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.code).toBe("out_of_app_credits");
+    expect(err.retryAfter).toBeUndefined();
+  });
+
+  // rate_limited expresses retryAfter as SECONDS while the credit codes send an
+  // ISO instant. Both must reach app code as one type.
+  test("rate_limited's seconds form normalizes to an absolute Date", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited", retryAfter: 45 }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const before = Date.now();
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.retryAfter).toBeInstanceOf(Date);
+    const delta = err.retryAfter!.getTime() - before;
+    expect(delta).toBeGreaterThanOrEqual(45_000);
+    expect(delta).toBeLessThan(50_000);
+  });
+
+  test("retryAfter: 0 is a Date (retry now), not a dropped field", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited", retryAfter: 0 }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.retryAfter).toBeInstanceOf(Date);
+  });
+
+  test("a negative retryAfter is dropped rather than yielding a past Date", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited", retryAfter: -5 }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.retryAfter).toBeUndefined();
+  });
+
+  // new Date("45") is the year 2045, not 45 seconds from now — a digits-only
+  // string must take the seconds path, not the instant path.
+  // The shared plane preamble answers some 403/404s in text/plain, so there is
+  // no code to read. That must NOT masquerade as ai_failed (a real 502 code
+  // apps retry on) — a 404 retried forever is the bug that would cause.
+  test("a text/plain body yields unknown_error, not ai_failed", async () => {
+    respond = () => new Response("Not found", { status: 404 });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.status).toBe(404);
+    expect(err.code).toBe("unknown_error");
+  });
+
+  test("a genuine ai_failed 502 still surfaces as ai_failed", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "ai_failed" }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.code).toBe("ai_failed");
+  });
+
+  // The gateway ships independently of this package, so an app on an older SDK
+  // can meet a code this build has never heard of. Pass it through verbatim.
+  test("an unrecognized code passes through rather than being flattened", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "some_future_code" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.code).toBe("some_future_code");
+  });
+
+  test("a digits-only string retryAfter is read as seconds, not as a year", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited", retryAfter: "45" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const before = Date.now();
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    const delta = err.retryAfter!.getTime() - before;
+    expect(delta).toBeGreaterThanOrEqual(45_000);
+    expect(delta).toBeLessThan(50_000);
+  });
+
+  test("an unparseable retryAfter is dropped rather than surfaced as Invalid Date", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "app_credit_daily_cap", retryAfter: "soon" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.retryAfter).toBeUndefined();
   });
 
   test("stream yields decoded text chunks", async () => {

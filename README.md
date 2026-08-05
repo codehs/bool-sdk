@@ -76,7 +76,7 @@ tested, and upgradable independently of any one app.
   key in the bundle** — calls route through the gateway's AI plane
   (`/_bool/v1/ai`), which runs the prompt against Bool's provider credential and
   meters one AI credit against the app owner. Returns results directly and throws
-  a `BoolAiError` (with `status` + `code`, e.g. `"out_of_ai_credits"`) on failure:
+  a `BoolAiError` (with `status` + `code`, e.g. `"out_of_app_credits"`) on failure:
   ```ts
   const text = await bool.ai.generate("Summarize this review: " + review);
 
@@ -93,6 +93,27 @@ tested, and upgradable independently of any one app.
 
   for await (const chunk of bool.ai.stream("Write a haiku")) setText((t) => t + chunk);
   ```
+  On failure it throws `BoolAiError` with a machine-readable `code`
+  (`BoolAiWireErrorCode`) — branch on `code`, **not** on `status`, since one
+  status carries more than one code:
+
+  ```ts
+  try {
+    await bool.ai.generate(prompt);
+  } catch (e) {
+    const err = e as BoolAiError;
+    if (err.code === "app_credit_daily_cap" && err.retryAfter) {
+      setNotice(`Back at ${err.retryAfter.toLocaleTimeString()}`);
+    } else if (err.code === "out_of_app_credits") {
+      setNotice("This app is out of credits.");
+    }
+  }
+  ```
+
+  `retryAfter` is a `Date` whenever the gateway supplies a retry hint, and
+  absent otherwise. The wire has two forms for it (an instant, or a delay in
+  seconds); the SDK normalizes both so app code only handles one.
+
   Requires the workspace to be opted into the `bool-ai` server flag.
 - **React auth layer** (`bool-sdk/react`): `<BoolAuthProvider>`,
   `useBoolAuth()`, `<AuthGate>`, and the headless `useSignInForm()` state

@@ -9,6 +9,8 @@ export {
   type BoolAi,
   type BoolAiSchema,
   BoolAiError,
+  type BoolAiErrorCode,
+  type BoolAiWireErrorCode,
   type BoolUser,
   type BoolChangePayload,
   type AuthEvent,

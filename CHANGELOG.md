@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.4.0
+
+Types every error the AI plane can return, and normalizes the one field whose
+wire shape isn't consistent.
+
+- `BoolAiError.code` is now typed. `BoolAiWireErrorCode` lists all ten codes the
+  plane returns as JSON — `out_of_app_credits`, `app_credit_daily_cap`,
+  `rate_limited`, `payload_too_large`, `missing_prompt`, `invalid_json`,
+  `method_not_allowed`, `not_found`, `ai_unavailable`, `ai_failed` — each
+  documented with the status it arrives on. `BoolAiErrorCode` adds
+  `"unknown_error"` and stays an open union: the gateway ships independently of
+  this package, so an app on an older SDK can meet a code published after it,
+  and that's a runtime case to handle rather than a compile error.
+
+- **Branch on `code`, not on `status`.** 429 is now two different conditions:
+  `rate_limited` (per-caller pacing) and `app_credit_daily_cap` (this app has
+  spent its share of the owner's credits for the day, while the pool itself
+  still has credits). An app that wants to tell "slow down" from "come back
+  later" has to read the code.
+
+- **New: `BoolAiError.retryAfter`,** a `Date` when the gateway supplies a retry
+  hint. The wire carries two incompatible forms — an ISO-8601 instant on the
+  credit codes, a count of seconds on `rate_limited` — and no `Retry-After`
+  header on any of them. The SDK accepts both and exposes one, so app code can
+  compare or subtract it without knowing which code produced it. Absent, `null`,
+  negative, and unparseable values all yield `undefined` rather than an
+  `Invalid Date`, so `if (err.retryAfter)` means what it looks like.
+
+- **Behavior change:** a failure whose body carries no readable code now
+  surfaces as `unknown_error`. It previously defaulted to `ai_failed` — a real
+  code meaning "the provider request failed, credit refunded," which apps
+  reasonably retry. The shared gateway plane preamble answers some 403s and 404s
+  in `text/plain`, so those have no JSON to read and were being reported as a
+  transient provider blip; retrying a 404 forever was the result. Apps that
+  branch on `ai_failed` to drive a retry should keep doing exactly that — it
+  still arrives on a genuine 502, and now only then.
+
+- Renamed to match the gateway: the 402 code is `out_of_app_credits` (was
+  `out_of_ai_credits`). The code names the credit pool rather than this plane,
+  so every battery drawing on that pool reports the same string for the same
+  condition.
+
+`bool.ai` remains gated server-side by the `bool-ai` feature flag, off by
+default, so these codes only reach apps in workspaces opted into the battery.
+
 ## 0.3.1
 
 - **Fixes every published app that uses a live view.** `0.3.0` shipped
