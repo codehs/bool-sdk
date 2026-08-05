@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.4.0
+## 0.4.1
+
+_Published as 0.4.1 — 0.4.0 was published in error with unrelated content and unpublished; the fetch battery below is otherwise unchanged._
 
 - **New: the fetch battery — `client.fetch`.** Call a third-party API with a key
   the app's owner stored with Bool, without the key ever entering the app bundle.
