@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.5.0
+
+Types every error the AI plane can return, and normalizes the one field whose
+wire shape isn't consistent.
+
+- `BoolAiError.code` is now typed. `BoolAiWireErrorCode` lists all ten codes the
+  plane returns as JSON — `out_of_app_credits`, `app_credit_daily_cap`,
+  `rate_limited`, `payload_too_large`, `missing_prompt`, `invalid_json`,
+  `method_not_allowed`, `not_found`, `ai_unavailable`, `ai_failed` — each
+  documented with the status it arrives on. `BoolAiErrorCode` adds the SDK's own
+  `BoolAiLocalErrorCode`s and stays an open union: the gateway ships independently of
+  this package, so an app on an older SDK can meet a code published after it,
+  and that's a runtime case to handle rather than a compile error.
+
+  Because that union is open, comparing against it can't catch a typo — any
+  string is assignable. `isBoolAiWireErrorCode()` narrows to the closed set, and
+  inside that guard a `switch` is exhaustiveness-checked and a misspelled case is
+  an error rather than an arm that silently never runs.
+  `BOOL_AI_WIRE_ERROR_CODES` exposes the same list at runtime and is the single
+  source both the type and the guard derive from, so they can't drift.
+
+- **Branch on `code`, not on `status`.** 429 is now two different conditions:
+  `rate_limited` (per-caller pacing) and `app_credit_daily_cap` (this app has
+  spent its share of the owner's credits for the day, while the pool itself
+  still has credits). An app that wants to tell "slow down" from "come back
+  later" has to read the code.
+
+- **New: `BoolAiError.retryAfter`,** a `Date` when the gateway supplies a retry
+  hint. The wire carries two incompatible forms — an ISO-8601 instant on the
+  credit codes, a count of seconds on `rate_limited` — and no `Retry-After`
+  header on any of them. The SDK accepts both and exposes one, so app code can
+  compare or subtract it without knowing which code produced it. Absent, `null`,
+  negative, and unparseable values all yield `undefined` rather than an
+  `Invalid Date`, so `if (err.retryAfter)` means what it looks like.
+
+- **Behavior change:** a failure whose body carries no readable code now
+  surfaces as `unknown_error`. It previously defaulted to `ai_failed` — a real
+  code meaning "the provider request failed, credit refunded," which apps
+  reasonably retry. The shared gateway plane preamble answers some 403s and 404s
+  in `text/plain`, so those have no JSON to read and were being reported as a
+  transient provider blip; retrying a 404 forever was the result. Apps that
+  branch on `ai_failed` to drive a retry should keep doing exactly that — it
+  still arrives on a genuine 502, and now only then.
+
+- **`stream` has its own error path.** A stream can fail after it starts, and
+  that failure can never be status-mapped: the gateway commits to 200 when it
+  sends headers, so a provider that dies mid-generation can only break the body.
+  Previously the reader's rejection escaped as whatever the runtime threw — a
+  plain `TypeError`, outside `BoolAiError` entirely, so a `catch` written against
+  the AI surface couldn't classify it. It now throws
+  `code === "stream_interrupted"` with `status` 200 and the original failure on
+  `cause`. Chunks yielded before the break were real output and stay yielded, so
+  this means "the response stopped early", not "the response failed".
+
+  `stream_interrupted` and `unknown_error` are grouped as
+  `BoolAiLocalErrorCode` — codes the SDK raises where no response body exists to
+  carry one. They're deliberately absent from `BOOL_AI_WIRE_ERROR_CODES`, which
+  is pinned against the gateway's own codes and would otherwise misreport what
+  the wire can produce.
+
+- Renamed to match the gateway: the 402 code is `out_of_app_credits` (was
+  `out_of_ai_credits`). The code names the credit pool rather than this plane,
+  so every battery drawing on that pool reports the same string for the same
+  condition.
+
+`bool.ai` remains gated server-side by the `bool-ai` feature flag, off by
+default, so these codes only reach apps in workspaces opted into the battery.
+
 ## 0.4.1
 
 _Published as 0.4.1 — 0.4.0 was published in error with unrelated content and unpublished; the fetch battery below is otherwise unchanged._

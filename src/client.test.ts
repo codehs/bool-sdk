@@ -5,6 +5,9 @@ import {
   hasDefaultBoolClient,
   isDeploymentSubdomain,
   BoolAiError,
+  BOOL_AI_WIRE_ERROR_CODES,
+  isBoolAiWireErrorCode,
+  type BoolAiWireErrorCode,
   BoolFetchError,
   type BoolClientConfig,
 } from "./client";
@@ -371,7 +374,7 @@ describe("bool.ai battery", () => {
 
   test("generate throws BoolAiError carrying status + code on failure", async () => {
     respond = () =>
-      new Response(JSON.stringify({ error: "out_of_ai_credits" }), {
+      new Response(JSON.stringify({ error: "out_of_app_credits" }), {
         status: 402,
         headers: { "content-type": "application/json" },
       });
@@ -379,7 +382,229 @@ describe("bool.ai battery", () => {
     const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
     expect(err).toBeInstanceOf(BoolAiError);
     expect(err.status).toBe(402);
-    expect(err.code).toBe("out_of_ai_credits");
+    expect(err.code).toBe("out_of_app_credits");
+  });
+
+  test("app_credit_daily_cap surfaces as a 429 with retryAfter as a Date", async () => {
+    respond = () =>
+      new Response(
+        JSON.stringify({ error: "app_credit_daily_cap", retryAfter: "2026-08-06T00:00:00.000Z" }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      );
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.code).toBe("app_credit_daily_cap");
+    expect(err.status).toBe(429);
+    expect(err.retryAfter).toBeInstanceOf(Date);
+    expect(err.retryAfter?.toISOString()).toBe("2026-08-06T00:00:00.000Z");
+  });
+
+  test("app_credit_daily_cap on stream carries retryAfter too", async () => {
+    respond = () =>
+      new Response(
+        JSON.stringify({ error: "app_credit_daily_cap", retryAfter: "2026-08-06T00:00:00.000Z" }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      );
+    const client = createBoolClient(CONFIG);
+    const err = await (async () => {
+      try {
+        for await (const _ of client.ai.stream("hi")) void _;
+      } catch (e) {
+        return e as BoolAiError;
+      }
+    })();
+    expect(err?.code).toBe("app_credit_daily_cap");
+    expect(err?.retryAfter?.toISOString()).toBe("2026-08-06T00:00:00.000Z");
+  });
+
+  test("a code with no retryAfter leaves the field undefined", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.code).toBe("rate_limited");
+    expect(err.retryAfter).toBeUndefined();
+  });
+
+  test("isBoolAiWireErrorCode accepts every known code and rejects others", () => {
+    for (const code of BOOL_AI_WIRE_ERROR_CODES) {
+      expect(isBoolAiWireErrorCode(code)).toBe(true);
+    }
+    expect(isBoolAiWireErrorCode("unknown_error")).toBe(false);
+    expect(isBoolAiWireErrorCode("some_future_code")).toBe(false);
+    expect(isBoolAiWireErrorCode("")).toBe(false);
+    // A near-miss: the kind of typo the closed union exists to catch.
+    expect(isBoolAiWireErrorCode("out_of_app_credit")).toBe(false);
+  });
+
+  // Pins the list against the gateway's ai-route.ts. If a code is added there,
+  // this is the test that should fail and send someone to update the array.
+  test("the wire code list matches the AI plane, exactly", () => {
+    expect([...BOOL_AI_WIRE_ERROR_CODES].sort()).toEqual([
+      "ai_failed",
+      "ai_unavailable",
+      "app_credit_daily_cap",
+      "invalid_json",
+      "method_not_allowed",
+      "missing_prompt",
+      "not_found",
+      "out_of_app_credits",
+      "payload_too_large",
+      "rate_limited",
+    ]);
+  });
+
+  test("a thrown error's code narrows to the closed union", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "app_credit_daily_cap" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    if (!isBoolAiWireErrorCode(err.code)) throw new Error("expected a known code");
+    // Inside the guard the compiler sees the closed union, so this switch is
+    // exhaustiveness-checked — the `never` default is the assertion.
+    const label: string = ((code: BoolAiWireErrorCode): string => {
+      switch (code) {
+        case "app_credit_daily_cap":
+          return "daily cap";
+        case "out_of_app_credits":
+          return "out of credits";
+        case "rate_limited":
+        case "payload_too_large":
+        case "missing_prompt":
+        case "invalid_json":
+        case "method_not_allowed":
+        case "not_found":
+        case "ai_unavailable":
+        case "ai_failed":
+          return "other";
+        default: {
+          const exhaustive: never = code;
+          return exhaustive;
+        }
+      }
+    })(err.code);
+    expect(label).toBe("daily cap");
+  });
+
+  // The gateway sends `retryAfter: null` (not an absent key) for a credit code
+  // whose period has no known end.
+  test("an explicit null retryAfter is treated as no hint", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "out_of_app_credits", retryAfter: null }), {
+        status: 402,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.code).toBe("out_of_app_credits");
+    expect(err.retryAfter).toBeUndefined();
+  });
+
+  // rate_limited expresses retryAfter as SECONDS while the credit codes send an
+  // ISO instant. Both must reach app code as one type.
+  test("rate_limited's seconds form normalizes to an absolute Date", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited", retryAfter: 45 }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const before = Date.now();
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.retryAfter).toBeInstanceOf(Date);
+    const delta = err.retryAfter!.getTime() - before;
+    expect(delta).toBeGreaterThanOrEqual(45_000);
+    expect(delta).toBeLessThan(50_000);
+  });
+
+  test("retryAfter: 0 is a Date (retry now), not a dropped field", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited", retryAfter: 0 }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.retryAfter).toBeInstanceOf(Date);
+  });
+
+  test("a negative retryAfter is dropped rather than yielding a past Date", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited", retryAfter: -5 }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.retryAfter).toBeUndefined();
+  });
+
+  // new Date("45") is the year 2045, not 45 seconds from now — a digits-only
+  // string must take the seconds path, not the instant path.
+  // The shared plane preamble answers some 403/404s in text/plain, so there is
+  // no code to read. That must NOT masquerade as ai_failed (a real 502 code
+  // apps retry on) — a 404 retried forever is the bug that would cause.
+  test("a text/plain body yields unknown_error, not ai_failed", async () => {
+    respond = () => new Response("Not found", { status: 404 });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.status).toBe(404);
+    expect(err.code).toBe("unknown_error");
+  });
+
+  test("a genuine ai_failed 502 still surfaces as ai_failed", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "ai_failed" }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.code).toBe("ai_failed");
+  });
+
+  // The gateway ships independently of this package, so an app on an older SDK
+  // can meet a code this build has never heard of. Pass it through verbatim.
+  test("an unrecognized code passes through rather than being flattened", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "some_future_code" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.code).toBe("some_future_code");
+  });
+
+  test("a digits-only string retryAfter is read as seconds, not as a year", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited", retryAfter: "45" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const before = Date.now();
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    const delta = err.retryAfter!.getTime() - before;
+    expect(delta).toBeGreaterThanOrEqual(45_000);
+    expect(delta).toBeLessThan(50_000);
+  });
+
+  test("an unparseable retryAfter is dropped rather than surfaced as Invalid Date", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "app_credit_daily_cap", retryAfter: "soon" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = (await client.ai.generate("hi").catch((e) => e)) as BoolAiError;
+    expect(err.retryAfter).toBeUndefined();
   });
 
   test("stream yields decoded text chunks", async () => {
@@ -403,6 +628,65 @@ describe("bool.ai battery", () => {
     const err = await iter[Symbol.asyncIterator]().next().catch((e) => e);
     expect(err).toBeInstanceOf(BoolAiError);
     expect((err as BoolAiError).code).toBe("rate_limited");
+  });
+
+  // A mid-stream provider failure can't be status-mapped: the gateway already
+  // sent 200 and only the body can break afterwards.
+  function brokenStreamAfter(chunks: string[], cause: Error): Response {
+    const encoder = new TextEncoder();
+    let sent = 0;
+    return new Response(
+      new ReadableStream({
+        // Enqueue one chunk per read, then error. Erroring a stream discards
+        // anything still queued, so the chunks have to be handed over one at a
+        // time for this to model a reader that saw output and then broke.
+        pull(controller) {
+          if (sent < chunks.length) controller.enqueue(encoder.encode(chunks[sent++]!));
+          else controller.error(cause);
+        },
+      }),
+      { status: 200 },
+    );
+  }
+
+  test("a stream that breaks mid-body throws stream_interrupted, not the raw read error", async () => {
+    respond = () => brokenStreamAfter(["Once upon "], new Error("provider hung up"));
+    const client = createBoolClient(CONFIG);
+    const seen: string[] = [];
+    let err: unknown;
+    try {
+      for await (const chunk of client.ai.stream("a story")) seen.push(chunk);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(BoolAiError);
+    expect((err as BoolAiError).code).toBe("stream_interrupted");
+    // The status is the one the gateway committed to before it broke — which is
+    // exactly why callers must branch on `code` here and not on `status`.
+    expect((err as BoolAiError).status).toBe(200);
+    expect((err as BoolAiError).retryAfter).toBeUndefined();
+    // Chunks delivered before the break were real output and stay delivered.
+    expect(seen).toEqual(["Once upon "]);
+  });
+
+  test("stream_interrupted keeps the underlying failure as `cause`", async () => {
+    const underlying = new Error("provider hung up");
+    respond = () => brokenStreamAfter([], underlying);
+    const client = createBoolClient(CONFIG);
+    const err = (await (async () => {
+      try {
+        for await (const _ of client.ai.stream("go")) void _;
+      } catch (e) {
+        return e;
+      }
+    })()) as BoolAiError;
+    expect(err.cause).toBe(underlying);
+  });
+
+  test("stream_interrupted is not a wire code", () => {
+    // It's raised locally, so the array pinned against the gateway must not
+    // claim the gateway can send it.
+    expect(isBoolAiWireErrorCode("stream_interrupted")).toBe(false);
   });
 
   test("replays the preview viewer token as x-bool-viewer", async () => {
