@@ -67,6 +67,7 @@ wire shape isn't consistent.
 
 `bool.ai` remains gated server-side by the `bool-ai` feature flag, off by
 default, so these codes only reach apps in workspaces opted into the battery.
+
 ## 0.4.1
 
 _Published as 0.4.1 — 0.4.0 was published in error with unrelated content and unpublished; the fetch battery below is otherwise unchanged._
