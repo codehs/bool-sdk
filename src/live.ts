@@ -169,7 +169,7 @@ export function matchesFilter(row: Record<string, unknown>, query: FilterQuery):
 type PendingOp<T extends EntityRow> =
   | { kind: "create"; id: string; row: Partial<T> }
   | { kind: "update"; id: string; patch: Partial<T> }
-  | { kind: "increment"; id: string; inc: Record<string, number> }
+  | { kind: "increment"; id: string; field: string; value: number }
   | { kind: "remove"; id: string };
 
 /** Generate a client-side row id (the optimistic-UI cornerstone: ONE id shared
@@ -316,22 +316,27 @@ export class LiveEntityStore<T extends EntityRow = EntityRow> {
 
   /** Optimistic ATOMIC increment of one numeric field (`by` defaults to 1).
    *
-   * The overlay bumps the field by `by` immediately, so the number moves in the
-   * same frame as the tap, with no read-modify-write and no wait for the server
-   * echo. The write itself is the atomic `$inc` (`col = col + n` in SQL), so two
-   * people incrementing at the same instant can't lose each other's clicks. Once
-   * it commits we read the row back BEFORE retiring the overlay: that read is
-   * ordered after our committed write, so it already includes this increment
-   * (and any concurrent ones), and swapping overlay for committed in one emit
-   * means the digit never dips in between. A failed write drops the overlay
+   * The number moves in the same frame as the tap, and the write itself is the
+   * atomic `$inc` (`col = col + n` in SQL), so two people incrementing at the
+   * same instant can't lose each other's clicks. Once it commits we read the row
+   * back before retiring the overlay, so the digit never dips to a stale value
+   * between the tap and the server value. A failed write drops the overlay
    * (rolls back) and surfaces the error on the snapshot; it never throws.
    *
-   * This is the ONE counter pattern hand-rolled app code kept getting wrong: an
-   * optimistic bump reconciled against a full refetch flickered when the refetch
-   * raced the change broadcast. Owning it here is what makes counters feel
-   * instant without giving up atomicity. */
+   * The overlay stores the ABSOLUTE optimistic value (current + by), not a `+by`
+   * delta, and this is load-bearing. The private doorbell echoes our own write
+   * back as a row-bearing ding that lands on `server` while the overlay is still
+   * up. A delta would then add ON TOP of a committed row that already counts our
+   * write (0 -> optimistic 1 -> ding sets server 1, delta still +1 -> 2 -> drop
+   * overlay -> 1): the digit visibly bounces, worse the faster you tap. An
+   * absolute overlay SETS the field, so it stays idempotent with the echo (and
+   * with the read-back), exactly like `update`'s overlay. `current` is read from
+   * the live snapshot, so rapid taps that haven't settled stack correctly. */
   async increment(id: string, field: string, by = 1): Promise<T | null> {
-    const op: PendingOp<T> = { kind: "increment", id, inc: { [field]: by } };
+    const current = this.snapshot.data.find((r) => r.id === id) ?? this.server.get(id);
+    const value =
+      Number((current as Record<string, unknown> | undefined)?.[field] ?? 0) + by;
+    const op: PendingOp<T> = { kind: "increment", id, field, value };
     this.pending.push(op);
     this.emit();
     try {
@@ -464,17 +469,12 @@ export class LiveEntityStore<T extends EntityRow = EntityRow> {
         const base = byId.get(op.id);
         if (base) byId.set(op.id, { ...base, ...op.patch });
       } else if (op.kind === "increment") {
-        // Bump the numeric field(s) on the committed row. Only when the row is
-        // present. Incrementing something not yet loaded is a no-op overlay,
-        // the same way an update to an unknown id is.
+        // SET the field to the optimistic ABSOLUTE value (not add a delta), so
+        // the doorbell echo of our own write can't double-count. Only when the
+        // row is present; incrementing something not yet loaded is a no-op
+        // overlay, the same way an update to an unknown id is.
         const base = byId.get(op.id);
-        if (base) {
-          const next = { ...base } as Record<string, unknown>;
-          for (const [f, d] of Object.entries(op.inc)) {
-            next[f] = Number(base[f as keyof T] ?? 0) + d;
-          }
-          byId.set(op.id, next as T);
-        }
+        if (base) byId.set(op.id, { ...base, [op.field]: op.value } as T);
       } else {
         byId.delete(op.id);
       }

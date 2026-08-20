@@ -608,6 +608,31 @@ describe("LiveEntityStore: optimistic mutations", () => {
     stop();
   });
 
+  test("increment does not double-count when the doorbell echoes the write mid-flight", async () => {
+    const h = makeHarness([{ id: "1", rank: 0 }]);
+    const store = new LiveEntityStore<Row>(h.handler);
+    const stop = store.start();
+    await tick();
+
+    const gate = h.gateNextUpdateMany();
+    const p = store.increment("1", "rank", 1);
+    expect(store.getSnapshot().data[0]!.rank).toBe(1); // optimistic, same frame
+
+    // The private doorbell echoes our own committed write as a row-bearing ding
+    // (rank already 1) while the optimistic overlay is still up. A +1 delta
+    // overlay would land ON TOP -> 2 (the fast-tap bounce Jack hit). The absolute
+    // overlay SETS the field, so it stays 1.
+    h.ding({ table: "t", op: "UPDATE", id: "1", row: { id: "1", rank: 1 } });
+    await settle();
+    expect(store.getSnapshot().data[0]!.rank).toBe(1); // NOT 2
+
+    gate.resolve();
+    await p;
+    expect(store.getSnapshot().data[0]!.rank).toBe(1);
+    stop();
+  });
+
+
   test("the doorbell echo of your own write reconciles to a no-op (no duplicates)", async () => {
     const h = makeHarness();
     const store = new LiveEntityStore<Row>(h.handler);
