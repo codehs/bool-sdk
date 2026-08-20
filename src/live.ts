@@ -197,6 +197,11 @@ export class LiveEntityStore<T extends EntityRow = EntityRow> {
   /** Monotonic full-load counter — the anti-rewind guard. Only the response to
    * the NEWEST load may apply; anything else is a stale answer arriving late. */
   private loadSeq = 0;
+  /** Per-id monotonic increment counter — the same anti-rewind guard, but for
+   * an increment's settle read-back: only the NEWEST tap's read-back may write
+   * `server`, so an earlier tap's read-back landing late can't rewind the count
+   * to a stale value. Grows one small entry per row ever incremented. */
+  private incSeq = new Map<string, number>();
   private unsubscribe: (() => void) | null = null;
 
   constructor(
@@ -320,8 +325,10 @@ export class LiveEntityStore<T extends EntityRow = EntityRow> {
    * atomic `$inc` (`col = col + n` in SQL), so two people incrementing at the
    * same instant can't lose each other's clicks. Once it commits we read the row
    * back before retiring the overlay, so the digit never dips to a stale value
-   * between the tap and the server value. A failed write drops the overlay
-   * (rolls back) and surfaces the error on the snapshot; it never throws.
+   * between the tap and the server value. A failed WRITE drops the overlay
+   * (rolls back) and surfaces the error on the snapshot; it never throws. A write
+   * that commits but whose settle read-back then fails is NOT rolled back — the
+   * increment is durable, and the row-bearing doorbell echo settles the value.
    *
    * The overlay stores the ABSOLUTE optimistic value (current + by), not a `+by`
    * delta, and this is load-bearing. The private doorbell echoes our own write
@@ -337,22 +344,49 @@ export class LiveEntityStore<T extends EntityRow = EntityRow> {
     const value =
       Number((current as Record<string, unknown> | undefined)?.[field] ?? 0) + by;
     const op: PendingOp<T> = { kind: "increment", id, field, value };
+    // Stamp this tap so a stale read-back can't rewind `server` (see incSeq).
+    const seq = (this.incSeq.get(id) ?? 0) + 1;
+    this.incSeq.set(id, seq);
     this.pending.push(op);
     this.emit();
+
     try {
       await this.handler.updateMany({ id: [id] } as FilterQuery, { $inc: { [field]: by } });
-      const rows = await this.handler.filter({ id: [id] } as FilterQuery, undefined, 1);
-      if (rows[0]) this.server.set(id, rows[0]);
-      else this.server.delete(id); // removed while our increment was in flight
-      this.snapshot = { ...this.snapshot, error: null };
-      return rows[0] ?? null;
     } catch (error) {
+      // The atomic write itself failed — nothing committed. Roll the overlay
+      // back and surface the error, exactly like a failed create/update.
       this.snapshot = { ...this.snapshot, error };
+      this.pending = this.pending.filter((p) => p !== op);
+      this.emit();
       return null;
+    }
+
+    // The write COMMITTED. From here we never roll back — the increment is
+    // durable even if the settle read-back fails. Read the row back so `server`
+    // holds the true value before the overlay retires (no dip in the gap before
+    // the doorbell echo), but only when we are still the newest tap for this id;
+    // an older read-back landing late must not overwrite a fresher one.
+    let settled: T | null = null;
+    try {
+      const rows = await this.handler.filter({ id: [id] } as FilterQuery, undefined, 1);
+      settled = rows[0] ?? null;
+      if (this.incSeq.get(id) === seq) {
+        if (rows[0]) this.server.set(id, rows[0]);
+        else this.server.delete(id); // removed while our increment was in flight
+      }
+      this.snapshot = { ...this.snapshot, error: null };
+    } catch {
+      // Write committed but the settle read-back failed (offline blip). Do NOT
+      // roll a durable write back and do NOT surface an error. Leave `server`
+      // untouched: the overlay retires to whatever's committed, and the
+      // row-bearing doorbell echo delivers the authoritative value. (Folding our
+      // own delta in here would double-count if the echo already landed.)
+      this.snapshot = { ...this.snapshot, error: null };
     } finally {
       this.pending = this.pending.filter((p) => p !== op);
       this.emit();
     }
+    return settled;
   }
 
   // ---- loading & reconciling ------------------------------------------------

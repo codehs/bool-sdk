@@ -62,9 +62,12 @@ export type FilterQuery = {
   $nor?: FilterQuery[];
 };
 
-/** MongoDB-style update operators. `$set` is applied as one atomic PATCH; the
- * others (`$inc`/`$mul`/`$push`/`$pull`/`$unset`) are applied read-modify-write
- * (see updateMany docs — not atomic under concurrent writers). */
+/** MongoDB-style update operators. `$set`/`$unset` apply as one atomic PATCH,
+ * and `$inc`/`$mul` are atomic too — done in SQL (`col = col + n`) via the
+ * per-schema `bool_apply_numeric` function, so concurrent writers can't lose
+ * each other's arithmetic (older schemas without the function fall back to
+ * read-modify-write). Only the array operators (`$push`/`$pull`) are
+ * read-modify-write and not atomic under concurrent writers. See updateMany. */
 export type UpdateOps = Partial<{
   $set: Record<string, unknown>;
   $inc: Record<string, number>;

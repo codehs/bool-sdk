@@ -14,6 +14,12 @@ instant without giving up atomic safety.
   the snapshot; it never throws. Resolves to the committed row, or null on
   failure.
 
+  Rapid taps are safe against their read-backs racing: each tap is stamped, and
+  only the newest one's read-back may settle `server`, so a stale response
+  landing late cannot rewind the count. And a write that commits but whose
+  read-back then blips offline is not rolled back or reported as an error — the
+  increment is durable and the doorbell echo settles the value.
+
   This replaces the pattern generated counter code kept reaching for: a manual
   local bump reconciled against a full `refetch()`, which flickered when the
   refetch raced the change broadcast, plus a `working` guard that dropped fast

@@ -632,6 +632,84 @@ describe("LiveEntityStore: optimistic mutations", () => {
     stop();
   });
 
+  test("a stale read-back landing after a newer tap does not rewind the count", async () => {
+    // Two rapid taps. The atomic writes commit in order (0 -> 1 -> 2), but the
+    // settle read-backs race: the NEWER tap's read-back (value 2) lands first,
+    // then the OLDER tap's stale read-back (value 1) lands late. Without the
+    // per-id seq guard the late stale response would set `server` back to 1;
+    // the guard drops it so the digit holds at 2.
+    const filters: Array<ReturnType<typeof deferred<Row[]>>> = [];
+    let committed = 0;
+    const handler = {
+      async list() {
+        return [{ id: "1", rank: 0 }];
+      },
+      async filter() {
+        const d = deferred<Row[]>();
+        filters.push(d);
+        return d.promise;
+      },
+      async updateMany(_q: FilterQuery, ops: Record<string, any>) {
+        committed += Number(ops.$inc?.rank ?? 0);
+        return { success: true, updated: 1, has_more: false };
+      },
+      subscribe() {
+        return () => {};
+      },
+    } as unknown as EntityHandler<Row>;
+
+    const store = new LiveEntityStore<Row>(handler);
+    const stop = store.start();
+    await tick();
+
+    const p1 = store.increment("1", "rank", 1); // seq 1, commits -> 1
+    const p2 = store.increment("1", "rank", 1); // seq 2, commits -> 2
+    await tick(); // both writes settled; both read-backs now parked, in order
+    expect(filters.length).toBe(2);
+    expect(committed).toBe(2);
+
+    filters[1]!.resolve([{ id: "1", rank: 2 }]); // newer tap's read-back, fresh
+    filters[0]!.resolve([{ id: "1", rank: 1 }]); // older tap's read-back, STALE
+    await Promise.all([p1, p2]);
+
+    expect(store.getSnapshot().data[0]!.rank).toBe(2); // not rewound to 1
+    stop();
+  });
+
+  test("a read-back that fails after the write committed does not roll back or error", async () => {
+    // The atomic write commits, then the settle read-back blips offline. The
+    // increment is durable, so we must NOT surface an error or signal failure
+    // as if the write were lost — the doorbell echo will deliver the true value.
+    const handler = {
+      async list() {
+        return [{ id: "1", rank: 5 }];
+      },
+      async filter() {
+        throw new Error("read-back offline");
+      },
+      async updateMany() {
+        return { success: true, updated: 1, has_more: false };
+      },
+      subscribe() {
+        return () => {};
+      },
+    } as unknown as EntityHandler<Row>;
+
+    const store = new LiveEntityStore<Row>(handler);
+    const stop = store.start();
+    await tick();
+
+    const result = await store.increment("1", "rank", 1);
+    // No spurious error on a write that actually succeeded (the load-bearing
+    // fix: the old code surfaced the read-back's error and returned null here,
+    // which reads to the app as "the save failed").
+    expect(store.getSnapshot().error).toBeNull();
+    // The overlay retired to the last committed value we know (5) rather than
+    // dropping below it; the echo settles it to 6. It never throws.
+    expect(store.getSnapshot().data[0]!.rank).toBe(5);
+    expect(result).toBeNull();
+    stop();
+  });
 
   test("the doorbell echo of your own write reconciles to a no-op (no duplicates)", async () => {
     const h = makeHarness();
