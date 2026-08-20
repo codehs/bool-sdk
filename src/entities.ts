@@ -62,9 +62,12 @@ export type FilterQuery = {
   $nor?: FilterQuery[];
 };
 
-/** MongoDB-style update operators. `$set` is applied as one atomic PATCH; the
- * others (`$inc`/`$mul`/`$push`/`$pull`/`$unset`) are applied read-modify-write
- * (see updateMany docs — not atomic under concurrent writers). */
+/** MongoDB-style update operators. `$set`/`$unset` apply as one atomic PATCH,
+ * and `$inc`/`$mul` are atomic too — done in SQL (`col = col + n`) via the
+ * per-schema `bool_apply_numeric` function, so concurrent writers can't lose
+ * each other's arithmetic (older schemas without the function fall back to
+ * read-modify-write). Only the array operators (`$push`/`$pull`) are
+ * read-modify-write and not atomic under concurrent writers. See updateMany. */
 export type UpdateOps = Partial<{
   $set: Record<string, unknown>;
   $inc: Record<string, number>;
@@ -155,6 +158,12 @@ export type EntityQueryResult<T = any> = {
   create: (fields: Partial<T>) => Promise<T | null>;
   /** Optimistic patch. Resolves to the committed row, or null on failure. */
   update: (id: string, fields: Partial<T>) => Promise<T | null>;
+  /** Optimistic ATOMIC increment of one numeric field (`by` defaults to 1).
+   * The number moves instantly, the write adds in SQL so simultaneous clicks
+   * can't clobber each other, and it settles from the server. Resolves to the
+   * committed row, or null on failure. Use this for counters/likes/votes/stock
+   * instead of read-then-write or a manual bump-and-refetch. */
+  increment: (id: string, field: string, by?: number) => Promise<T | null>;
   /** Optimistic delete. Resolves false on failure (row restored). */
   remove: (id: string) => Promise<boolean>;
   /** Force a full reload (rarely needed — changes arrive on their own). */

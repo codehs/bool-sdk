@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.6.0
+
+Adds an optimistic atomic increment to the live query hook, so counters feel
+instant without giving up atomic safety.
+
+- **New: `bool.entities.<table>.useQuery().increment(id, field, by?)`** (`by`
+  defaults to 1). It bumps the field on the row in the same frame as the tap,
+  performs the write as an atomic SQL `$inc` so two people incrementing at once
+  cannot lose each other's clicks, and then reads the committed row back before
+  retiring the overlay, so the digit never dips between the optimistic bump and
+  the server value. A failed write rolls the bump back and surfaces the error on
+  the snapshot; it never throws. Resolves to the committed row, or null on
+  failure.
+
+  Rapid taps are safe against their read-backs racing: each tap is stamped, and
+  only the newest one's read-back may settle `server`, so a stale response
+  landing late cannot rewind the count. And a write that commits but whose
+  read-back then blips offline is not rolled back or reported as an error — the
+  increment is durable and the doorbell echo settles the value.
+
+  This replaces the pattern generated counter code kept reaching for: a manual
+  local bump reconciled against a full `refetch()`, which flickered when the
+  refetch raced the change broadcast, plus a `working` guard that dropped fast
+  taps. `increment` needs neither. Rapid taps stack on the overlay and each
+  lands as its own atomic `$inc`.
+
+  For counters, likes, votes, and stock decrements, reach for `increment`
+  instead of `update(id, { count: current + 1 })` (a read-modify-write that
+  loses concurrent changes) or the one-off `updateMany({ id }, { $inc: {...} })`
+  (atomic, but not optimistic and not on the hook).
+
 ## 0.5.0
 
 Types every error the AI plane can return, and normalizes the one field whose
