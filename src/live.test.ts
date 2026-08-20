@@ -28,14 +28,23 @@ function deferred<V>() {
 function makeHarness(initial: Row[] = []) {
   const rows = new Map(initial.map((r) => [r.id, { ...r }]));
   const listeners = new Set<(p: BoolChangePayload) => void>();
-  const calls: { list: number; filter: FilterQuery[]; creates: Partial<Row>[] } = {
+  const calls: {
+    list: number;
+    filter: FilterQuery[];
+    creates: Partial<Row>[];
+    updateMany: FilterQuery[];
+  } = {
     list: 0,
     filter: [],
     creates: [],
+    updateMany: [],
   };
   // When set, the next list/filter call parks on this deferred instead of
   // resolving immediately (then clears, so later calls auto-resolve).
   let gate: ReturnType<typeof deferred<Row[]>> | null = null;
+  // Same idea for updateMany, so a test can hold the atomic write in flight and
+  // assert the optimistic overlay is already showing.
+  let updateManyGate: ReturnType<typeof deferred<void>> | null = null;
 
   const visible = () => [...rows.values()].map((r) => ({ ...r }));
   const handler = {
@@ -75,6 +84,25 @@ function makeHarness(initial: Row[] = []) {
       rows.set(id, row);
       return { ...row };
     },
+    async updateMany(q: FilterQuery, ops: Record<string, any>) {
+      calls.updateMany.push(q);
+      if (updateManyGate) {
+        const g = updateManyGate;
+        updateManyGate = null;
+        await g.promise;
+      }
+      const ids = (q.id as string[]) ?? [];
+      const inc = (ops.$inc ?? {}) as Record<string, number>;
+      for (const id of ids) {
+        const r = rows.get(id);
+        if (!r) continue;
+        for (const [f, d] of Object.entries(inc)) {
+          (r as Record<string, unknown>)[f] = Number((r as Record<string, unknown>)[f] ?? 0) + d;
+        }
+        rows.set(id, r);
+      }
+      return { success: true, updated: ids.length, has_more: false };
+    },
     async delete(id: string) {
       rows.delete(id);
       return { success: true };
@@ -95,6 +123,10 @@ function makeHarness(initial: Row[] = []) {
     gateNextLoad() {
       gate = deferred<Row[]>();
       return gate;
+    },
+    gateNextUpdateMany() {
+      updateManyGate = deferred<void>();
+      return updateManyGate;
     },
   };
 }
@@ -520,6 +552,59 @@ describe("LiveEntityStore: optimistic mutations", () => {
     expect(store.getSnapshot().data.length).toBe(0); // hidden immediately
     expect(await p).toBe(false);
     expect(store.getSnapshot().data.length).toBe(1); // restored
+    stop();
+  });
+
+  test("increment bumps the field instantly and settles without double-counting", async () => {
+    const h = makeHarness([{ id: "1", rank: 5 }]);
+    const store = new LiveEntityStore<Row>(h.handler);
+    const stop = store.start();
+    await tick();
+
+    const gate = h.gateNextUpdateMany();
+    const p = store.increment("1", "rank", 1);
+    // Optimistic: the number moved in the same frame, before the write settled.
+    expect(store.getSnapshot().data[0]!.rank).toBe(6);
+
+    gate.resolve();
+    const settled = await p;
+    // Settled from the read-back: the overlay retired without adding a 2nd time.
+    expect(settled?.rank).toBe(6);
+    expect(store.getSnapshot().data[0]!.rank).toBe(6);
+    // Went through the atomic path, scoped to this id.
+    expect(h.calls.updateMany.at(-1)).toEqual({ id: ["1"] });
+    stop();
+  });
+
+  test("increment stacks rapid taps optimistically and lands on the summed total", async () => {
+    const h = makeHarness([{ id: "1", rank: 0 }]);
+    const store = new LiveEntityStore<Row>(h.handler);
+    const stop = store.start();
+    await tick();
+
+    // Three taps, none awaited between, so the overlay shows the running sum with
+    // no throttle, and each write is an atomic $inc so none clobbers another.
+    const taps = [store.increment("1", "rank"), store.increment("1", "rank"), store.increment("1", "rank")];
+    expect(store.getSnapshot().data[0]!.rank).toBe(3); // instant, cumulative
+    await Promise.all(taps);
+    expect(store.getSnapshot().data[0]!.rank).toBe(3); // atomic writes summed
+    stop();
+  });
+
+  test("increment rolls back the bump and surfaces the error when the write fails", async () => {
+    const h = makeHarness([{ id: "1", rank: 5 }]);
+    const store = new LiveEntityStore<Row>(h.handler);
+    const stop = store.start();
+    await tick();
+
+    h.handler.updateMany = (async () => {
+      throw new Error("increment failed");
+    }) as typeof h.handler.updateMany;
+
+    const result = await store.increment("1", "rank", 1);
+    expect(result).toBeNull();
+    expect(store.getSnapshot().data[0]!.rank).toBe(5); // rolled back to committed
+    expect((store.getSnapshot().error as Error).message).toBe("increment failed");
     stop();
   });
 

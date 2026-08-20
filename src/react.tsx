@@ -366,6 +366,7 @@ function useEntityHandler<T extends EntityRow = EntityRow>(
     error: snap.error,
     create: (fields) => store.create(fields),
     update: (id, fields) => store.update(id, fields),
+    increment: (id, field, by) => store.increment(id, field, by),
     remove: (id) => store.remove(id),
     refetch: () => store.refetch(),
   };

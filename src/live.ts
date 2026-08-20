@@ -169,6 +169,7 @@ export function matchesFilter(row: Record<string, unknown>, query: FilterQuery):
 type PendingOp<T extends EntityRow> =
   | { kind: "create"; id: string; row: Partial<T> }
   | { kind: "update"; id: string; patch: Partial<T> }
+  | { kind: "increment"; id: string; inc: Record<string, number> }
   | { kind: "remove"; id: string };
 
 /** Generate a client-side row id (the optimistic-UI cornerstone: ONE id shared
@@ -313,6 +314,42 @@ export class LiveEntityStore<T extends EntityRow = EntityRow> {
     }
   }
 
+  /** Optimistic ATOMIC increment of one numeric field (`by` defaults to 1).
+   *
+   * The overlay bumps the field by `by` immediately, so the number moves in the
+   * same frame as the tap, with no read-modify-write and no wait for the server
+   * echo. The write itself is the atomic `$inc` (`col = col + n` in SQL), so two
+   * people incrementing at the same instant can't lose each other's clicks. Once
+   * it commits we read the row back BEFORE retiring the overlay: that read is
+   * ordered after our committed write, so it already includes this increment
+   * (and any concurrent ones), and swapping overlay for committed in one emit
+   * means the digit never dips in between. A failed write drops the overlay
+   * (rolls back) and surfaces the error on the snapshot; it never throws.
+   *
+   * This is the ONE counter pattern hand-rolled app code kept getting wrong: an
+   * optimistic bump reconciled against a full refetch flickered when the refetch
+   * raced the change broadcast. Owning it here is what makes counters feel
+   * instant without giving up atomicity. */
+  async increment(id: string, field: string, by = 1): Promise<T | null> {
+    const op: PendingOp<T> = { kind: "increment", id, inc: { [field]: by } };
+    this.pending.push(op);
+    this.emit();
+    try {
+      await this.handler.updateMany({ id: [id] } as FilterQuery, { $inc: { [field]: by } });
+      const rows = await this.handler.filter({ id: [id] } as FilterQuery, undefined, 1);
+      if (rows[0]) this.server.set(id, rows[0]);
+      else this.server.delete(id); // removed while our increment was in flight
+      this.snapshot = { ...this.snapshot, error: null };
+      return rows[0] ?? null;
+    } catch (error) {
+      this.snapshot = { ...this.snapshot, error };
+      return null;
+    } finally {
+      this.pending = this.pending.filter((p) => p !== op);
+      this.emit();
+    }
+  }
+
   // ---- loading & reconciling ------------------------------------------------
 
   private async load(): Promise<void> {
@@ -426,6 +463,18 @@ export class LiveEntityStore<T extends EntityRow = EntityRow> {
       } else if (op.kind === "update") {
         const base = byId.get(op.id);
         if (base) byId.set(op.id, { ...base, ...op.patch });
+      } else if (op.kind === "increment") {
+        // Bump the numeric field(s) on the committed row. Only when the row is
+        // present. Incrementing something not yet loaded is a no-op overlay,
+        // the same way an update to an unknown id is.
+        const base = byId.get(op.id);
+        if (base) {
+          const next = { ...base } as Record<string, unknown>;
+          for (const [f, d] of Object.entries(op.inc)) {
+            next[f] = Number(base[f as keyof T] ?? 0) + d;
+          }
+          byId.set(op.id, next as T);
+        }
       } else {
         byId.delete(op.id);
       }
