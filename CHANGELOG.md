@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0-next.0
+
+Adds project-isolated runtime file storage for generated Bool apps.
+
+- **New: `bool.files.upload(file, options?)`.** Reserves quota through Bool's
+  gateway, uploads the bytes directly through a short-lived signed URL, then
+  verifies and completes the object. `File.name` is used automatically; a plain
+  `Blob` requires `options.name`. Visibility defaults to `user`, while `app`
+  makes the file readable to anyone who can use that Bool.
+- **New: `bool.files.list()`, `getDownloadUrl(id)`, and `remove(id)`.** Apps work
+  only with opaque file IDs. Bucket names and provider paths never enter app
+  code, and download URLs are short-lived rather than durable values.
+- **New: `BoolFilesError` and file types.** Gateway failures preserve their
+  machine-readable code and HTTP status so apps can distinguish quota, size,
+  authentication, and rate-limit failures.
+
+This prerelease requires the matching Bool files gateway and its `bool-files`
+feature flag. It is published only to the `next` channel.
+
 ## 0.6.0
 
 Adds an optimistic atomic increment to the live query hook, so counters feel

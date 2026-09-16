@@ -9,6 +9,7 @@ import {
   isBoolAiWireErrorCode,
   type BoolAiWireErrorCode,
   BoolFetchError,
+  BoolFilesError,
   type BoolClientConfig,
 } from "./client";
 
@@ -338,6 +339,112 @@ describe("local development (config.apiKey)", () => {
     const client = createBoolClient(CONFIG);
     await client.db.from("todos").select("*");
     expect(headersOf(calls[0]!).get("api_key")).toBeNull();
+  });
+});
+
+describe("bool.files", () => {
+  test("uploads bytes directly with a signed URL, then completes the reservation", async () => {
+    respond = (url) => {
+      if (url.endsWith("/_bool/v1/files/uploads")) {
+        return Response.json({
+          file: { id: "file-1" },
+          upload: { url: "https://storage.test/signed-upload" },
+        });
+      }
+      if (url === "https://storage.test/signed-upload") return Response.json({ Key: "ok" });
+      if (url.endsWith("/_bool/v1/files/uploads/file-1/complete")) {
+        return Response.json({
+          file: {
+            id: "file-1",
+            name: "clip.gif",
+            type: "image/gif",
+            size: 3,
+            visibility: "app",
+            createdAt: "2026-09-16T00:00:00.000Z",
+          },
+        });
+      }
+      return Response.json({ error: "not_found" }, { status: 404 });
+    };
+
+    const client = createBoolClient({ ...CONFIG, viewerToken: "viewer", apiKey: "user-key" });
+    const file = new File(["gif"], "clip.gif", { type: "image/gif" });
+    const uploaded = await client.files.upload(file, { visibility: "app" });
+
+    expect(uploaded.id).toBe("file-1");
+    expect(calls.map((call) => call.url)).toEqual([
+      "https://bool.test/served/my-app/_bool/v1/files/uploads",
+      "https://storage.test/signed-upload",
+      "https://bool.test/served/my-app/_bool/v1/files/uploads/file-1/complete",
+    ]);
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({
+      name: "clip.gif",
+      type: "image/gif",
+      size: 3,
+      visibility: "app",
+    });
+    expect(headersOf(calls[0]!).get("x-bool-viewer")).toBe("viewer");
+    expect(headersOf(calls[0]!).get("api_key")).toBe("user-key");
+    expect(calls[1]!.init?.method).toBe("PUT");
+    expect(headersOf(calls[1]!).get("x-upsert")).toBe("false");
+    expect(calls[1]!.init?.body).toBeInstanceOf(FormData);
+  });
+
+  test("list, signed read, and removal stay on the files gateway plane", async () => {
+    respond = (url, init) => {
+      if (url.endsWith("/_bool/v1/files") && init?.method === "GET") {
+        return Response.json({
+          files: [{
+            id: "one",
+            name: "one.png",
+            type: "image/png",
+            size: 12,
+            visibility: "user",
+            createdAt: "2026-09-16T00:00:00.000Z",
+          }],
+        });
+      }
+      if (url.endsWith("/_bool/v1/files/objects/one") && init?.method === "POST") {
+        return Response.json({ url: "https://storage.test/read" });
+      }
+      return new Response(null, { status: 204 });
+    };
+    const client = createBoolClient(CONFIG);
+
+    expect(await client.files.list()).toEqual([
+      {
+        id: "one",
+        name: "one.png",
+        type: "image/png",
+        size: 12,
+        visibility: "user",
+        createdAt: "2026-09-16T00:00:00.000Z",
+      },
+    ]);
+    expect(await client.files.getDownloadUrl("one")).toBe("https://storage.test/read");
+    await client.files.remove("one");
+
+    expect(calls.map((call) => [call.url, call.init?.method])).toEqual([
+      ["https://bool.test/served/my-app/_bool/v1/files", "GET"],
+      ["https://bool.test/served/my-app/_bool/v1/files/objects/one", "POST"],
+      ["https://bool.test/served/my-app/_bool/v1/files/objects/one", "DELETE"],
+    ]);
+  });
+
+  test("surfaces gateway errors and rejects unnamed Blobs before making a request", async () => {
+    const client = createBoolClient(CONFIG);
+    const unnamed = (await client.files
+      .upload(new Blob(["x"]))
+      .catch((error) => error)) as BoolFilesError;
+    expect(unnamed).toBeInstanceOf(BoolFilesError);
+    expect(unnamed.code).toBe("missing_filename");
+    expect(calls).toHaveLength(0);
+
+    respond = () => Response.json({ error: "storage_quota_exceeded" }, { status: 413 });
+    const quota = (await client.files.list().catch((error) => error)) as BoolFilesError;
+    expect(quota).toBeInstanceOf(BoolFilesError);
+    expect(quota.code).toBe("storage_quota_exceeded");
+    expect(quota.status).toBe(413);
   });
 });
 

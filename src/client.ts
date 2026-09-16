@@ -362,6 +362,44 @@ export class BoolFetchError extends Error {
   }
 }
 
+export type BoolFileVisibility = "app" | "user";
+
+export type BoolFile = {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  visibility: BoolFileVisibility;
+  createdAt: string;
+};
+
+export type BoolFileUploadOptions = {
+  /** Filename shown in the app and dashboard. Required for a Blob; defaults to
+   * File.name when a File is supplied. */
+  name?: string;
+  /** `user` is private to the uploader; `app` is readable by anyone who can
+   * open this app. Defaults to `user`. */
+  visibility?: BoolFileVisibility;
+};
+
+export class BoolFilesError extends Error {
+  constructor(
+    readonly code: string,
+    readonly status: number,
+    options?: ErrorOptions,
+  ) {
+    super(`bool.files failed: ${code} (${status})`, options);
+    this.name = "BoolFilesError";
+  }
+}
+
+export type BoolFiles = {
+  upload(file: Blob, options?: BoolFileUploadOptions): Promise<BoolFile>;
+  list(): Promise<BoolFile[]>;
+  getDownloadUrl(id: string): Promise<string>;
+  remove(id: string): Promise<void>;
+};
+
 /** The subset of `RequestInit` a proxied call supports. Streaming request bodies,
  * `FormData`, `AbortSignal` and the rest of `fetch`'s surface aren't forwarded:
  * the call is described to the gateway as data, not opened from the browser. */
@@ -422,6 +460,10 @@ export type BoolClient = {
    * `{{SECRET_NAME}}` substituted server-side: `fetch(url, init)`. Same
    * arguments and same `Response` as the global `fetch`. */
   fetch: BoolFetch;
+  /** Private, project-isolated file storage. Uploads go directly to storage
+   * through a short-lived signed URL; metadata and access stay behind Bool's
+   * gateway. */
+  files: BoolFiles;
   /** This app's private Postgres schema name. */
   schema: string;
   /** Subscribe to the app's realtime "doorbell": fires whenever any row in the
@@ -1001,6 +1043,78 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     });
   };
 
+  async function filesCall(path: string, init?: RequestInit): Promise<any> {
+    const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/files${path}`, {
+      ...init,
+      headers: batteryHeaders(),
+      credentials: "include",
+    });
+    let body: any = null;
+    try {
+      body = await res.json();
+    } catch (_) {}
+    if (!res.ok) {
+      throw new BoolFilesError(body?.error ?? "unknown_error", res.status);
+    }
+    return body;
+  }
+
+  const filesModule: BoolFiles = {
+    async upload(file, options = {}) {
+      const inferredName =
+        typeof File !== "undefined" && file instanceof File ? file.name : undefined;
+      const name = options.name ?? inferredName;
+      if (!name) throw new BoolFilesError("missing_filename", 400);
+
+      const prepared = await filesCall("/uploads", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          type: file.type || "application/octet-stream",
+          size: file.size,
+          visibility: options.visibility ?? "user",
+        }),
+      });
+      const id = prepared?.file?.id as string;
+      try {
+        const body = new FormData();
+        body.append("cacheControl", "3600");
+        body.append("", file);
+        const uploaded = await fetch(prepared.upload.url, {
+          method: "PUT",
+          headers: { "x-upsert": "false" },
+          body,
+        });
+        if (!uploaded.ok) {
+          throw new BoolFilesError("upload_failed", uploaded.status);
+        }
+        const completed = await filesCall(`/uploads/${encodeURIComponent(id)}/complete`, {
+          method: "POST",
+        });
+        return completed.file as BoolFile;
+      } catch (cause) {
+        await filesCall(`/objects/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(
+          () => {},
+        );
+        if (cause instanceof BoolFilesError) throw cause;
+        throw new BoolFilesError("upload_failed", 0, { cause });
+      }
+    },
+    async list() {
+      const body = await filesCall("", { method: "GET" });
+      return (body.files ?? []) as BoolFile[];
+    },
+    async getDownloadUrl(id) {
+      const body = await filesCall(`/objects/${encodeURIComponent(id)}`, {
+        method: "POST",
+      });
+      return body.url as string;
+    },
+    async remove(id) {
+      await filesCall(`/objects/${encodeURIComponent(id)}`, { method: "DELETE" });
+    },
+  };
+
   const subscribeToChanges = (
     listener: (payload: BoolChangePayload) => void,
   ): (() => void) => doorbell.subscribe(listener);
@@ -1011,6 +1125,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     auth,
     ai,
     fetch: boolFetch,
+    files: filesModule,
     schema,
     subscribeToChanges,
   };
