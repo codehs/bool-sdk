@@ -33,6 +33,14 @@ const GATEWAY_API = "v1";
 // preview reloads. Stays empty on deployed apps (same-origin → the cookie is
 // used, and the server never returns a token), so it's never exposed there.
 const EU_SESSION_KEY = "bool_eu_session_token";
+const FILE_UPLOADER_HEADER = "x-bool-file-uploader";
+const FILE_UPLOADER_KEY_PREFIX = "bool_file_uploader:";
+
+function randomUploaderKey(): string {
+  const bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 /** True when `host` is a single-label deployment subdomain of `appHost` (e.g.
  * "acme.bool.so" under "bool.so") — the exact shape the platform proxy rewrites
@@ -544,6 +552,29 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     }
   }
 
+  // Public apps may accept app-visible uploads without forcing visitors to
+  // create accounts. A persistent random browser capability gives those files
+  // an uploader for completion/deletion without exposing a platform secret.
+  // Include the private schema in the storage key so path-based previews of
+  // different apps on one origin never share an anonymous identity.
+  let fileUploaderKey = "";
+  function getFileUploaderKey(): string {
+    if (fileUploaderKey) return fileUploaderKey;
+    const storageKey = `${FILE_UPLOADER_KEY_PREFIX}${schema}`;
+    try {
+      fileUploaderKey = localStorage.getItem(storageKey) ?? "";
+      if (!/^[a-f0-9]{64}$/.test(fileUploaderKey)) {
+        fileUploaderKey = randomUploaderKey();
+        localStorage.setItem(storageKey, fileUploaderKey);
+      }
+    } catch {
+      // Sandboxed/private browsing can deny localStorage. The in-memory
+      // capability still owns the upload for this page lifetime.
+      fileUploaderKey = randomUploaderKey();
+    }
+    return fileUploaderKey;
+  }
+
   // Where the gateway lives, decided at runtime by where the app is running:
   //  - Deployed on a <label>.<appHost> subdomain: the gateway is same-origin
   //    (the platform proxy rewrites /_bool → /served/<slug>/_bool keyed on the
@@ -1046,7 +1077,10 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
   async function filesCall(path: string, init?: RequestInit): Promise<any> {
     const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/files${path}`, {
       ...init,
-      headers: batteryHeaders(),
+      headers: {
+        ...batteryHeaders(),
+        [FILE_UPLOADER_HEADER]: getFileUploaderKey(),
+      },
       credentials: "include",
     });
     let body: any = null;

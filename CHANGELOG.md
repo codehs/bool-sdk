@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.0-next.1
+
+Allows public apps to accept shared uploads without adding an account wall.
+
+- **Anonymous app-visible uploads.** `bool.files.upload(file, { visibility:
+  "app" })` now carries a persistent, project-scoped browser capability. The
+  gateway uses it only to complete and delete that browser's uploads; private
+  `user` files still require a signed-in app user.
+- **No API changes.** The SDK manages the capability automatically. Existing
+  project quotas, object limits, signed reads, and uploader-only deletion still
+  apply.
+
 ## 0.7.0-next.0
 
 Adds project-isolated runtime file storage for generated Bool apps.

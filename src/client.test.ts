@@ -13,7 +13,7 @@ import {
   type BoolClientConfig,
 } from "./client";
 
-// Behavioral tests for the gateway client with fetch/sessionStorage stubbed.
+// Behavioral tests for the gateway client with fetch/browser storage stubbed.
 // These pin the invariants that make the client correct + secure: REST and
 // Storage go through the gateway, everything else passes through, and the
 // end-user auth surface stores/replays the preview session token correctly.
@@ -32,6 +32,7 @@ let calls: Call[] = [];
 let respond: (url: string, init?: RequestInit) => Response;
 
 const sessionStore = new Map<string, string>();
+const localStore = new Map<string, string>();
 
 beforeEach(() => {
   calls = [];
@@ -45,10 +46,16 @@ beforeEach(() => {
   }) as unknown as typeof fetch;
 
   sessionStore.clear();
+  localStore.clear();
   (globalThis as any).sessionStorage = {
     getItem: (k: string) => sessionStore.get(k) ?? null,
     setItem: (k: string, v: string) => void sessionStore.set(k, String(v)),
     removeItem: (k: string) => void sessionStore.delete(k),
+  };
+  (globalThis as any).localStorage = {
+    getItem: (k: string) => localStore.get(k) ?? null,
+    setItem: (k: string, v: string) => void localStore.set(k, String(v)),
+    removeItem: (k: string) => void localStore.delete(k),
   };
   delete (globalThis as any).location;
 });
@@ -385,9 +392,28 @@ describe("bool.files", () => {
     });
     expect(headersOf(calls[0]!).get("x-bool-viewer")).toBe("viewer");
     expect(headersOf(calls[0]!).get("api_key")).toBe("user-key");
+    expect(headersOf(calls[0]!).get("x-bool-file-uploader")).toMatch(
+      /^[a-f0-9]{64}$/,
+    );
     expect(calls[1]!.init?.method).toBe("PUT");
     expect(headersOf(calls[1]!).get("x-upsert")).toBe("false");
     expect(calls[1]!.init?.body).toBeInstanceOf(FormData);
+  });
+
+  test("keeps one project-scoped anonymous uploader capability across clients", async () => {
+    respond = () => Response.json({ files: [] });
+    const first = createBoolClient(CONFIG);
+    await first.files.list();
+    const firstKey = headersOf(calls[0]!).get("x-bool-file-uploader");
+
+    const reloaded = createBoolClient(CONFIG);
+    await reloaded.files.list();
+    expect(headersOf(calls[1]!).get("x-bool-file-uploader")).toBe(firstKey);
+
+    const otherProject = createBoolClient({ ...CONFIG, schema: "bool_other" });
+    await otherProject.files.list();
+    expect(headersOf(calls[2]!).get("x-bool-file-uploader")).not.toBe(firstKey);
+    expect(localStore.size).toBe(2);
   });
 
   test("list, signed read, and removal stay on the files gateway plane", async () => {
