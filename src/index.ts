@@ -21,6 +21,8 @@ export {
   type BoolFile,
   type BoolFileVisibility,
   type BoolFileUploadOptions,
+  type BoolFileListOptions,
+  type BoolFileUpdateInput,
   BoolFilesError,
   type BoolUser,
   type BoolChangePayload,

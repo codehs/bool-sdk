@@ -375,10 +375,13 @@ export type BoolFileVisibility = "app" | "user";
 export type BoolFile = {
   id: string;
   name: string;
+  /** Virtual folder path. An empty string means the project root. */
+  folder: string;
   type: string;
   size: number;
   visibility: BoolFileVisibility;
   createdAt: string;
+  updatedAt: string;
 };
 
 export type BoolFileUploadOptions = {
@@ -387,6 +390,20 @@ export type BoolFileUploadOptions = {
   name?: string;
   /** `user` is private to the uploader; `app` is readable by anyone who can
    * open this app. Defaults to `user`. */
+  visibility?: BoolFileVisibility;
+  /** Virtual folder path. Objects remain project-isolated regardless of folder. */
+  folder?: string;
+};
+
+export type BoolFileListOptions = {
+  query?: string;
+  folder?: string;
+  limit?: number;
+};
+
+export type BoolFileUpdateInput = {
+  name?: string;
+  folder?: string;
   visibility?: BoolFileVisibility;
 };
 
@@ -403,7 +420,8 @@ export class BoolFilesError extends Error {
 
 export type BoolFiles = {
   upload(file: Blob, options?: BoolFileUploadOptions): Promise<BoolFile>;
-  list(): Promise<BoolFile[]>;
+  list(options?: BoolFileListOptions): Promise<BoolFile[]>;
+  update(id: string, updates: BoolFileUpdateInput): Promise<BoolFile>;
   getDownloadUrl(id: string): Promise<string>;
   remove(id: string): Promise<void>;
 };
@@ -1107,6 +1125,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
           type: file.type || "application/octet-stream",
           size: file.size,
           visibility: options.visibility ?? "user",
+          folder: options.folder ?? "",
         }),
       });
       const id = prepared?.file?.id as string;
@@ -1134,9 +1153,20 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
         throw new BoolFilesError("upload_failed", 0, { cause });
       }
     },
-    async list() {
-      const body = await filesCall("", { method: "GET" });
+    async list(options = {}) {
+      const params = new URLSearchParams();
+      if (options.query) params.set("q", options.query);
+      if (options.folder !== undefined) params.set("folder", options.folder);
+      if (options.limit !== undefined) params.set("limit", String(options.limit));
+      const body = await filesCall(params.size ? `?${params}` : "", { method: "GET" });
       return (body.files ?? []) as BoolFile[];
+    },
+    async update(id, updates) {
+      const body = await filesCall(`/objects/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify(updates),
+      });
+      return body.file as BoolFile;
     },
     async getDownloadUrl(id) {
       const body = await filesCall(`/objects/${encodeURIComponent(id)}`, {

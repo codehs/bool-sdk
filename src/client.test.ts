@@ -389,6 +389,7 @@ describe("bool.files", () => {
       type: "image/gif",
       size: 3,
       visibility: "app",
+      folder: "",
     });
     expect(headersOf(calls[0]!).get("x-bool-viewer")).toBe("viewer");
     expect(headersOf(calls[0]!).get("api_key")).toBe("user-key");
@@ -416,9 +417,9 @@ describe("bool.files", () => {
     expect(localStore.size).toBe(2);
   });
 
-  test("list, signed read, and removal stay on the files gateway plane", async () => {
+  test("list, metadata update, signed read, and removal stay on the files gateway plane", async () => {
     respond = (url, init) => {
-      if (url.endsWith("/_bool/v1/files") && init?.method === "GET") {
+      if (url.includes("/_bool/v1/files?") && init?.method === "GET") {
         return Response.json({
           files: [{
             id: "one",
@@ -426,9 +427,23 @@ describe("bool.files", () => {
             type: "image/png",
             size: 12,
             visibility: "user",
+            folder: "",
             createdAt: "2026-09-16T00:00:00.000Z",
+            updatedAt: "2026-09-16T00:00:00.000Z",
           }],
         });
+      }
+      if (url.endsWith("/_bool/v1/files/objects/one") && init?.method === "PATCH") {
+        return Response.json({ file: {
+          id: "one",
+          name: "one.png",
+          folder: "Highlights",
+          type: "image/png",
+          size: 12,
+          visibility: "user",
+          createdAt: "2026-09-16T00:00:00.000Z",
+          updatedAt: "2026-09-16T01:00:00.000Z",
+        } });
       }
       if (url.endsWith("/_bool/v1/files/objects/one") && init?.method === "POST") {
         return Response.json({ url: "https://storage.test/read" });
@@ -437,21 +452,34 @@ describe("bool.files", () => {
     };
     const client = createBoolClient(CONFIG);
 
-    expect(await client.files.list()).toEqual([
+    expect(await client.files.list({ query: "one", folder: "", limit: 20 })).toEqual([
       {
         id: "one",
         name: "one.png",
         type: "image/png",
         size: 12,
         visibility: "user",
+        folder: "",
         createdAt: "2026-09-16T00:00:00.000Z",
+        updatedAt: "2026-09-16T00:00:00.000Z",
       },
     ]);
+    expect(await client.files.update("one", { folder: "Highlights" })).toEqual({
+      id: "one",
+      name: "one.png",
+      folder: "Highlights",
+      type: "image/png",
+      size: 12,
+      visibility: "user",
+      createdAt: "2026-09-16T00:00:00.000Z",
+      updatedAt: "2026-09-16T01:00:00.000Z",
+    });
     expect(await client.files.getDownloadUrl("one")).toBe("https://storage.test/read");
     await client.files.remove("one");
 
     expect(calls.map((call) => [call.url, call.init?.method])).toEqual([
-      ["https://bool.test/served/my-app/_bool/v1/files", "GET"],
+      ["https://bool.test/served/my-app/_bool/v1/files?q=one&folder=&limit=20", "GET"],
+      ["https://bool.test/served/my-app/_bool/v1/files/objects/one", "PATCH"],
       ["https://bool.test/served/my-app/_bool/v1/files/objects/one", "POST"],
       ["https://bool.test/served/my-app/_bool/v1/files/objects/one", "DELETE"],
     ]);

@@ -67,6 +67,24 @@ tested, and upgradable independently of any one app.
   If a token can't be obtained (not authorized for this app, or the gateway is
   unreachable) the doorbell retries with backoff and reports state rather than
   degrading silently — data still loads over HTTP, it just isn't live.
+- **App files.** `client.files` stores images, video, audio, and documents in a
+  project-isolated private bucket. Apps receive opaque IDs and short-lived read
+  URLs; provider bucket names and object paths never cross the API boundary.
+  Shared files can be uploaded anonymously, while private files require a
+  signed-in app user:
+  ```ts
+  const file = await bool.files.upload(selectedFile, {
+    visibility: "app",
+    folder: "Highlights/Defense",
+  });
+  const highlights = await bool.files.list({ folder: "Highlights/Defense" });
+  const url = await bool.files.getDownloadUrl(file.id);
+  await bool.files.update(file.id, { name: "Winning play.mp4", folder: "Highlights" });
+  await bool.files.remove(file.id);
+  ```
+  Store the file ID with app data, not the temporary read URL. Failures throw a
+  `BoolFilesError` whose `code` distinguishes quota, size, authentication, and
+  transport failures.
 - **End-user auth.** `client.auth` mirrors the `supabase.auth` surface
   (`signUp`, `signInWithPassword`, `signInWithOAuth`, `signOut`, `getUser`,
   `onAuthStateChange`, password reset) but talks to the Bool gateway's users

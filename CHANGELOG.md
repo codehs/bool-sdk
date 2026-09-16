@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.0-next.2
+
+Adds organization and metadata controls to app file storage.
+
+- **Virtual folders.** Upload into a folder with
+  `bool.files.upload(file, { folder: "Highlights/Defense" })`, filter with
+  `bool.files.list({ folder })`, and read `folder` on every `BoolFile`. Storage
+  objects keep opaque project-scoped paths; moving a file changes metadata,
+  never its isolation boundary.
+- **Server-side discovery.** `bool.files.list({ query, folder, limit })` filters
+  files at the gateway instead of requiring apps to load an entire library.
+- **Metadata updates.** `bool.files.update(id, { name, folder, visibility })`
+  renames, moves, or changes access without re-uploading bytes. `BoolFile` now
+  includes `updatedAt`.
+
 ## 0.7.0-next.1
 
 Allows public apps to accept shared uploads without adding an account wall.
