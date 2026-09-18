@@ -1,50 +1,33 @@
 # Changelog
 
-## 0.7.0-next.2
+## 0.7.0
 
-Adds organization and metadata controls to app file storage.
-
-- **Virtual folders.** Upload into a folder with
-  `bool.files.upload(file, { folder: "Highlights/Defense" })`, filter with
-  `bool.files.list({ folder })`, and read `folder` on every `BoolFile`. Storage
-  objects keep opaque project-scoped paths; moving a file changes metadata,
-  never its isolation boundary.
-- **Server-side discovery.** `bool.files.list({ query, folder, limit })` filters
-  files at the gateway instead of requiring apps to load an entire library.
-- **Metadata updates.** `bool.files.update(id, { name, folder, visibility })`
-  renames, moves, or changes access without re-uploading bytes. `BoolFile` now
-  includes `updatedAt`.
-
-## 0.7.0-next.1
-
-Allows public apps to accept shared uploads without adding an account wall.
-
-- **Anonymous app-visible uploads.** `bool.files.upload(file, { visibility:
-  "app" })` now carries a persistent, project-scoped browser capability. The
-  gateway uses it only to complete and delete that browser's uploads; private
-  `user` files still require a signed-in app user.
-- **No API changes.** The SDK manages the capability automatically. Existing
-  project quotas, object limits, signed reads, and uploader-only deletion still
-  apply.
-
-## 0.7.0-next.0
-
-Adds project-isolated runtime file storage for generated Bool apps.
+Adds project-isolated runtime file storage for generated Bool apps. Promotes
+the `0.7.0-next.0` through `-next.2` prereleases to stable, unchanged.
 
 - **New: `bool.files.upload(file, options?)`.** Reserves quota through Bool's
   gateway, uploads the bytes directly through a short-lived signed URL, then
   verifies and completes the object. `File.name` is used automatically; a plain
-  `Blob` requires `options.name`. Visibility defaults to `user`, while `app`
-  makes the file readable to anyone who can use that Bool.
-- **New: `bool.files.list()`, `getDownloadUrl(id)`, and `remove(id)`.** Apps work
-  only with opaque file IDs. Bucket names and provider paths never enter app
-  code, and download URLs are short-lived rather than durable values.
+  `Blob` requires `options.name`. Visibility defaults to `user` (private to the
+  signed-in app user); `app` makes the file readable to anyone who can use that
+  Bool, and `app` uploads work without an account through a persistent,
+  project-scoped browser capability the SDK manages itself.
+- **New: `bool.files.list(options?)`, `getDownloadUrl(id)`, `update(id, patch)`,
+  and `remove(id)`.** Apps work only with opaque file IDs. Bucket names and
+  provider paths never enter app code, and download URLs are short-lived rather
+  than durable values.
+- **Virtual folders and discovery.** Upload into a folder with
+  `bool.files.upload(file, { folder: "Highlights/Defense" })`, filter with
+  `bool.files.list({ query, folder, limit })` at the gateway, and read `folder`
+  and `updatedAt` on every `BoolFile`. `bool.files.update(id, { name, folder,
+  visibility })` renames, moves, or changes access without re-uploading bytes.
+  Moving a file changes metadata, never its isolation boundary.
 - **New: `BoolFilesError` and file types.** Gateway failures preserve their
   machine-readable code and HTTP status so apps can distinguish quota, size,
   authentication, and rate-limit failures.
 
-This prerelease requires the matching Bool files gateway and its `bool-files`
-feature flag. It is published only to the `next` channel.
+Requires the Bool platform's `bool-files` feature for the project; the gateway
+answers 404 for apps whose workspace has it off.
 
 ## 0.6.0
 
