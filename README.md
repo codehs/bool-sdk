@@ -85,6 +85,25 @@ tested, and upgradable independently of any one app.
   Store the file ID with app data, not the temporary read URL. Failures throw a
   `BoolFilesError` whose `code` distinguishes quota, size, authentication, and
   transport failures.
+- **Customer payments.** `client.payments` starts Stripe-hosted recurring
+  checkout and billing management without exposing Stripe credentials to the
+  app. Subscription reads come from signed webhooks rather than redirects or
+  browser state:
+  ```ts
+  const subscription = await bool.payments.current();
+  // subscription.mode is "test" until the owner switches the app to Live.
+  if (!subscription.active) {
+    await bool.payments.checkout({ plan: "pro" });
+  }
+
+  // For an existing customer:
+  await bool.payments.openPortal();
+  ```
+  Checkout and portal methods redirect automatically and default back to the
+  current page. Test and live customers, subscriptions, and entitlements are
+  isolated; a test subscription never unlocks an app after its owner switches
+  it to Live. Failures throw `BoolPaymentsError` with a machine-readable `code`
+  and HTTP `status`.
 - **End-user auth.** `client.auth` mirrors the `supabase.auth` surface
   (`signUp`, `signInWithPassword`, `signInWithOAuth`, `signOut`, `getUser`,
   `onAuthStateChange`, password reset) but talks to the Bool gateway's users

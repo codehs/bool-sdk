@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.0-next.0
+
+Adds Stripe-hosted recurring subscriptions for generated Bool apps.
+
+- **New: `bool.payments.current()`.** Reads the signed-in app user's
+  webhook-authoritative subscription and returns its plan, Stripe status,
+  renewal date, cancellation state, and normalized `active` entitlement.
+- **New: `bool.payments.checkout({ plan, returnUrl? })`.** Starts hosted Stripe
+  Checkout for a configured recurring plan and redirects there. The current
+  browser URL is the safe default return destination.
+- **New: `bool.payments.openPortal({ returnUrl? })`.** Redirects an existing
+  payment customer to Stripe's hosted billing portal.
+- **New: `BoolPaymentsError`.** Gateway failures preserve their stable code and
+  HTTP status so apps can distinguish sign-in, setup, plan, and customer errors.
+- **Safe test mode.** Subscription reads report `mode: "test" | "live"`, and
+  test customers and entitlements remain isolated from live payments.
+
+Stripe credentials and webhooks remain in Bool's gateway; they never enter the
+generated app bundle.
+
 ## 0.7.0
 
 Adds project-isolated runtime file storage for generated Bool apps. Promotes

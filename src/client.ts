@@ -426,6 +426,46 @@ export type BoolFiles = {
   remove(id: string): Promise<void>;
 };
 
+export type BoolSubscriptionStatus =
+  | "active"
+  | "trialing"
+  | "past_due"
+  | "canceled"
+  | "incomplete"
+  | "incomplete_expired"
+  | "unpaid"
+  | "paused";
+
+export type BoolSubscription = {
+  /** Stripe environment selected by the app owner. Test and live entitlements
+   * are isolated and never satisfy each other. */
+  mode: "test" | "live";
+  plan: string | null;
+  status: BoolSubscriptionStatus | null;
+  active: boolean;
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+};
+
+export class BoolPaymentsError extends Error {
+  constructor(
+    readonly code: string,
+    readonly status: number,
+  ) {
+    super(`bool.payments failed: ${code} (${status})`);
+    this.name = "BoolPaymentsError";
+  }
+}
+
+export type BoolPayments = {
+  /** Return the signed-in customer's current subscription. */
+  current(): Promise<BoolSubscription>;
+  /** Redirect to Stripe's hosted checkout for a recurring plan. */
+  checkout(options: { plan: string; returnUrl?: string }): Promise<void>;
+  /** Redirect to Stripe's hosted billing portal for the current customer. */
+  openPortal(options?: { returnUrl?: string }): Promise<void>;
+};
+
 /** The subset of `RequestInit` a proxied call supports. Streaming request bodies,
  * `FormData`, `AbortSignal` and the rest of `fetch`'s surface aren't forwarded:
  * the call is described to the gateway as data, not opened from the browser. */
@@ -490,6 +530,9 @@ export type BoolClient = {
    * through a short-lived signed URL; metadata and access stay behind Bool's
    * gateway. */
   files: BoolFiles;
+  /** Customer subscriptions for this app. Checkout and account management use
+   * Stripe-hosted pages, while subscription state comes from Bool's gateway. */
+  payments: BoolPayments;
   /** This app's private Postgres schema name. */
   schema: string;
   /** Subscribe to the app's realtime "doorbell": fires whenever any row in the
@@ -1179,6 +1222,48 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     },
   };
 
+  async function paymentsCall(path: string, init?: RequestInit): Promise<any> {
+    const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/payments${path}`, {
+      ...init,
+      headers: batteryHeaders(),
+      credentials: "include",
+    });
+    let body: any = null;
+    try {
+      body = await res.json();
+    } catch (_) {}
+    if (!res.ok) {
+      throw new BoolPaymentsError(body?.error ?? "unknown_error", res.status);
+    }
+    return body;
+  }
+
+  function paymentReturnUrl(explicit?: string): string {
+    if (explicit) return explicit;
+    if (typeof location !== "undefined") return location.href;
+    throw new BoolPaymentsError("return_url_required", 400);
+  }
+
+  const payments: BoolPayments = {
+    async current() {
+      return (await paymentsCall("/current", { method: "GET" })) as BoolSubscription;
+    },
+    async checkout({ plan, returnUrl }) {
+      const body = await paymentsCall("/checkout", {
+        method: "POST",
+        body: JSON.stringify({ plan, returnUrl: paymentReturnUrl(returnUrl) }),
+      });
+      location.assign(body.url as string);
+    },
+    async openPortal({ returnUrl } = {}) {
+      const body = await paymentsCall("/portal", {
+        method: "POST",
+        body: JSON.stringify({ returnUrl: paymentReturnUrl(returnUrl) }),
+      });
+      location.assign(body.url as string);
+    },
+  };
+
   const subscribeToChanges = (
     listener: (payload: BoolChangePayload) => void,
   ): (() => void) => doorbell.subscribe(listener);
@@ -1190,6 +1275,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     ai,
     fetch: boolFetch,
     files: filesModule,
+    payments,
     schema,
     subscribeToChanges,
   };
