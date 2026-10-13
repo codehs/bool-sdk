@@ -1,46 +1,32 @@
 # Changelog
 
-## 0.8.0-payments.2
+## 0.8.0
 
-- **Fix: checkout no longer replaces the editor in Chrome.** The editor's preview
-  frame is `credentialless`, and Chrome opens every tab from such a frame as
-  noopener, so `window.open` returned null even though a tab opened. 0.8.0-
-  payments.1 read that as a blocked tab and fell back to navigating the editor,
-  leaving a blank tab behind. In a credentialless frame, `checkout()` and
-  `openPortal()` now open Stripe's URL directly once the gateway returns it.
-
-## 0.8.0-payments.1
-
-Published to the `payments` dist-tag so only apps that pin this exact version
-get it; the `next` tag, which 166 older apps follow, stays on 0.8.0-next.0.
-
-- **Fix: checkout and the billing portal open in the Bool editor preview.**
-  Stripe's pages refuse to load inside a frame, and the editor previews apps in
-  one, so `checkout()` and `openPortal()` showed a blank page there. Inside a
-  frame they now open Stripe in a new tab, opened on the click itself so popup
-  blockers allow it, and close that tab if the gateway refuses. If the browser
-  blocks the tab anyway, they navigate the top window. Outside a frame nothing
-  changes.
-
-## 0.8.0-next.0
-
-Adds Stripe-hosted recurring subscriptions for generated Bool apps.
+Adds Stripe-hosted recurring subscriptions for generated Bool apps. Promotes
+the `0.8.0-next.0` and `0.8.0-payments.1`/`.2` prereleases to stable.
 
 - **New: `bool.payments.current()`.** Reads the signed-in app user's
   webhook-authoritative subscription and returns its plan, Stripe status,
   renewal date, cancellation state, and normalized `active` entitlement.
 - **New: `bool.payments.checkout({ plan, returnUrl? })`.** Starts hosted Stripe
-  Checkout for a configured recurring plan and redirects there. The current
-  browser URL is the safe default return destination.
-- **New: `bool.payments.openPortal({ returnUrl? })`.** Redirects an existing
-  payment customer to Stripe's hosted billing portal.
+  Checkout for a configured recurring plan. The current browser URL is the safe
+  default return destination.
+- **New: `bool.payments.openPortal({ returnUrl? })`.** Opens Stripe's hosted
+  billing portal for an existing payment customer.
 - **New: `BoolPaymentsError`.** Gateway failures preserve their stable code and
   HTTP status so apps can distinguish sign-in, setup, plan, and customer errors.
 - **Safe test mode.** Subscription reads report `mode: "test" | "live"`, and
   test customers and entitlements remain isolated from live payments.
+- **Works inside the Bool editor preview.** Stripe's pages refuse to load in a
+  frame, so inside one, `checkout()` and `openPortal()` open Stripe in a new tab
+  instead of redirecting. In the editor's credentialless preview frame, where
+  Chrome opens tabs as noopener, they open Stripe's URL directly once the
+  gateway returns it, so the editor is never replaced.
 
 Stripe credentials and webhooks remain in Bool's gateway; they never enter the
-generated app bundle.
+generated app bundle. Requires the Bool platform's `app-payments` feature for
+the project; the gateway answers 404 for projects that have it off, so the
+methods are inert until a creator is given payments.
 
 ## 0.7.0
 
