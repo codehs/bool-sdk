@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.0-next.1
+
+- **Fix: checkout and the billing portal open in the Bool editor preview.**
+  Stripe's pages refuse to load inside a frame, and the editor previews apps in
+  one, so `checkout()` and `openPortal()` showed a blank page there. Inside a
+  frame they now open Stripe in a new tab, opened on the click itself so popup
+  blockers allow it, and close that tab if the gateway refuses. If the browser
+  blocks the tab anyway, they navigate the top window. Outside a frame nothing
+  changes.
+
 ## 0.8.0-next.0
 
 Adds Stripe-hosted recurring subscriptions for generated Bool apps.

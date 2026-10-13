@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   createBoolClient,
   getDefaultBoolClient,
@@ -570,6 +570,75 @@ describe("bool.payments battery", () => {
       returnUrl: "https://my-app.bool.test/settings",
     });
     expect(redirects).toEqual(["https://billing.stripe.com/p/session_test"]);
+  });
+
+  describe("inside a frame (the Bool editor preview)", () => {
+    afterEach(() => {
+      delete (globalThis as any).window;
+    });
+
+    // Stripe pages refuse to load in a frame, so a redirect there shows a blank
+    // page. These stand in for an iframe: window.top is a different window.
+    function framedWindow(popup: { location: { href: string }; close(): void; opener: unknown } | null) {
+      const top = { location: { href: "https://bool.test/projects/p1" } };
+      const opened: string[] = [];
+      (globalThis as any).window = {
+        top,
+        self: {},
+        open: (url: string) => {
+          // The tab must open BEFORE the gateway call, while the click still
+          // counts as a user gesture, so it starts blank.
+          opened.push(`${url}|calls=${calls.length}`);
+          return popup;
+        },
+      };
+      return { top, opened };
+    }
+
+    test("opens checkout in a new tab, not in the frame", async () => {
+      const tab = { location: { href: "" }, close: () => {}, opener: "editor" as unknown };
+      const { top, opened } = framedWindow(tab);
+      const redirects: string[] = [];
+      (globalThis as any).location = {
+        href: "https://bool.test/served/my-app/",
+        assign: (url: string) => redirects.push(url),
+      };
+      respond = () => Response.json({ url: "https://checkout.stripe.com/c/pay_test" });
+
+      await createBoolClient(CONFIG).payments.checkout({ plan: "pro" });
+
+      expect(opened).toEqual(["|calls=0"]);
+      expect(tab.location.href).toBe("https://checkout.stripe.com/c/pay_test");
+      // Stripe's page never gets a handle back to the editor.
+      expect(tab.opener).toBeNull();
+      expect(redirects).toEqual([]);
+      expect(top.location.href).toBe("https://bool.test/projects/p1");
+    });
+
+    test("closes the blank tab when the gateway refuses", async () => {
+      let closed = false;
+      framedWindow({ location: { href: "" }, close: () => (closed = true), opener: null });
+      respond = () => Response.json({ error: "payments_not_configured" }, { status: 409 });
+
+      const error = await createBoolClient(CONFIG)
+        .payments.openPortal({ returnUrl: "https://my-app.bool.test/" })
+        .catch((cause) => cause);
+
+      expect(error).toBeInstanceOf(BoolPaymentsError);
+      expect(error.code).toBe("payments_not_configured");
+      expect(closed).toBe(true);
+    });
+
+    test("navigates the top window when the browser blocks the tab", async () => {
+      const { top } = framedWindow(null);
+      respond = () => Response.json({ url: "https://billing.stripe.com/p/session_test" });
+
+      await createBoolClient(CONFIG).payments.openPortal({
+        returnUrl: "https://my-app.bool.test/",
+      });
+
+      expect(top.location.href).toBe("https://billing.stripe.com/p/session_test");
+    });
   });
 
   test("surfaces stable gateway payment errors", async () => {

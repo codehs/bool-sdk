@@ -1244,23 +1244,52 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     throw new BoolPaymentsError("return_url_required", 400);
   }
 
+  // Stripe's checkout and billing pages refuse to load inside a frame, and the
+  // Bool editor previews apps in one, so a plain redirect showed a blank page
+  // there. Framed, open a tab right away, while the click still counts as a user
+  // gesture (popup blockers drop a window.open that waits on the gateway call),
+  // then point it at Stripe. If the browser blocks the tab anyway, navigate the
+  // top window, the same way auth handles the cross-origin preview.
+  function openStripePage(): { go(url: string): void; cancel(): void } {
+    const framed =
+      typeof window !== "undefined" && !!window.top && window.top !== window.self;
+    const tab = framed ? window.open("", "_blank") : null;
+    if (tab) tab.opener = null;
+    return {
+      go(url) {
+        if (tab) tab.location.href = url;
+        else if (framed) window.top!.location.href = url;
+        else location.assign(url);
+      },
+      cancel() {
+        tab?.close();
+      },
+    };
+  }
+
+  async function goToStripe(path: string, body: Record<string, unknown>): Promise<void> {
+    const page = openStripePage();
+    try {
+      const result = await paymentsCall(path, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      page.go(result.url as string);
+    } catch (error) {
+      page.cancel();
+      throw error;
+    }
+  }
+
   const payments: BoolPayments = {
     async current() {
       return (await paymentsCall("/current", { method: "GET" })) as BoolSubscription;
     },
     async checkout({ plan, returnUrl }) {
-      const body = await paymentsCall("/checkout", {
-        method: "POST",
-        body: JSON.stringify({ plan, returnUrl: paymentReturnUrl(returnUrl) }),
-      });
-      location.assign(body.url as string);
+      await goToStripe("/checkout", { plan, returnUrl: paymentReturnUrl(returnUrl) });
     },
     async openPortal({ returnUrl } = {}) {
-      const body = await paymentsCall("/portal", {
-        method: "POST",
-        body: JSON.stringify({ returnUrl: paymentReturnUrl(returnUrl) }),
-      });
-      location.assign(body.url as string);
+      await goToStripe("/portal", { returnUrl: paymentReturnUrl(returnUrl) });
     },
   };
 
