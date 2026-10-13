@@ -1,6 +1,9 @@
 # Changelog
 
-## 0.8.0-next.1
+## 0.8.0-payments.1
+
+Published to the `payments` dist-tag so only apps that pin this exact version
+get it; the `next` tag, which 166 older apps follow, stays on 0.8.0-next.0.
 
 - **Fix: checkout and the billing portal open in the Bool editor preview.**
   Stripe's pages refuse to load inside a frame, and the editor previews apps in
