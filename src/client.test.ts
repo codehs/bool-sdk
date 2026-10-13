@@ -595,6 +595,36 @@ describe("bool.payments battery", () => {
       return { top, opened };
     }
 
+    test("in a credentialless frame, opens Stripe directly and never replaces the editor", async () => {
+      // The editor's preview frame is credentialless. Chrome opens its tabs as
+      // noopener, so window.open returns null even though the tab opened.
+      // Pre-opening a blank tab there used to leave it blank AND navigate the
+      // editor away through the fallback.
+      const top = { location: { href: "https://bool.test/projects/p1" } };
+      const opened: { url: string; features?: string; calls: number }[] = [];
+      (globalThis as any).window = {
+        top,
+        self: {},
+        credentialless: true,
+        open: (url: string, _target: string, features?: string) => {
+          opened.push({ url, features, calls: calls.length });
+          return null;
+        },
+      };
+      respond = () => Response.json({ url: "https://checkout.stripe.com/c/pay_test" });
+
+      await createBoolClient(CONFIG).payments.checkout({
+        plan: "pro",
+        returnUrl: "https://my-app.bool.test/",
+      });
+
+      // One tab, opened after the gateway answered, straight to Stripe.
+      expect(opened).toEqual([
+        { url: "https://checkout.stripe.com/c/pay_test", features: "noopener", calls: 1 },
+      ]);
+      expect(top.location.href).toBe("https://bool.test/projects/p1");
+    });
+
     test("opens checkout in a new tab, not in the frame", async () => {
       const tab = { location: { href: "" }, close: () => {}, opener: "editor" as unknown };
       const { top, opened } = framedWindow(tab);

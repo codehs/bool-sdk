@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.0-payments.2
+
+- **Fix: checkout no longer replaces the editor in Chrome.** The editor's preview
+  frame is `credentialless`, and Chrome opens every tab from such a frame as
+  noopener, so `window.open` returned null even though a tab opened. 0.8.0-
+  payments.1 read that as a blocked tab and fell back to navigating the editor,
+  leaving a blank tab behind. In a credentialless frame, `checkout()` and
+  `openPortal()` now open Stripe's URL directly once the gateway returns it.
+
 ## 0.8.0-payments.1
 
 Published to the `payments` dist-tag so only apps that pin this exact version

@@ -1250,14 +1250,27 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
   // gesture (popup blockers drop a window.open that waits on the gateway call),
   // then point it at Stripe. If the browser blocks the tab anyway, navigate the
   // top window, the same way auth handles the cross-origin preview.
+  //
+  // The editor's preview frame is `credentialless`, and Chrome opens every tab
+  // from such a frame as noopener: the tab appears but window.open returns null.
+  // Pre-opening there left a blank tab AND took the fallback, replacing the
+  // editor. So in a credentialless frame, open Stripe's URL directly once it's
+  // known. Chrome still honors the click's activation after the gateway round
+  // trip (checked on the bool#1335 preview: a new tab after a 640 ms fetch).
   function openStripePage(): { go(url: string): void; cancel(): void } {
     const framed =
       typeof window !== "undefined" && !!window.top && window.top !== window.self;
-    const tab = framed ? window.open("", "_blank") : null;
+    const detached =
+      framed && (window as unknown as { credentialless?: boolean }).credentialless === true;
+    const tab = framed && !detached ? window.open("", "_blank") : null;
     if (tab) tab.opener = null;
     return {
       go(url) {
         if (tab) tab.location.href = url;
+        // No handle comes back from a credentialless frame, so there is no way
+        // to tell a blocked tab from an opened one. Never fall back here: that
+        // would replace the editor whenever the tab did open.
+        else if (detached) window.open(url, "_blank", "noopener");
         else if (framed) window.top!.location.href = url;
         else location.assign(url);
       },
