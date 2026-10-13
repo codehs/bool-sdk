@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   createBoolClient,
   getDefaultBoolClient,
@@ -10,6 +10,7 @@ import {
   type BoolAiWireErrorCode,
   BoolFetchError,
   BoolFilesError,
+  BoolPaymentsError,
   type BoolClientConfig,
 } from "./client";
 
@@ -499,6 +500,186 @@ describe("bool.files", () => {
     expect(quota).toBeInstanceOf(BoolFilesError);
     expect(quota.code).toBe("storage_quota_exceeded");
     expect(quota.status).toBe(413);
+  });
+});
+
+describe("bool.payments battery", () => {
+  test("reads the signed-in customer's subscription from the payments plane", async () => {
+    respond = () =>
+      Response.json({
+        mode: "test",
+        plan: "pro",
+        status: "active",
+        active: true,
+        currentPeriodEnd: "2026-10-01T00:00:00.000Z",
+        cancelAtPeriodEnd: false,
+      });
+    const client = createBoolClient({ ...CONFIG, viewerToken: "viewer" });
+
+    expect(await client.payments.current()).toEqual({
+      mode: "test",
+      plan: "pro",
+      status: "active",
+      active: true,
+      currentPeriodEnd: "2026-10-01T00:00:00.000Z",
+      cancelAtPeriodEnd: false,
+    });
+    expect(calls[0]!.url).toBe(
+      "https://bool.test/served/my-app/_bool/v1/payments/current",
+    );
+    expect(calls[0]!.init?.method).toBe("GET");
+    expect(calls[0]!.init?.credentials).toBe("include");
+    expect(headersOf(calls[0]!).get("x-bool-viewer")).toBe("viewer");
+  });
+
+  test("starts checkout with the current page as its safe return URL", async () => {
+    const redirects: string[] = [];
+    (globalThis as any).location = {
+      href: "https://my-app.bool.test/pricing?from=home",
+      assign: (url: string) => redirects.push(url),
+    };
+    respond = () => Response.json({ url: "https://checkout.stripe.com/c/pay_test" });
+    const client = createBoolClient(CONFIG);
+
+    await client.payments.checkout({ plan: "pro" });
+
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({
+      plan: "pro",
+      returnUrl: "https://my-app.bool.test/pricing?from=home",
+    });
+    expect(redirects).toEqual(["https://checkout.stripe.com/c/pay_test"]);
+  });
+
+  test("opens the billing portal with an explicit same-app return URL", async () => {
+    const redirects: string[] = [];
+    (globalThis as any).location = {
+      href: "https://my-app.bool.test/account",
+      assign: (url: string) => redirects.push(url),
+    };
+    respond = () => Response.json({ url: "https://billing.stripe.com/p/session_test" });
+    const client = createBoolClient(CONFIG);
+
+    await client.payments.openPortal({
+      returnUrl: "https://my-app.bool.test/settings",
+    });
+
+    expect(calls[0]!.url).toBe(
+      "https://bool.test/served/my-app/_bool/v1/payments/portal",
+    );
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({
+      returnUrl: "https://my-app.bool.test/settings",
+    });
+    expect(redirects).toEqual(["https://billing.stripe.com/p/session_test"]);
+  });
+
+  describe("inside a frame (the Bool editor preview)", () => {
+    afterEach(() => {
+      delete (globalThis as any).window;
+    });
+
+    // Stripe pages refuse to load in a frame, so a redirect there shows a blank
+    // page. These stand in for an iframe: window.top is a different window.
+    function framedWindow(popup: { location: { href: string }; close(): void; opener: unknown } | null) {
+      const top = { location: { href: "https://bool.test/projects/p1" } };
+      const opened: string[] = [];
+      (globalThis as any).window = {
+        top,
+        self: {},
+        open: (url: string) => {
+          // The tab must open BEFORE the gateway call, while the click still
+          // counts as a user gesture, so it starts blank.
+          opened.push(`${url}|calls=${calls.length}`);
+          return popup;
+        },
+      };
+      return { top, opened };
+    }
+
+    test("in a credentialless frame, opens Stripe directly and never replaces the editor", async () => {
+      // The editor's preview frame is credentialless. Chrome opens its tabs as
+      // noopener, so window.open returns null even though the tab opened.
+      // Pre-opening a blank tab there used to leave it blank AND navigate the
+      // editor away through the fallback.
+      const top = { location: { href: "https://bool.test/projects/p1" } };
+      const opened: { url: string; features?: string; calls: number }[] = [];
+      (globalThis as any).window = {
+        top,
+        self: {},
+        credentialless: true,
+        open: (url: string, _target: string, features?: string) => {
+          opened.push({ url, features, calls: calls.length });
+          return null;
+        },
+      };
+      respond = () => Response.json({ url: "https://checkout.stripe.com/c/pay_test" });
+
+      await createBoolClient(CONFIG).payments.checkout({
+        plan: "pro",
+        returnUrl: "https://my-app.bool.test/",
+      });
+
+      // One tab, opened after the gateway answered, straight to Stripe.
+      expect(opened).toEqual([
+        { url: "https://checkout.stripe.com/c/pay_test", features: "noopener", calls: 1 },
+      ]);
+      expect(top.location.href).toBe("https://bool.test/projects/p1");
+    });
+
+    test("opens checkout in a new tab, not in the frame", async () => {
+      const tab = { location: { href: "" }, close: () => {}, opener: "editor" as unknown };
+      const { top, opened } = framedWindow(tab);
+      const redirects: string[] = [];
+      (globalThis as any).location = {
+        href: "https://bool.test/served/my-app/",
+        assign: (url: string) => redirects.push(url),
+      };
+      respond = () => Response.json({ url: "https://checkout.stripe.com/c/pay_test" });
+
+      await createBoolClient(CONFIG).payments.checkout({ plan: "pro" });
+
+      expect(opened).toEqual(["|calls=0"]);
+      expect(tab.location.href).toBe("https://checkout.stripe.com/c/pay_test");
+      // Stripe's page never gets a handle back to the editor.
+      expect(tab.opener).toBeNull();
+      expect(redirects).toEqual([]);
+      expect(top.location.href).toBe("https://bool.test/projects/p1");
+    });
+
+    test("closes the blank tab when the gateway refuses", async () => {
+      let closed = false;
+      framedWindow({ location: { href: "" }, close: () => (closed = true), opener: null });
+      respond = () => Response.json({ error: "payments_not_configured" }, { status: 409 });
+
+      const error = await createBoolClient(CONFIG)
+        .payments.openPortal({ returnUrl: "https://my-app.bool.test/" })
+        .catch((cause) => cause);
+
+      expect(error).toBeInstanceOf(BoolPaymentsError);
+      expect(error.code).toBe("payments_not_configured");
+      expect(closed).toBe(true);
+    });
+
+    test("navigates the top window when the browser blocks the tab", async () => {
+      const { top } = framedWindow(null);
+      respond = () => Response.json({ url: "https://billing.stripe.com/p/session_test" });
+
+      await createBoolClient(CONFIG).payments.openPortal({
+        returnUrl: "https://my-app.bool.test/",
+      });
+
+      expect(top.location.href).toBe("https://billing.stripe.com/p/session_test");
+    });
+  });
+
+  test("surfaces stable gateway payment errors", async () => {
+    respond = () =>
+      Response.json({ error: "authentication_required" }, { status: 401 });
+    const client = createBoolClient(CONFIG);
+
+    const error = await client.payments.current().catch((cause) => cause);
+    expect(error).toBeInstanceOf(BoolPaymentsError);
+    expect(error.code).toBe("authentication_required");
+    expect(error.status).toBe(401);
   });
 });
 

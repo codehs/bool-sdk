@@ -426,6 +426,46 @@ export type BoolFiles = {
   remove(id: string): Promise<void>;
 };
 
+export type BoolSubscriptionStatus =
+  | "active"
+  | "trialing"
+  | "past_due"
+  | "canceled"
+  | "incomplete"
+  | "incomplete_expired"
+  | "unpaid"
+  | "paused";
+
+export type BoolSubscription = {
+  /** Stripe environment selected by the app owner. Test and live entitlements
+   * are isolated and never satisfy each other. */
+  mode: "test" | "live";
+  plan: string | null;
+  status: BoolSubscriptionStatus | null;
+  active: boolean;
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+};
+
+export class BoolPaymentsError extends Error {
+  constructor(
+    readonly code: string,
+    readonly status: number,
+  ) {
+    super(`bool.payments failed: ${code} (${status})`);
+    this.name = "BoolPaymentsError";
+  }
+}
+
+export type BoolPayments = {
+  /** Return the signed-in customer's current subscription. */
+  current(): Promise<BoolSubscription>;
+  /** Redirect to Stripe's hosted checkout for a recurring plan. */
+  checkout(options: { plan: string; returnUrl?: string }): Promise<void>;
+  /** Redirect to Stripe's hosted billing portal for the current customer. */
+  openPortal(options?: { returnUrl?: string }): Promise<void>;
+};
+
 /** The subset of `RequestInit` a proxied call supports. Streaming request bodies,
  * `FormData`, `AbortSignal` and the rest of `fetch`'s surface aren't forwarded:
  * the call is described to the gateway as data, not opened from the browser. */
@@ -490,6 +530,9 @@ export type BoolClient = {
    * through a short-lived signed URL; metadata and access stay behind Bool's
    * gateway. */
   files: BoolFiles;
+  /** Customer subscriptions for this app. Checkout and account management use
+   * Stripe-hosted pages, while subscription state comes from Bool's gateway. */
+  payments: BoolPayments;
   /** This app's private Postgres schema name. */
   schema: string;
   /** Subscribe to the app's realtime "doorbell": fires whenever any row in the
@@ -1179,6 +1222,90 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     },
   };
 
+  async function paymentsCall(path: string, init?: RequestInit): Promise<any> {
+    const res = await fetch(`${GATEWAY}/_bool/${GATEWAY_API}/payments${path}`, {
+      ...init,
+      headers: batteryHeaders(),
+      credentials: "include",
+    });
+    let body: any = null;
+    try {
+      body = await res.json();
+    } catch (_) {}
+    if (!res.ok) {
+      throw new BoolPaymentsError(body?.error ?? "unknown_error", res.status);
+    }
+    return body;
+  }
+
+  function paymentReturnUrl(explicit?: string): string {
+    if (explicit) return explicit;
+    if (typeof location !== "undefined") return location.href;
+    throw new BoolPaymentsError("return_url_required", 400);
+  }
+
+  // Stripe's checkout and billing pages refuse to load inside a frame, and the
+  // Bool editor previews apps in one, so a plain redirect showed a blank page
+  // there. Framed, open a tab right away, while the click still counts as a user
+  // gesture (popup blockers drop a window.open that waits on the gateway call),
+  // then point it at Stripe. If the browser blocks the tab anyway, navigate the
+  // top window, the same way auth handles the cross-origin preview.
+  //
+  // The editor's preview frame is `credentialless`, and Chrome opens every tab
+  // from such a frame as noopener: the tab appears but window.open returns null.
+  // Pre-opening there left a blank tab AND took the fallback, replacing the
+  // editor. So in a credentialless frame, open Stripe's URL directly once it's
+  // known. Chrome still honors the click's activation after the gateway round
+  // trip (checked on the bool#1335 preview: a new tab after a 640 ms fetch).
+  function openStripePage(): { go(url: string): void; cancel(): void } {
+    const framed =
+      typeof window !== "undefined" && !!window.top && window.top !== window.self;
+    const detached =
+      framed && (window as unknown as { credentialless?: boolean }).credentialless === true;
+    const tab = framed && !detached ? window.open("", "_blank") : null;
+    if (tab) tab.opener = null;
+    return {
+      go(url) {
+        if (tab) tab.location.href = url;
+        // No handle comes back from a credentialless frame, so there is no way
+        // to tell a blocked tab from an opened one. Never fall back here: that
+        // would replace the editor whenever the tab did open.
+        else if (detached) window.open(url, "_blank", "noopener");
+        else if (framed) window.top!.location.href = url;
+        else location.assign(url);
+      },
+      cancel() {
+        tab?.close();
+      },
+    };
+  }
+
+  async function goToStripe(path: string, body: Record<string, unknown>): Promise<void> {
+    const page = openStripePage();
+    try {
+      const result = await paymentsCall(path, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      page.go(result.url as string);
+    } catch (error) {
+      page.cancel();
+      throw error;
+    }
+  }
+
+  const payments: BoolPayments = {
+    async current() {
+      return (await paymentsCall("/current", { method: "GET" })) as BoolSubscription;
+    },
+    async checkout({ plan, returnUrl }) {
+      await goToStripe("/checkout", { plan, returnUrl: paymentReturnUrl(returnUrl) });
+    },
+    async openPortal({ returnUrl } = {}) {
+      await goToStripe("/portal", { returnUrl: paymentReturnUrl(returnUrl) });
+    },
+  };
+
   const subscribeToChanges = (
     listener: (payload: BoolChangePayload) => void,
   ): (() => void) => doorbell.subscribe(listener);
@@ -1190,6 +1317,7 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
     ai,
     fetch: boolFetch,
     files: filesModule,
+    payments,
     schema,
     subscribeToChanges,
   };
