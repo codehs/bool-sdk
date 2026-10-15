@@ -216,6 +216,48 @@ const DEFAULT_SORT = "-created_at";
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 5000;
 
+/**
+ * What an entity call throws when the gateway or the database refuses it.
+ *
+ * supabase-js returns failures as plain objects, and the SDK used to rethrow
+ * them as-is: not an `Error`, no stack, `String(err)` was "[object Object]", and
+ * a gateway 429 arrived with no message at all. That is how a bad date in one
+ * app was misread as throttling. The Postgres fields (`code`, `details`,
+ * `hint`) are kept, so code that checks `err.code === "23505"` still works.
+ */
+export class BoolDataError extends Error {
+  /** Postgres or PostgREST error code (e.g. "23505", "PGRST116"), or
+   * "rate_limited" for a gateway 429. */
+  readonly code?: string;
+  /** HTTP status of the gateway response; 0 when the request never completed. */
+  readonly status: number;
+  readonly details?: string | null;
+  readonly hint?: string | null;
+
+  constructor(
+    raw: { message?: string; code?: string; details?: string | null; hint?: string | null },
+    status: number,
+  ) {
+    const rateLimited = status === 429;
+    super(
+      raw.message ||
+        (rateLimited
+          ? "This app is sending too many requests. Slow down and try again."
+          : `Data request failed (HTTP ${status || "network error"}).`),
+    );
+    this.name = "BoolDataError";
+    this.code = raw.code ?? (rateLimited ? "rate_limited" : undefined);
+    this.status = status;
+    this.details = raw.details;
+    this.hint = raw.hint;
+  }
+}
+
+function toDataError(error: unknown, status: number): BoolDataError {
+  if (error instanceof BoolDataError) return error;
+  return new BoolDataError((error ?? {}) as ConstructorParameters<typeof BoolDataError>[0], status);
+}
+
 // A supabase-js filter/query builder is chainable and thenable; we only need
 // the handful of methods below, so keep it loosely typed rather than importing
 // supabase-js's internal builder generics.
@@ -426,8 +468,8 @@ function createEntityHandler(
     return query.range(skip, skip + limit - 1);
   }
   async function unwrap<R>(query: QueryBuilder): Promise<R> {
-    const { data, error } = await query;
-    if (error) throw error;
+    const { data, error, status } = await query;
+    if (error) throw toDataError(error, status);
     return data as R;
   }
 
@@ -504,7 +546,7 @@ function createEntityHandler(
         await unwrap(db.from(table).update(setPart).in("id", ids).select("id"));
       }
       if (ids.length) {
-        const { error } = await db.rpc("bool_apply_numeric", {
+        const { error, status } = await db.rpc("bool_apply_numeric", {
           p_table: table,
           p_ids: ids,
           p_inc: n.$inc ?? null,
@@ -516,7 +558,7 @@ function createEntityHandler(
             for (const row of rows) applyUpdateOps(row, { $inc: n.$inc, $mul: n.$mul });
             if (rows.length) await unwrap(db.from(table).upsert(rows).select("id"));
           } else {
-            throw error;
+            throw toDataError(error, status);
           }
         }
       }

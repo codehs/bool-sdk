@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { createBoolClient, type BoolClientConfig } from "./client";
+import { BoolDataError } from "./entities";
 
 // These drive the entities layer through the REAL supabase-js query builder and
 // assert the PostgREST request it produces (routed through the gateway). So we
@@ -409,5 +410,57 @@ describe("entities: errors + ergonomics", () => {
   test("awaiting the module itself doesn't create a `then` entity", () => {
     const bool = createBoolClient(CONFIG);
     expect((bool.entities as any).then).toBeUndefined();
+  });
+});
+
+describe("entity errors and rate limits", () => {
+  test("a database error throws a real Error that keeps the Postgres fields", async () => {
+    respond = () =>
+      new Response(
+        JSON.stringify({ code: "22008", message: 'date/time field value out of range: "2030-02-29"', details: null, hint: null }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+    const client = createBoolClient(CONFIG);
+    const err = await client.entities.key_dates.create({ date: "2030-02-29" }).catch((e) => e);
+    expect(err).toBeInstanceOf(BoolDataError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toContain("out of range");
+    expect(err.code).toBe("22008");
+    expect(err.status).toBe(400);
+    expect(String(err)).not.toContain("[object Object]");
+  });
+
+  test("a 429 is retried and the write goes through", async () => {
+    let n = 0;
+    respond = () =>
+      n++ === 0
+        ? new Response(JSON.stringify({ error: "rate_limited" }), {
+            status: 429,
+            headers: { "content-type": "application/json", "retry-after": "0" },
+          })
+        : new Response(JSON.stringify({ id: "r1", title: "hi" }), {
+            status: 201,
+            headers: { "content-type": "application/json" },
+          });
+    const client = createBoolClient(CONFIG);
+    const row = await client.entities.todos.create({ title: "hi" });
+    expect(row).toEqual({ id: "r1", title: "hi" });
+    expect(calls.filter((c) => c.url.startsWith(DB)).length).toBe(2);
+  });
+
+  test("a 429 that never clears throws a rate_limited error with a message", async () => {
+    respond = () =>
+      new Response(JSON.stringify({ error: "rate_limited" }), {
+        status: 429,
+        headers: { "content-type": "application/json", "retry-after": "0" },
+      });
+    const client = createBoolClient(CONFIG);
+    const err = await client.entities.todos.create({ title: "hi" }).catch((e) => e);
+    expect(err).toBeInstanceOf(BoolDataError);
+    expect(err.code).toBe("rate_limited");
+    expect(err.status).toBe(429);
+    expect(err.message.length).toBeGreaterThan(0);
+    // The first try plus three retries.
+    expect(calls.filter((c) => c.url.startsWith(DB)).length).toBe(4);
   });
 });
