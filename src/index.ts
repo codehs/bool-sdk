@@ -36,6 +36,7 @@ export {
   type Credentials,
 } from "./client.js";
 export {
+  BoolDataError,
   type EntitiesModule,
   type EntityHandler,
   type FilterQuery,

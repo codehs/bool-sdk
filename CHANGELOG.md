@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.8.1
+
+Entity calls now survive the gateway's rate limits and fail with readable
+errors. Both changes are backwards compatible.
+
+- **Rate-limited requests are retried.** A gateway 429 is retried up to three
+  times, waiting the `Retry-After` the gateway sends (capped at 10 seconds,
+  with jitter so tabs don't retry in lockstep). The gateway rejects these
+  before they reach the database, so a retried write can't apply twice.
+  Before, an import loop or a burst of traffic simply failed.
+- **New: `BoolDataError`.** Entity reads and writes used to throw supabase-js's
+  plain error object: not an `Error`, no stack, `"[object Object]"` when
+  printed, and no message at all for a 429. They now throw a `BoolDataError`
+  with a message, `status`, and the Postgres `code`, `details` and `hint`.
+  Code that checks `err.code` keeps working. A 429 that never clears has
+  `code: "rate_limited"`. Every field the old object carried is still there,
+  `error: "rate_limited"` included, and `JSON.stringify(err)` shows the same
+  fields as before.
+- **`bulkUpdate` no longer erases fields a row left out.** An upsert sends one
+  column list per request, so when rows set different fields, a row missing a
+  field had it set to null. Rows are now grouped by the fields they set. When
+  every row sets the same fields, it's still one request, exactly as before.
+- **Bulk writes over the request size limit are split.** A `bulkCreate` or
+  `bulkUpdate` whose body would exceed about 4 MB (Vercel rejects bodies over
+  4.5 MB) is sent in order-preserving batches. Batches under the limit, which
+  is every batch that worked before, are still one request.
+
 ## 0.8.0
 
 Adds Stripe-hosted recurring subscriptions for generated Bool apps. Promotes

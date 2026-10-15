@@ -20,6 +20,7 @@
 // Keep this in sync with the gateway data route (/_bool/v1/db) and users route
 // (/_bool/v1/users) in the Bool platform repo.
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { fetchWithRateLimitRetry } from "./retry.js";
 import { createEntitiesModule, type EntitiesModule } from "./entities.js";
 import { createDoorbell, type MintResult, type RealtimeMint } from "./realtime.js";
 
@@ -674,12 +675,13 @@ export function createBoolClient(config: BoolClientConfig): BoolClient {
       if (apiKey) headers.set("api_key", apiKey);
       // credentials:include so the live-gate identity cookie flows to the
       // gateway (same-origin or custom-domain); the viewer token covers the
-      // cross-origin preview.
-      return fetch(`${GATEWAY}/_bool/${GATEWAY_API}/db${url.pathname}${url.search}`, {
-        ...init,
-        headers,
-        credentials: "include",
-      });
+      // cross-origin preview. A 429 is retried here, where Retry-After is
+      // visible; supabase-js hands callers no response headers (src/retry.ts).
+      const target = `${GATEWAY}/_bool/${GATEWAY_API}/db${url.pathname}${url.search}`;
+      return fetchWithRateLimitRetry(
+        () => fetch(target, { ...init, headers, credentials: "include" }),
+        init,
+      );
     }
     return fetch(input as RequestInfo, init);
   };
