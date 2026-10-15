@@ -428,6 +428,13 @@ describe("entity errors and rate limits", () => {
     expect(err.code).toBe("22008");
     expect(err.status).toBe(400);
     expect(String(err)).not.toContain("[object Object]");
+    // Fields apps read off the old plain object are all still there.
+    expect(err.details).toBeNull();
+    expect(err.hint).toBeNull();
+    expect(JSON.parse(JSON.stringify(err))).toMatchObject({
+      code: "22008",
+      message: 'date/time field value out of range: "2030-02-29"',
+    });
   });
 
   test("a 429 is retried and the write goes through", async () => {
@@ -460,6 +467,10 @@ describe("entity errors and rate limits", () => {
     expect(err.code).toBe("rate_limited");
     expect(err.status).toBe(429);
     expect(err.message.length).toBeGreaterThan(0);
+    // Back-compat: the old plain object carried the body's fields; apps check
+    // err.error === "rate_limited". And JSON.stringify(err) still shows the message.
+    expect(err.error).toBe("rate_limited");
+    expect(JSON.parse(JSON.stringify(err)).message).toBe(err.message);
     // The first try plus three retries.
     expect(calls.filter((c) => c.url.startsWith(DB)).length).toBe(4);
   });

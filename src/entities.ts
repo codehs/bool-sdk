@@ -246,6 +246,14 @@ export class BoolDataError extends Error {
           : `Data request failed (HTTP ${status || "network error"}).`),
     );
     this.name = "BoolDataError";
+    // Back-compat with the plain object entity calls used to throw: keep every
+    // field it carried (a gateway 429 body adds `error: "rate_limited"`, which
+    // apps check), and keep `message` enumerable so JSON.stringify(err) still
+    // shows it.
+    for (const [k, v] of Object.entries(raw)) {
+      if (!(k in this)) (this as Record<string, unknown>)[k] = v;
+    }
+    Object.defineProperty(this, "message", { enumerable: true });
     this.code = raw.code ?? (rateLimited ? "rate_limited" : undefined);
     this.status = status;
     this.details = raw.details;
