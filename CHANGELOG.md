@@ -15,7 +15,17 @@ errors. Both changes are backwards compatible.
   printed, and no message at all for a 429. They now throw a `BoolDataError`
   with a message, `status`, and the Postgres `code`, `details` and `hint`.
   Code that checks `err.code` keeps working. A 429 that never clears has
-  `code: "rate_limited"`.
+  `code: "rate_limited"`. Every field the old object carried is still there,
+  `error: "rate_limited"` included, and `JSON.stringify(err)` shows the same
+  fields as before.
+- **`bulkUpdate` no longer erases fields a row left out.** An upsert sends one
+  column list per request, so when rows set different fields, a row missing a
+  field had it set to null. Rows are now grouped by the fields they set. When
+  every row sets the same fields, it's still one request, exactly as before.
+- **Bulk writes over the request size limit are split.** A `bulkCreate` or
+  `bulkUpdate` whose body would exceed about 4 MB (Vercel rejects bodies over
+  4.5 MB) is sent in order-preserving batches. Batches under the limit, which
+  is every batch that worked before, are still one request.
 
 ## 0.8.0
 

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { createBoolClient, type BoolClientConfig } from "./client";
-import { BoolDataError } from "./entities";
+import { BoolDataError, batchBySize, groupByFields } from "./entities";
 
 // These drive the entities layer through the REAL supabase-js query builder and
 // assert the PostgREST request it produces (routed through the gateway). So we
@@ -473,5 +473,84 @@ describe("entity errors and rate limits", () => {
     expect(JSON.parse(JSON.stringify(err)).message).toBe(err.message);
     // The first try plus three retries.
     expect(calls.filter((c) => c.url.startsWith(DB)).length).toBe(4);
+  });
+});
+
+describe("bulk writes stay back-compatible", () => {
+  const dbCalls = () => calls.filter((c) => c.url.startsWith(DB));
+  const echo = (status = 200) => (_url: string, init?: RequestInit) =>
+    new Response(String(init?.body ?? "[]"), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+
+  test("bulkUpdate with the same fields on every row is still one request", async () => {
+    respond = echo();
+    const client = createBoolClient(CONFIG);
+    await client.entities.todos.bulkUpdate([
+      { id: "1", done: true },
+      { id: "2", done: false },
+    ]);
+    expect(dbCalls().length).toBe(1);
+  });
+
+  test("bulkUpdate with different fields per row never sends a field a row left out", async () => {
+    respond = echo();
+    const client = createBoolClient(CONFIG);
+    const out = await client.entities.todos.bulkUpdate([
+      { id: "1", title: "a", note: "x" },
+      { id: "2", title: "b" },
+      { id: "3", title: "c", note: "y" },
+    ]);
+    const sent = dbCalls().map((c) => JSON.parse(String(c.init?.body)));
+    expect(sent.length).toBe(2);
+    // Row 2 goes in its own request, so `note` can't be nulled for it.
+    expect(sent.some((rows) => rows.length === 1 && rows[0].id === "2" && !("note" in rows[0]))).toBe(true);
+    for (const c of dbCalls()) {
+      const cols = new URL(c.url).searchParams.get("columns");
+      const body = JSON.parse(String(c.init?.body));
+      if (cols) expect(cols.split(",").sort()).toEqual(Object.keys(body[0]).map((k) => `"${k}"`).sort());
+    }
+    // Results come back in the order the rows were passed.
+    expect(out.map((r) => r.id)).toEqual(["1", "2", "3"]);
+  });
+
+  test("bulkCreate under the size limit is still one request", async () => {
+    respond = echo(201);
+    const client = createBoolClient(CONFIG);
+    await client.entities.todos.bulkCreate(Array.from({ length: 500 }, (_, i) => ({ title: `t${i}` })));
+    expect(dbCalls().length).toBe(1);
+  });
+
+  test("bulkCreate over the size limit is split, in order", async () => {
+    respond = echo(201);
+    const client = createBoolClient(CONFIG);
+    const big = "x".repeat(300_000);
+    const rows = Array.from({ length: 30 }, (_, i) => ({ title: `t${i}`, body: big })); // ~9 MB
+    const out = await client.entities.todos.bulkCreate(rows);
+    expect(dbCalls().length).toBeGreaterThan(1);
+    for (const c of dbCalls()) expect(String(c.init?.body).length).toBeLessThan(4 * 1024 * 1024);
+    expect(out.map((r) => r.title)).toEqual(rows.map((r) => r.title));
+  });
+});
+
+describe("batchBySize and groupByFields", () => {
+  test("rows that fit stay one batch", () => {
+    expect(batchBySize([{ a: 1 }, { a: 2 }], 1000)).toEqual([[{ a: 1 }, { a: 2 }]]);
+  });
+  test("splits on the byte limit and keeps order", () => {
+    const rows = Array.from({ length: 5 }, (_, i) => ({ i, s: "x".repeat(40) }));
+    const batches = batchBySize(rows, 120);
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.flat()).toEqual(rows);
+    for (const b of batches) expect(new TextEncoder().encode(JSON.stringify(b)).length).toBeLessThanOrEqual(120);
+  });
+  test("a single oversized row goes alone", () => {
+    const huge = { s: "x".repeat(500) };
+    expect(batchBySize([huge, { s: "y" }], 100)).toEqual([[huge], [{ s: "y" }]]);
+  });
+  test("groups rows by the fields they set, in first-seen order", () => {
+    const groups = groupByFields([{ id: 1, a: 1 }, { id: 2 }, { a: 2, id: 3 }]);
+    expect(groups).toEqual([[{ id: 1, a: 1 }, { a: 2, id: 3 }], [{ id: 2 }]]);
   });
 });

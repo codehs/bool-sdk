@@ -261,6 +261,54 @@ export class BoolDataError extends Error {
   }
 }
 
+// Vercel rejects a function request body over 4.5 MB before the gateway sees
+// it. Leave headroom for encoding and headers.
+export const MAX_BATCH_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Split rows into batches whose JSON stays under `maxBytes`, keeping order.
+ * One batch when the rows already fit, which is every batch that works today:
+ * those keep their single, all-or-nothing request. Only a batch that would be
+ * rejected for size gets split. A single row over the limit goes alone and
+ * fails as it does today.
+ */
+export function batchBySize<R>(rows: R[], maxBytes = MAX_BATCH_BYTES): R[][] {
+  const enc = new TextEncoder();
+  if (enc.encode(JSON.stringify(rows)).length <= maxBytes) return [rows];
+  const batches: R[][] = [];
+  let current: R[] = [];
+  let size = 2; // the surrounding []
+  for (const row of rows) {
+    const rowBytes = enc.encode(JSON.stringify(row)).length + 1;
+    if (current.length && size + rowBytes > maxBytes) {
+      batches.push(current);
+      current = [];
+      size = 2;
+    }
+    current.push(row);
+    size += rowBytes;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+/**
+ * Group rows that set the same fields, keeping first-seen order. An upsert
+ * sends one column list for the whole request, so a row that leaves a field out
+ * gets it set to null. Grouping by field set means each request only touches
+ * the fields its rows actually carry.
+ */
+export function groupByFields<R extends object>(rows: R[]): R[][] {
+  const groups = new Map<string, R[]>();
+  for (const row of rows) {
+    const key = Object.keys(row).sort().join("\u0000");
+    const group = groups.get(key);
+    if (group) group.push(row);
+    else groups.set(key, [row]);
+  }
+  return [...groups.values()];
+}
+
 function toDataError(error: unknown, status: number): BoolDataError {
   if (error instanceof BoolDataError) return error;
   return new BoolDataError((error ?? {}) as ConstructorParameters<typeof BoolDataError>[0], status);
@@ -507,14 +555,32 @@ function createEntityHandler(
       return unwrap(db.from(table).insert(values).select().single());
     },
     async bulkCreate(values) {
-      return (await unwrap<any[]>(db.from(table).insert(values).select())) ?? [];
+      const out: any[] = [];
+      for (const batch of batchBySize(values)) {
+        out.push(...((await unwrap<any[]>(db.from(table).insert(batch).select())) ?? []));
+      }
+      return out;
     },
     async update(id, values) {
       return unwrap(db.from(table).update(values).eq("id", id).select().single());
     },
     async bulkUpdate(values) {
-      // Upsert on the primary key: each row must include `id`.
-      return (await unwrap<any[]>(db.from(table).upsert(values).select())) ?? [];
+      // Upsert on the primary key: each row must include `id`. Rows that set the
+      // same fields go together, so a row that leaves a field out doesn't have
+      // it nulled by another row's column list. When every row sets the same
+      // fields (the usual case) this is the same single request as before.
+      const requests = groupByFields(values).flatMap((group) => batchBySize(group));
+      if (requests.length === 1) {
+        return (await unwrap<any[]>(db.from(table).upsert(requests[0]).select())) ?? [];
+      }
+      const results: any[] = [];
+      for (const rows of requests) {
+        results.push(...((await unwrap<any[]>(db.from(table).upsert(rows).select())) ?? []));
+      }
+      // Hand rows back in the order they were passed, as one request would.
+      const byId = new Map(results.map((r) => [String(r.id), r]));
+      const ordered = values.map((v) => byId.get(String(v.id))).filter((r) => r !== undefined);
+      return ordered.length === results.length ? ordered : results;
     },
     async updateMany(query, ops) {
       const n: UpdateOps = isUpdateOps(ops as Record<string, unknown>)
